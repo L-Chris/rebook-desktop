@@ -1,0 +1,15 @@
+[package]
+name = "rebook-reader"
+description = "Reader session state machine and commands for rebook-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rebook-publication = { path = "../publication" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

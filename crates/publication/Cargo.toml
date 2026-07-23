@@ -1,0 +1,15 @@
+[package]
+name = "rebook-publication"
+description = "Format-neutral publication, locator, and resource models for rebook-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+percent-encoding.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

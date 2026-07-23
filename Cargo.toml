@@ -1,0 +1,59 @@
+[workspace]
+members = [
+    "apps/desktop",
+    "apps/inspect",
+    "crates/epub",
+    "crates/publication",
+    "crates/reader",
+    "crates/renderer",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/L-Chris/rebook-desktop"
+
+[workspace.dependencies]
+anyrender = "0.11.1"
+anyrender_vello = "0.12.0"
+anyrender_vello_cpu = "0.14.0"
+blitz-dom = { version = "=0.3.0-beta.1", default-features = false, features = ["complex-scripts", "floats", "system-fonts", "woff"] }
+blitz-html = { version = "=0.3.0-beta.1", default-features = false }
+blitz-paint = { version = "=0.3.0-beta.1", default-features = false }
+blitz-shell = { version = "=0.3.0-beta.1", default-features = false }
+blitz-traits = { version = "=0.3.0-beta.1", default-features = false }
+percent-encoding = "2.3.2"
+quick-xml = { version = "0.41.0", features = ["encoding"] }
+roxmltree = "0.21.1"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+thiserror = "2.0.19"
+url = "2.5.8"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

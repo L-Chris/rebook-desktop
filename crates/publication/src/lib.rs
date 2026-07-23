@@ -1,0 +1,443 @@
+//! Format-neutral publication, resource, and locator contracts.
+
+use std::fmt;
+use std::sync::Arc;
+
+use percent_encoding::percent_decode_str;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Stable identity for an imported publication, normally derived from its content hash.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PublicationId(String);
+
+impl PublicationId {
+    /// Creates a non-empty publication identity.
+    pub fn new(value: impl Into<String>) -> Result<Self, PublicationError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(PublicationError::InvalidIdentifier);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the serialized identity.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PublicationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Stable identity for a spine item inside one publication.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SpineItemId(String);
+
+impl SpineItemId {
+    /// Creates a non-empty spine item identity.
+    pub fn new(value: impl Into<String>) -> Result<Self, PublicationError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(PublicationError::InvalidIdentifier);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the serialized identity.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Canonical URL for a resource inside a publication.
+///
+/// This type never represents a file-system or network URL. Paths are decoded once, use `/`
+/// separators, and cannot escape the publication root.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PublicationUrl {
+    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fragment: Option<String>,
+}
+
+impl PublicationUrl {
+    /// Parses and canonicalizes a root-relative publication path.
+    pub fn parse(value: &str) -> Result<Self, PublicationError> {
+        Self::resolve_from_segments(&[], value)
+    }
+
+    /// Resolves a relative reference against this resource URL.
+    pub fn resolve(&self, reference: &str) -> Result<Self, PublicationError> {
+        if let Some(reference) = reference.strip_prefix('#') {
+            let fragment = decode_component(reference)?;
+            return Ok(Self {
+                path: self.path.clone(),
+                fragment: non_empty(fragment),
+            });
+        }
+
+        let segments = self.path.split('/').collect::<Vec<_>>();
+        let base = segments
+            .split_last()
+            .map_or(&[][..], |(_, directory)| directory);
+        Self::resolve_from_segments(base, reference)
+    }
+
+    /// Returns the canonical archive path without its fragment.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the decoded fragment, if present.
+    pub fn fragment(&self) -> Option<&str> {
+        self.fragment.as_deref()
+    }
+
+    /// Returns a copy without a fragment for resource lookup.
+    #[must_use]
+    pub fn resource_url(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            fragment: None,
+        }
+    }
+
+    fn resolve_from_segments(base: &[&str], value: &str) -> Result<Self, PublicationError> {
+        let (raw_path, raw_fragment) = value
+            .split_once('#')
+            .map_or((value, None), |parts| (parts.0, Some(parts.1)));
+        let raw_path = raw_path.split_once('?').map_or(raw_path, |parts| parts.0);
+        if raw_path.starts_with('/') || raw_path.starts_with('\\') {
+            return Err(PublicationError::InvalidPublicationUrl(value.to_owned()));
+        }
+        if looks_like_external_scheme(raw_path) {
+            return Err(PublicationError::ExternalUrl(value.to_owned()));
+        }
+
+        let decoded = decode_component(raw_path)?;
+        if decoded.contains('\\') || decoded.contains('\0') {
+            return Err(PublicationError::InvalidPublicationUrl(value.to_owned()));
+        }
+
+        let mut segments = base.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for segment in decoded.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    if segments.pop().is_none() {
+                        return Err(PublicationError::PathEscapesRoot(value.to_owned()));
+                    }
+                }
+                other => segments.push(other.to_owned()),
+            }
+        }
+        if segments.is_empty() {
+            return Err(PublicationError::InvalidPublicationUrl(value.to_owned()));
+        }
+        let fragment = raw_fragment
+            .map(decode_component)
+            .transpose()?
+            .and_then(non_empty);
+        Ok(Self {
+            path: segments.join("/"),
+            fragment,
+        })
+    }
+}
+
+impl fmt::Display for PublicationUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.path)?;
+        if let Some(fragment) = &self.fragment {
+            write!(formatter, "#{fragment}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Normalized metadata used by the shelf and reader.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Metadata {
+    /// Primary title in display form.
+    pub title: String,
+    /// Ordered contributors that authored the publication.
+    pub authors: Vec<String>,
+    /// BCP 47 language tags declared by the publication.
+    pub languages: Vec<String>,
+    /// Package-level rendition layout.
+    pub layout: RenditionLayout,
+}
+
+/// Package-level rendition layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RenditionLayout {
+    /// Content is laid out according to the reader viewport.
+    #[default]
+    Reflowable,
+    /// Content documents declare fixed page dimensions.
+    PrePaginated,
+}
+
+/// A resource declared by a publication manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Link {
+    /// Canonical resource URL.
+    pub href: PublicationUrl,
+    /// Declared media type.
+    pub media_type: String,
+    /// EPUB manifest properties.
+    pub properties: Vec<String>,
+}
+
+/// One ordered content document in the publication spine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpineItem {
+    /// Stable identity, normally the OPF manifest ID.
+    pub id: SpineItemId,
+    /// Canonical content document URL.
+    pub href: PublicationUrl,
+    /// Declared media type.
+    pub media_type: String,
+    /// Whether this item is part of the normal linear reading order.
+    pub linear: bool,
+    /// EPUB manifest and spine properties.
+    pub properties: Vec<String>,
+}
+
+/// Hierarchical table-of-contents entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TocEntry {
+    /// Human-readable navigation label.
+    pub label: String,
+    /// Target URL, when the entry is navigable.
+    pub href: Option<PublicationUrl>,
+    /// Nested entries.
+    pub children: Vec<Self>,
+}
+
+/// Fully loaded resource returned through the publication boundary.
+#[derive(Debug, Clone)]
+pub struct Resource {
+    /// Canonical resource URL.
+    pub href: PublicationUrl,
+    /// Manifest or detected media type.
+    pub media_type: String,
+    /// Immutable uncompressed bytes.
+    pub bytes: Arc<[u8]>,
+}
+
+/// Format-neutral contract consumed by reader and renderer layers.
+pub trait Publication: Send + Sync {
+    /// Stable publication identity.
+    fn id(&self) -> &PublicationId;
+    /// Normalized metadata.
+    fn metadata(&self) -> &Metadata;
+    /// Ordered spine items.
+    fn reading_order(&self) -> &[SpineItem];
+    /// Table of contents.
+    fn table_of_contents(&self) -> &[TocEntry];
+    /// Loads one resource subject to the publication's resource budgets.
+    fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError>;
+}
+
+/// Source position shared by DOM, semantic blocks, and layout fragments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceAnchor {
+    /// Spine item containing the source node.
+    pub spine: SpineItemId,
+    /// Deterministic node identifier assigned during document parsing.
+    pub node: String,
+    /// Unicode scalar offset within the node's normalized text.
+    pub text_offset: u64,
+}
+
+/// Half-open source range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRange {
+    /// Inclusive start anchor.
+    pub start: SourceAnchor,
+    /// Exclusive end anchor.
+    pub end: SourceAnchor,
+}
+
+/// Text quote used to recover a location when structural anchors no longer match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextQuote {
+    /// Text immediately before the selected text.
+    pub before: String,
+    /// Selected or highlighted text.
+    pub highlight: String,
+    /// Text immediately after the selected text.
+    pub after: String,
+}
+
+/// Versioned durable reading location.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocatorV1 {
+    /// Serialization model version.
+    pub version: u8,
+    /// Publication to which the locator belongs.
+    pub publication_id: PublicationId,
+    /// Content document containing the location.
+    pub href: PublicationUrl,
+    /// Progression within the content document.
+    pub progression: Option<f64>,
+    /// Progression across the whole publication.
+    pub total_progression: Option<f64>,
+    /// Optional implementation-independent position index.
+    pub position: Option<u64>,
+    /// Precise source range when available.
+    pub source: Option<SourceRange>,
+    /// EPUB CFI relative to the current spine item.
+    pub partial_cfi: Option<String>,
+    /// Text quote fallback.
+    pub text: Option<TextQuote>,
+}
+
+impl LocatorV1 {
+    /// Current locator model version.
+    pub const VERSION: u8 = 1;
+
+    /// Creates a locator at the beginning of a resource.
+    pub fn at_start(publication_id: PublicationId, href: PublicationUrl) -> Self {
+        Self {
+            version: Self::VERSION,
+            publication_id,
+            href,
+            progression: Some(0.0),
+            total_progression: None,
+            position: None,
+            source: None,
+            partial_cfi: None,
+            text: None,
+        }
+    }
+
+    /// Validates version, finite progress values, and range bounds.
+    pub fn validate(&self) -> Result<(), PublicationError> {
+        if self.version != Self::VERSION {
+            return Err(PublicationError::UnsupportedLocatorVersion(self.version));
+        }
+        for progression in [self.progression, self.total_progression]
+            .into_iter()
+            .flatten()
+        {
+            if !progression.is_finite() || !(0.0..=1.0).contains(&progression) {
+                return Err(PublicationError::InvalidProgression(progression));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Errors shared across format-neutral publication boundaries.
+#[derive(Debug, Error)]
+pub enum PublicationError {
+    /// An identifier was empty or otherwise unusable.
+    #[error("publication identifier cannot be empty")]
+    InvalidIdentifier,
+    /// An internal URL was malformed.
+    #[error("invalid publication URL: {0}")]
+    InvalidPublicationUrl(String),
+    /// A relative URL escaped the publication root.
+    #[error("publication path escapes its root: {0}")]
+    PathEscapesRoot(String),
+    /// A network or file-system URL was passed to an internal resource API.
+    #[error("external URL is not allowed in the publication resource API: {0}")]
+    ExternalUrl(String),
+    /// A percent-encoded URL was not valid UTF-8.
+    #[error("publication URL is not valid UTF-8 after percent decoding: {0}")]
+    InvalidUrlEncoding(String),
+    /// A requested resource does not exist.
+    #[error("publication resource was not found: {0}")]
+    ResourceNotFound(String),
+    /// Resource access exceeded a configured safety budget.
+    #[error("publication resource limit exceeded: {0}")]
+    ResourceLimit(String),
+    /// Publication content did not satisfy its format requirements.
+    #[error("invalid publication: {0}")]
+    InvalidPublication(String),
+    /// Locator schema version is not supported.
+    #[error("unsupported locator version: {0}")]
+    UnsupportedLocatorVersion(u8),
+    /// A locator progression was not finite or fell outside 0..=1.
+    #[error("invalid locator progression: {0}")]
+    InvalidProgression(f64),
+    /// A lower-level I/O operation failed.
+    #[error("publication I/O failed: {0}")]
+    Io(String),
+}
+
+fn decode_component(value: &str) -> Result<String, PublicationError> {
+    percent_decode_str(value)
+        .decode_utf8()
+        .map(String::from)
+        .map_err(|_| PublicationError::InvalidUrlEncoding(value.to_owned()))
+}
+
+fn non_empty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn looks_like_external_scheme(value: &str) -> bool {
+    let candidate = value.split('/').next().unwrap_or_default();
+    candidate
+        .split_once(':')
+        .is_some_and(|(scheme, _)| !scheme.is_empty() && scheme.chars().all(is_scheme_character))
+}
+
+fn is_scheme_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LocatorV1, PublicationError, PublicationId, PublicationUrl};
+
+    #[test]
+    fn resolves_and_normalizes_relative_publication_urls() {
+        let base = PublicationUrl::parse("OPS/Text/chapter.xhtml").expect("valid base URL");
+        let resolved = base
+            .resolve("../Images/cover%20image.jpg#hero")
+            .expect("valid relative URL");
+
+        assert_eq!(resolved.path(), "OPS/Images/cover image.jpg");
+        assert_eq!(resolved.fragment(), Some("hero"));
+    }
+
+    #[test]
+    fn rejects_paths_that_escape_the_publication_root() {
+        let base = PublicationUrl::parse("chapter.xhtml").expect("valid base URL");
+        let error = base
+            .resolve("../../secret")
+            .expect_err("path must be rejected");
+        assert!(matches!(error, PublicationError::PathEscapesRoot(_)));
+    }
+
+    #[test]
+    fn rejects_external_urls_in_resource_api() {
+        let error = PublicationUrl::parse("https://example.com/book.css")
+            .expect_err("external URL must be rejected");
+        assert!(matches!(error, PublicationError::ExternalUrl(_)));
+    }
+
+    #[test]
+    fn validates_locator_progressions() {
+        let publication_id = PublicationId::new("sha256:book").expect("valid ID");
+        let href = PublicationUrl::parse("OPS/chapter.xhtml").expect("valid URL");
+        let mut locator = LocatorV1::at_start(publication_id, href);
+        locator.total_progression = Some(1.1);
+
+        assert!(matches!(
+            locator.validate(),
+            Err(PublicationError::InvalidProgression(_))
+        ));
+    }
+}

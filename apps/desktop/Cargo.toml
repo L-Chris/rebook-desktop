@@ -1,0 +1,17 @@
+[package]
+name = "rebook-desktop"
+description = "Native Vello/wgpu Phase 0 shell for rebook-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyrender_vello.workspace = true
+blitz-shell.workspace = true
+rebook-epub = { path = "../../crates/epub" }
+rebook-renderer = { path = "../../crates/renderer" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

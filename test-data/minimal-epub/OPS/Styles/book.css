@@ -1,0 +1,33 @@
+:root {
+  color: #20242a;
+  background: #f7f2e8;
+  font-family: serif;
+}
+
+body {
+  box-sizing: border-box;
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 3rem;
+  font-size: 20px;
+  line-height: 1.75;
+}
+
+h1 {
+  color: #7a3f2b;
+  font-size: 2rem;
+}
+
+.lead {
+  border-left: 0.3rem solid #c87953;
+  padding-left: 1rem;
+}
+
+.badge {
+  display: inline-block;
+  margin-top: 1rem;
+  padding: 0.25rem 0.65rem;
+  border: 1px solid #9a6b50;
+  border-radius: 999px;
+  background: #fffaf0;
+}

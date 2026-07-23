@@ -1,0 +1,21 @@
+[package]
+name = "rebook-renderer"
+description = "Backend-isolated native document layout adapter for rebook-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyrender.workspace = true
+anyrender_vello_cpu.workspace = true
+blitz-dom.workspace = true
+blitz-html.workspace = true
+blitz-paint.workspace = true
+blitz-traits.workspace = true
+rebook-publication = { path = "../publication" }
+thiserror.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true
