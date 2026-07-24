@@ -1,15 +1,63 @@
-//! Phase 0 native window: EPUB -> Publication -> Stylo/Taffy/Parley -> Vello/wgpu.
+//! Native EPUB reader: parser -> reading IR -> page layout -> display list -> Xilem/Vello.
 
-use std::collections::HashSet;
+mod reader_canvas;
+mod vello_bridge;
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
+use std::ffi::OsString;
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
-use anyrender_vello::VelloWindowRenderer;
-use blitz_shell::{BlitzApplication, BlitzShellProxy, WindowConfig, create_default_event_loop};
+use anyrender_vello_cpu::VelloCpuImageRenderer;
+use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
+use reader_canvas::{ReaderCanvasAction, reader_canvas};
 use rebook_epub::EpubPublication;
-use rebook_renderer::{LayoutViewport, ReflowDocument};
+use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode};
+use rebook_publication::{BookSource, PublicationUrl, Rgba, TocEntry};
+use rebook_reader::{PageDirection, PageTurn, ReaderSession};
+use vello_bridge::XilemVelloScene;
+use xilem::core::fork;
+use xilem::masonry::kurbo::Size;
+use xilem::masonry::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
+use xilem::masonry::properties::types::{AsUnit, UnitPoint};
+use xilem::masonry::vello::Scene;
+use xilem::style::{Padding, Style};
+use xilem::view::{
+    CrossAxisAlignment, FlexExt, FlexSpacer, MainAxisAlignment, ObjectFit, ZStackExt, button,
+    flex_col, flex_row, image, label, portal, prose, sized_box, task, zstack,
+};
+use xilem::{
+    Affine, AnyWidgetView, Color, EventLoop, FontWeight, WidgetView, WindowOptions, Xilem,
+};
+
+const INITIAL_WIDTH: u32 = 1200;
+const INITIAL_HEIGHT: u32 = 800;
+const TOOLBAR_HEIGHT: f64 = 44.0;
+const PROGRESS_HEIGHT: f64 = 4.0;
+const TOC_WIDTH: f64 = 240.0;
+const SETTINGS_WIDTH: f64 = 520.0;
+const SETTINGS_HEIGHT: f64 = 360.0;
+const PAGE_SCENE_CACHE_CAPACITY: usize = 32;
+const MOTION_DURATION: Duration = Duration::from_millis(180);
+const MOTION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const SIDEBAR_SCRIM_ALPHA: f32 = 0.28;
+const MODAL_SCRIM_ALPHA: f32 = 0.35;
+const MOTION_EPSILON: f32 = 0.001;
+
+// Keep these in sync with rebook-web's light reader tokens.
+const UI_BACKGROUND: Color = Color::from_rgb8(0xff, 0xff, 0xff);
+const UI_SURFACE: Color = Color::from_rgb8(0xff, 0xff, 0xff);
+const UI_SIDEBAR: Color = Color::from_rgb8(0xfb, 0xfc, 0xfd);
+const UI_SURFACE_MUTED: Color = Color::from_rgb8(0xf2, 0xf5, 0xf8);
+const UI_TEXT: Color = Color::from_rgb8(0x1f, 0x2d, 0x3d);
+const UI_TEXT_SOFT: Color = Color::from_rgb8(0x43, 0x55, 0x6b);
+const UI_MUTED: Color = Color::from_rgb8(0x70, 0x82, 0x98);
+const UI_BORDER: Color = Color::from_rgb8(0xdd, 0xe5, 0xee);
+const UI_ACCENT: Color = Color::from_rgb8(0x0f, 0x76, 0x6e);
+const UI_ACCENT_SOFT: Color = Color::from_rgb8(0xe2, 0xf3, 0xf1);
+const UI_ACCENT_BORDER: Color = Color::from_rgb8(0xba, 0xe6, 0xe1);
 
 fn main() -> ExitCode {
     match run() {
@@ -22,6 +70,41 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let (diagnose, path) = parse_arguments()?;
+    let started = Instant::now();
+    let publication = Arc::new(EpubPublication::open_file(path)?);
+    let parsed = Instant::now();
+    let cover = publication
+        .book()
+        .cover
+        .as_ref()
+        .and_then(|href| publication.resource(href).ok())
+        .and_then(|resource| decode_cover(&resource.bytes).ok());
+    let source: Arc<dyn BookSource> = publication;
+    let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
+    let reader = ReaderSession::open(source, viewport, ReaderStyle::default())?;
+    let laid_out = Instant::now();
+
+    if diagnose {
+        diagnose_reader(reader, started, parsed, laid_out)?;
+        return Ok(());
+    }
+
+    let title = reader.book().metadata.title.clone();
+    let state = DesktopReader::new(reader, cover);
+    let window = WindowOptions::new(title)
+        .with_initial_inner_size(xilem::winit::dpi::LogicalSize::new(
+            INITIAL_WIDTH,
+            INITIAL_HEIGHT,
+        ))
+        .with_min_inner_size(xilem::winit::dpi::LogicalSize::new(720_u32, 520_u32));
+    Xilem::new_simple(state, app_view, window)
+        .with_font(LUCIDE_FONT_BYTES.to_vec())
+        .run_in(EventLoop::with_user_event())?;
+    Ok(())
+}
+
+fn parse_arguments() -> Result<(bool, OsString), Box<dyn std::error::Error>> {
     let mut arguments = env::args_os();
     let executable = arguments
         .next()
@@ -38,61 +121,1140 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if arguments.next().is_some() {
         return Err(usage(&executable).into());
     }
+    Ok((diagnose, path))
+}
 
-    let started = Instant::now();
-    let publication = Arc::new(EpubPublication::open_file(path)?);
-    let opened = Instant::now();
-    let viewport = LayoutViewport::new(900, 700, 1.0)?;
-    let mut document = ReflowDocument::layout(publication, 0, viewport)?;
-    let laid_out = Instant::now();
+struct DesktopReader {
+    reader: Mutex<ReaderSession>,
+    toc_rows: Vec<TocRow>,
+    cover: Option<ImageData>,
+    ui: ReaderUiState,
+    canvas_size: Option<(u32, u32)>,
+    scene_revision: u64,
+    page_scenes: HashMap<PageSceneKey, Arc<Scene>>,
+    page_scene_lru: VecDeque<PageSceneKey>,
+    error: Option<String>,
+}
 
-    if diagnose {
-        let metrics = document.metrics();
-        let failures = document.resource_failures();
-        let rgba = document.render_offscreen_rgba(viewport)?;
-        let painted = Instant::now();
-        let distinct_colors = rgba
-            .chunks_exact(4)
-            .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
-            .collect::<HashSet<_>>()
-            .len();
-        let non_transparent_pixels = rgba.chunks_exact(4).filter(|pixel| pixel[3] != 0).count();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "backend": "Vello CPU offscreen",
-                "open_ms": elapsed_ms(started, opened),
-                "layout_ms": elapsed_ms(opened, laid_out),
-                "paint_ms": elapsed_ms(laid_out, painted),
-                "total_ms": elapsed_ms(started, painted),
-                "process_peak_resident_kib": process_peak_resident_kib(),
-                "layout": {
-                    "content_width": metrics.content_width,
-                    "content_height": metrics.content_height,
-                    "node_count": metrics.node_count,
-                    "pending_critical_resources": metrics.has_pending_critical_resources,
-                },
-                "render_target": {
-                    "width": viewport.width,
-                    "height": viewport.height,
-                    "rgba_bytes": rgba.len(),
-                    "non_transparent_pixels": non_transparent_pixels,
-                    "distinct_colors": distinct_colors,
-                },
-                "resource_failures": failures.iter().map(|failure| failure.url.as_str()).collect::<Vec<_>>(),
-            }))?
-        );
-        return Ok(());
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PageSceneKey {
+    section_index: usize,
+    page_index: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReaderOverlay {
+    None,
+    Menu,
+    Settings,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Motion {
+    value: f32,
+    start: f32,
+    target: f32,
+    elapsed: Duration,
+}
+
+impl Motion {
+    const fn settled(value: f32) -> Self {
+        Self {
+            value,
+            start: value,
+            target: value,
+            elapsed: Duration::ZERO,
+        }
     }
 
-    let event_loop = create_default_event_loop();
-    let (proxy, event_queue) = BlitzShellProxy::new(event_loop.create_proxy());
-    let mut application = BlitzApplication::new(proxy, event_queue);
-    application.add_window(WindowConfig::new(
-        Box::new(document),
-        VelloWindowRenderer::new(),
-    ));
-    event_loop.run_app(application)?;
+    fn animate_to(&mut self, target: f32) -> bool {
+        if (self.target - target).abs() <= MOTION_EPSILON {
+            return false;
+        }
+        self.start = self.value;
+        self.target = target;
+        self.elapsed = Duration::ZERO;
+        true
+    }
+
+    fn advance(&mut self, delta: Duration) {
+        if !self.is_animating() {
+            return;
+        }
+        self.elapsed = self.elapsed.saturating_add(delta);
+        let progress = (self.elapsed.as_secs_f32() / MOTION_DURATION.as_secs_f32()).min(1.0);
+        let eased = 1.0 - (1.0 - progress).powi(3);
+        self.value = self.start + (self.target - self.start) * eased;
+        if progress >= 1.0 {
+            self.value = self.target;
+            self.start = self.target;
+            self.elapsed = Duration::ZERO;
+        }
+    }
+
+    fn is_animating(self) -> bool {
+        (self.value - self.target).abs() > MOTION_EPSILON
+    }
+
+    fn is_visible(self) -> bool {
+        self.value > MOTION_EPSILON
+    }
+}
+
+struct ReaderUiState {
+    sidebar_open: bool,
+    sidebar_pinned: bool,
+    toolbar_visible: bool,
+    overlay: ReaderOverlay,
+    draft_spread: SpreadMode,
+    sidebar_motion: Motion,
+    menu_motion: Motion,
+    settings_motion: Motion,
+    last_motion_tick: Option<Instant>,
+}
+
+impl ReaderUiState {
+    fn is_animating(&self) -> bool {
+        self.sidebar_motion.is_animating()
+            || self.menu_motion.is_animating()
+            || self.settings_motion.is_animating()
+    }
+
+    fn overlay_visible(&self) -> bool {
+        self.menu_motion.is_visible() || self.settings_motion.is_visible()
+    }
+}
+
+#[derive(Clone)]
+struct TocRow {
+    label: String,
+    target: Option<PublicationUrl>,
+    depth: usize,
+}
+
+impl DesktopReader {
+    fn new(mut reader: ReaderSession, cover: Option<ImageData>) -> Self {
+        let mut toc_rows = Vec::new();
+        flatten_toc(&reader.book().table_of_contents, 0, &mut toc_rows);
+        let draft_spread = reader.style().spread;
+        let error = reader
+            .prefetch_adjacent()
+            .err()
+            .map(|error| error.to_string());
+        Self {
+            reader: Mutex::new(reader),
+            toc_rows,
+            cover,
+            ui: ReaderUiState {
+                sidebar_open: true,
+                sidebar_pinned: true,
+                toolbar_visible: false,
+                overlay: ReaderOverlay::None,
+                draft_spread,
+                sidebar_motion: Motion::settled(1.0),
+                menu_motion: Motion::settled(0.0),
+                settings_motion: Motion::settled(0.0),
+                last_motion_tick: None,
+            },
+            canvas_size: None,
+            scene_revision: 0,
+            page_scenes: HashMap::new(),
+            page_scene_lru: VecDeque::new(),
+            error,
+        }
+    }
+
+    fn turn_page(&mut self, direction: PageDirection) {
+        let (previous_section, result) = {
+            let mut reader = self.reader();
+            let previous_section = reader.location().section_index;
+            let result = reader.turn_page(direction);
+            (previous_section, result)
+        };
+        match result {
+            Ok(PageTurn::Moved { section_index, .. }) => {
+                self.bump_scene_revision();
+                self.error = None;
+                if section_index != previous_section {
+                    self.prefetch();
+                }
+            }
+            Ok(PageTurn::Boundary { .. }) => self.error = None,
+            Err(error) => self.error = Some(format!("翻页失败：{error}")),
+        }
+    }
+
+    fn open_settings(&mut self) {
+        let spread = self.reader().style().spread;
+        self.ui.draft_spread = spread;
+        self.set_overlay(ReaderOverlay::Settings);
+    }
+
+    fn apply_settings(&mut self) {
+        let mut style = self.reader().style();
+        style.spread = self.ui.draft_spread;
+        let result = self.reader().set_style(style);
+        match result {
+            Ok(()) => {
+                self.close_overlay();
+                self.invalidate_page_scenes();
+                self.prefetch();
+            }
+            Err(error) => self.error = Some(format!("切换布局失败：{error}")),
+        }
+    }
+
+    fn go_to(&mut self, target: &PublicationUrl) {
+        let result = self.reader().go_to_href(target);
+        match result {
+            Ok(_) => {
+                self.bump_scene_revision();
+                self.error = None;
+                self.prefetch();
+            }
+            Err(error) => self.error = Some(format!("目录跳转失败：{error}")),
+        }
+    }
+
+    fn resize_canvas(&mut self, size: Size) {
+        let width = logical_dimension(size.width);
+        let height = logical_dimension(size.height);
+        if width == 0 || height == 0 || self.canvas_size == Some((width, height)) {
+            return;
+        }
+        if self.ui.sidebar_motion.is_animating() {
+            return;
+        }
+        let Ok(viewport) = LayoutViewport::new(width, height) else {
+            return;
+        };
+        let result = self.reader().resize(viewport);
+        match result {
+            Ok(()) => {
+                self.canvas_size = Some((width, height));
+                self.invalidate_page_scenes();
+                self.prefetch();
+            }
+            Err(error) => self.error = Some(format!("调整页面失败：{error}")),
+        }
+    }
+
+    fn prefetch(&mut self) {
+        let result = self
+            .reader()
+            .prefetch_adjacent()
+            .err()
+            .map(|error| format!("章节预取失败：{error}"));
+        self.error = result;
+    }
+
+    fn page_scene(&mut self) -> Arc<Scene> {
+        let key = {
+            let reader = self.reader();
+            let location = reader.location();
+            PageSceneKey {
+                section_index: location.section_index,
+                page_index: location.page_index,
+            }
+        };
+        if let Some(scene) = self.page_scenes.get(&key).cloned() {
+            self.touch_page_scene(key);
+            return scene;
+        }
+
+        let mut scene = Scene::new();
+        {
+            let mut bridge = XilemVelloScene::new(&mut scene);
+            self.reader().current_page().paint(&mut bridge);
+        }
+        let scene = Arc::new(scene);
+        self.page_scenes.insert(key, Arc::clone(&scene));
+        self.touch_page_scene(key);
+        while self.page_scenes.len() > PAGE_SCENE_CACHE_CAPACITY {
+            let Some(oldest) = self.page_scene_lru.pop_front() else {
+                break;
+            };
+            if oldest != key {
+                self.page_scenes.remove(&oldest);
+            }
+        }
+        scene
+    }
+
+    fn touch_page_scene(&mut self, key: PageSceneKey) {
+        if let Some(position) = self.page_scene_lru.iter().position(|entry| *entry == key) {
+            self.page_scene_lru.remove(position);
+        }
+        self.page_scene_lru.push_back(key);
+    }
+
+    fn bump_scene_revision(&mut self) {
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+    }
+
+    fn invalidate_page_scenes(&mut self) {
+        self.page_scenes.clear();
+        self.page_scene_lru.clear();
+        self.bump_scene_revision();
+    }
+
+    fn progress(&self) -> f64 {
+        let reader = self.reader();
+        let location = reader.location();
+        let to_f64 = |value: usize| f64::from(u32::try_from(value).unwrap_or(u32::MAX));
+        let section_count = to_f64(reader.book().sections.len().max(1));
+        let page_count = to_f64(location.page_count.max(1));
+        ((to_f64(location.section_index) + to_f64(location.page_index + 1) / page_count)
+            / section_count)
+            .clamp(0.0, 1.0)
+    }
+
+    fn reader(&self) -> MutexGuard<'_, ReaderSession> {
+        self.reader.lock().expect("reader mutex was poisoned")
+    }
+
+    fn set_sidebar_open(&mut self, open: bool) {
+        self.ui.sidebar_open = open;
+        if self
+            .ui
+            .sidebar_motion
+            .animate_to(if open { 1.0 } else { 0.0 })
+        {
+            self.ui.last_motion_tick = Some(Instant::now());
+        }
+    }
+
+    fn toggle_menu(&mut self) {
+        if self.ui.overlay == ReaderOverlay::Menu {
+            self.close_overlay();
+        } else {
+            self.set_overlay(ReaderOverlay::Menu);
+        }
+    }
+
+    fn close_overlay(&mut self) {
+        self.set_overlay(ReaderOverlay::None);
+    }
+
+    fn set_overlay(&mut self, overlay: ReaderOverlay) {
+        self.ui.overlay = overlay;
+        let menu_changed = self
+            .ui
+            .menu_motion
+            .animate_to(if overlay == ReaderOverlay::Menu {
+                1.0
+            } else {
+                0.0
+            });
+        let settings_changed =
+            self.ui
+                .settings_motion
+                .animate_to(if overlay == ReaderOverlay::Settings {
+                    1.0
+                } else {
+                    0.0
+                });
+        if menu_changed || settings_changed {
+            self.ui.last_motion_tick = Some(Instant::now());
+        }
+    }
+
+    fn advance_motion(&mut self, now: Instant) {
+        let delta = self
+            .ui
+            .last_motion_tick
+            .replace(now)
+            .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
+        let sidebar_was_animating = self.ui.sidebar_motion.is_animating();
+        self.ui.sidebar_motion.advance(delta);
+        self.ui.menu_motion.advance(delta);
+        self.ui.settings_motion.advance(delta);
+
+        if sidebar_was_animating && !self.ui.sidebar_motion.is_animating() {
+            // Reader layout is deliberately held stable during the slide. Trigger one
+            // final canvas draw so the EPUB is reflowed only once at the settled width.
+            self.bump_scene_revision();
+        }
+        if !self.ui.is_animating() {
+            self.ui.last_motion_tick = None;
+        }
+    }
+}
+
+fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
+    let progress = state.progress();
+    let sidebar_progress = state.ui.sidebar_motion.value.clamp(0.0, 1.0);
+    let sidebar_offset = -TOC_WIDTH * f64::from(1.0 - sidebar_progress);
+    let workspace: Box<AnyWidgetView<DesktopReader>> = if !state.ui.sidebar_motion.is_visible() {
+        reader_workspace(state, progress).boxed()
+    } else if state.ui.sidebar_pinned && !state.ui.sidebar_motion.is_animating() {
+        flex_row((toc_view(state), reader_workspace(state, progress).flex(1.0)))
+            .gap(0.px())
+            .boxed()
+    } else if state.ui.sidebar_pinned {
+        zstack((
+            flex_row((
+                sized_box(label(""))
+                    .width((TOC_WIDTH * f64::from(sidebar_progress)).px())
+                    .expand_height(),
+                reader_workspace(state, progress).flex(1.0),
+            )),
+            toc_view(state)
+                .transform(Affine::translate((sidebar_offset, 0.0)))
+                .alignment(UnitPoint::TOP_LEFT),
+        ))
+        .boxed()
+    } else {
+        zstack((
+            reader_workspace(state, progress),
+            animated_scrim(
+                sidebar_scrim_color(sidebar_progress),
+                |state: &mut DesktopReader| state.set_sidebar_open(false),
+            ),
+            toc_view(state)
+                .transform(Affine::translate((sidebar_offset, 0.0)))
+                .alignment(UnitPoint::TOP_LEFT),
+        ))
+        .boxed()
+    };
+    let settings_progress = state.ui.settings_motion.value.clamp(0.0, 1.0);
+    let settings_layer: Box<AnyWidgetView<DesktopReader>> = if state.ui.settings_motion.is_visible()
+    {
+        settings_overlay(state, settings_progress).boxed()
+    } else {
+        sized_box(label("")).width(0.px()).height(0.px()).boxed()
+    };
+    let animations_running = state.ui.is_animating();
+    let app = sized_box(zstack((workspace, settings_layer)))
+        .expand()
+        .background_color(UI_BACKGROUND);
+
+    fork(
+        app,
+        animations_running.then(|| {
+            task(
+                |proxy| async move {
+                    let mut interval = xilem::tokio::time::interval(MOTION_FRAME_INTERVAL);
+                    interval.set_missed_tick_behavior(xilem::tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        interval.tick().await;
+                        if proxy.message(Instant::now()).is_err() {
+                            break;
+                        }
+                    }
+                },
+                |state: &mut DesktopReader, now| state.advance_motion(now),
+            )
+        }),
+    )
+}
+
+fn reader_workspace(
+    state: &DesktopReader,
+    progress: f64,
+) -> impl WidgetView<DesktopReader> + use<> {
+    let (title, reader_background) = {
+        let reader = state.reader();
+        (
+            reader.book().metadata.title.clone(),
+            ui_color(reader.style().background),
+        )
+    };
+    let menu_open = state.ui.overlay == ReaderOverlay::Menu;
+    let menu_progress = state.ui.menu_motion.value.clamp(0.0, 1.0);
+    let menu_visible = state.ui.menu_motion.is_visible();
+    let toolbar_visible = state.ui.toolbar_visible || menu_visible;
+    let toolbar_content: Box<AnyWidgetView<DesktopReader>> = if toolbar_visible {
+        sized_box(reader_toolbar(
+            title,
+            state.ui.sidebar_open,
+            menu_open,
+            reader_background,
+        ))
+        .height(TOOLBAR_HEIGHT.px())
+        .expand_width()
+        .boxed()
+    } else {
+        sized_box(label("")).width(0.px()).height(0.px()).boxed()
+    };
+    let toolbar_layer = toolbar_content.alignment(UnitPoint::TOP);
+    let menu_scrim: Box<AnyWidgetView<DesktopReader>> = if menu_visible {
+        transparent_catcher(DesktopReader::close_overlay).boxed()
+    } else {
+        sized_box(label("")).width(0.px()).height(0.px()).boxed()
+    };
+    let menu_content: Box<AnyWidgetView<DesktopReader>> = if menu_visible {
+        flex_col((
+            FlexSpacer::Fixed((TOOLBAR_HEIGHT + 8.0).px()),
+            reader_menu().transform(Affine::translate((
+                0.0,
+                -8.0 * f64::from(1.0 - menu_progress),
+            ))),
+        ))
+        .padding(Padding::horizontal(12.0))
+        .boxed()
+    } else {
+        sized_box(label("")).width(0.px()).height(0.px()).boxed()
+    };
+    let menu_layer = menu_content.alignment(UnitPoint::TOP_RIGHT);
+    let pages = sized_box(flex_col((
+        reader_view(state.scene_revision, reader_background).flex(1.0),
+        progress_bar(progress),
+    )))
+    .expand();
+
+    sized_box(zstack((pages, menu_scrim, toolbar_layer, menu_layer)))
+        .expand()
+        .background_color(reader_background)
+}
+
+fn reader_view(scene_revision: u64, reader_background: Color) -> impl WidgetView<DesktopReader> {
+    sized_box(reader_canvas(
+        scene_revision,
+        |state: &mut DesktopReader, size| {
+            state.resize_canvas(size);
+            state.page_scene()
+        },
+        |state: &mut DesktopReader, action| match action {
+            ReaderCanvasAction::ToolbarVisibility(visible) => {
+                state.ui.toolbar_visible = visible;
+            }
+            ReaderCanvasAction::PreviousPage if !state.ui.overlay_visible() => {
+                state.turn_page(PageDirection::Previous);
+            }
+            ReaderCanvasAction::NextPage if !state.ui.overlay_visible() => {
+                state.turn_page(PageDirection::Next);
+            }
+            _ => {}
+        },
+    ))
+    .expand()
+    .background_color(reader_background)
+}
+
+fn toc_view(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
+    let (title, author) = sidebar_book_metadata(state);
+    let cover = state.cover.clone();
+    let toc_rows = state
+        .toc_rows
+        .iter()
+        .cloned()
+        .map(|row| toc_row_view(state, row))
+        .collect::<Vec<_>>();
+    sized_box(
+        flex_col((
+            sidebar_toolbar(state.ui.sidebar_pinned),
+            sidebar_book_summary(cover, title, author),
+            divider(),
+            sized_box(zstack((
+                portal(
+                    flex_col(toc_rows)
+                        .gap(2.px())
+                        .cross_axis_alignment(CrossAxisAlignment::Fill),
+                ),
+                // Masonry 0.4 clips the rounded scrollbar thumb at y=0, which leaves
+                // a jagged cap under the CPU renderer. Keep the draggable scrollbar,
+                // but mask only that defective top edge.
+                sized_box(label(""))
+                    .width(12.px())
+                    .height(8.px())
+                    .background_color(UI_SIDEBAR)
+                    .alignment(UnitPoint::TOP_RIGHT),
+            )))
+            .background_color(UI_SIDEBAR)
+            .padding(Padding::from_vh(6.0, 8.0))
+            .flex(1.0),
+        ))
+        .gap(4.px()),
+    )
+    .width(TOC_WIDTH.px())
+    .expand_height()
+    .background_color(UI_SIDEBAR)
+    .padding(Padding::from_vh(6.0, 10.0))
+}
+
+fn sidebar_toolbar(pinned: bool) -> impl WidgetView<DesktopReader> {
+    flex_row((
+        icon_button(Icon::PanelLeft, false, |state: &mut DesktopReader| {
+            state.set_sidebar_open(false);
+        }),
+        FlexSpacer::Flex(1.0),
+        icon_button(
+            if pinned { Icon::Pin } else { Icon::PinOff },
+            pinned,
+            |state: &mut DesktopReader| {
+                state.ui.sidebar_pinned = !state.ui.sidebar_pinned;
+            },
+        ),
+    ))
+    .cross_axis_alignment(CrossAxisAlignment::Center)
+}
+
+fn sidebar_book_metadata(state: &DesktopReader) -> (String, String) {
+    let reader = state.reader();
+    let title = reader.book().metadata.title.clone();
+    let author = if reader.book().metadata.authors.is_empty() {
+        "未知作者".to_owned()
+    } else {
+        reader.book().metadata.authors.join(" / ")
+    };
+    (title, author)
+}
+
+fn sidebar_book_summary(
+    cover: Option<ImageData>,
+    title: String,
+    author: String,
+) -> impl WidgetView<DesktopReader> {
+    flex_row((
+        sidebar_book_cover(cover),
+        flex_col((
+            prose(title)
+                .text_size(13.5)
+                .weight(FontWeight::BOLD)
+                .text_color(UI_TEXT),
+            label(author).text_size(11.5).color(UI_MUTED),
+        ))
+        .gap(4.px())
+        .cross_axis_alignment(CrossAxisAlignment::Start)
+        .flex(1.0),
+    ))
+    .gap(12.px())
+    .cross_axis_alignment(CrossAxisAlignment::Center)
+    .padding(Padding::from_vh(14.0, 4.0))
+}
+
+fn sidebar_book_cover(cover: Option<ImageData>) -> Box<AnyWidgetView<DesktopReader>> {
+    if let Some(cover) = cover {
+        sized_box(image(cover).fit(ObjectFit::Contain))
+            .width(54.px())
+            .height(74.px())
+            .background_color(UI_SURFACE_MUTED)
+            .border(UI_BORDER, 1.0)
+            .corner_radius(8.0)
+            .boxed()
+    } else {
+        sized_box(
+            flex_col((
+                label("电子书")
+                    .text_size(10.0)
+                    .weight(FontWeight::BOLD)
+                    .color(UI_ACCENT),
+                label("EPUB").text_size(10.0).color(UI_MUTED),
+            ))
+            .gap(2.px())
+            .cross_axis_alignment(CrossAxisAlignment::Center)
+            .main_axis_alignment(MainAxisAlignment::Center),
+        )
+        .width(54.px())
+        .height(74.px())
+        .background_color(UI_ACCENT_SOFT)
+        .border(UI_ACCENT_BORDER, 1.0)
+        .corner_radius(8.0)
+        .boxed()
+    }
+}
+
+fn toc_row_view(state: &DesktopReader, row: TocRow) -> impl WidgetView<DesktopReader> + use<> {
+    let target = row.target;
+    let reader = state.reader();
+    let selected = target
+        .as_ref()
+        .and_then(|target| reader.section_index_for_href(target))
+        == Some(reader.location().section_index);
+    drop(reader);
+    let row_label = format!("{}{}", "    ".repeat(row.depth), row.label);
+    let (background, foreground) = if selected {
+        (UI_ACCENT_SOFT, UI_ACCENT)
+    } else {
+        (UI_SIDEBAR, UI_TEXT_SOFT)
+    };
+    sized_box(
+        button(
+            flex_row((
+                label(row_label)
+                    .text_size(13.0)
+                    .weight(if selected {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .color(foreground),
+                FlexSpacer::Flex(1.0),
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Center),
+            move |state: &mut DesktopReader| {
+                if let Some(target) = &target {
+                    state.go_to(target);
+                }
+            },
+        )
+        .background_color(background)
+        .active_background_color(UI_SURFACE_MUTED)
+        .border_color(background)
+        .hovered_border_color(if selected {
+            UI_ACCENT_BORDER
+        } else {
+            UI_BORDER
+        })
+        .corner_radius(10.0)
+        .padding(Padding::from_vh(8.0, 12.0)),
+    )
+    .height(40.px())
+    .expand_width()
+}
+
+fn reader_toolbar(
+    title: String,
+    toc_open: bool,
+    menu_open: bool,
+    reader_background: Color,
+) -> impl WidgetView<DesktopReader> {
+    let left: Box<AnyWidgetView<DesktopReader>> = if toc_open {
+        sized_box(label("")).width(32.px()).height(32.px()).boxed()
+    } else {
+        icon_button(Icon::PanelLeft, false, |state: &mut DesktopReader| {
+            state.set_sidebar_open(true);
+        })
+        .boxed()
+    };
+    flex_row((
+        left,
+        FlexSpacer::Flex(1.0),
+        label(title)
+            .text_size(13.5)
+            .weight(FontWeight::BOLD)
+            .color(UI_TEXT),
+        FlexSpacer::Flex(1.0),
+        icon_button(Icon::Menu, menu_open, DesktopReader::toggle_menu),
+    ))
+    .gap(8.px())
+    .cross_axis_alignment(CrossAxisAlignment::Center)
+    .background_color(reader_background)
+    .padding(Padding::from_vh(6.0, 12.0))
+}
+
+fn icon_button(
+    icon: Icon,
+    selected: bool,
+    callback: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
+) -> impl WidgetView<DesktopReader> {
+    let background = if selected {
+        UI_SURFACE_MUTED
+    } else {
+        Color::TRANSPARENT
+    };
+    sized_box(
+        button(
+            icon_label(icon, 16.0, if selected { UI_TEXT } else { UI_MUTED }),
+            callback,
+        )
+        .background_color(background)
+        .active_background_color(UI_SURFACE_MUTED)
+        .border_color(Color::TRANSPARENT)
+        .hovered_border_color(Color::TRANSPARENT)
+        .border_width(0.0)
+        .corner_radius(8.0)
+        .padding(0.0),
+    )
+    .width(32.px())
+    .height(32.px())
+}
+
+fn icon_label(icon: Icon, size: f32, color: Color) -> impl WidgetView<DesktopReader> {
+    label(char::from(icon).to_string())
+        .font("lucide")
+        .text_size(size)
+        .color(color)
+}
+
+fn reader_menu() -> impl WidgetView<DesktopReader> {
+    sized_box(menu_row(
+        Icon::Settings,
+        "设置",
+        DesktopReader::open_settings,
+    ))
+    .width(180.px())
+    .background_color(UI_SURFACE)
+    .border(UI_BORDER, 1.0)
+    .corner_radius(12.0)
+    .padding(6.0)
+}
+
+fn menu_row(
+    icon: Icon,
+    text: &'static str,
+    callback: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
+) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        button(
+            flex_row((
+                icon_label(icon, 16.0, UI_MUTED),
+                label(text).text_size(14.0).color(UI_TEXT_SOFT),
+                FlexSpacer::Flex(1.0),
+            ))
+            .gap(12.px())
+            .cross_axis_alignment(CrossAxisAlignment::Center)
+            .must_fill_major_axis(true),
+            callback,
+        )
+        .background_color(UI_SURFACE)
+        .active_background_color(UI_SURFACE_MUTED)
+        .border_color(Color::TRANSPARENT)
+        .hovered_border_color(UI_BORDER)
+        .corner_radius(8.0)
+        .padding(Padding::from_vh(10.0, 12.0)),
+    )
+    .height(48.px())
+    .expand_width()
+}
+
+fn progress_bar(progress: f64) -> impl WidgetView<DesktopReader> {
+    let completed = progress.clamp(0.0, 1.0).max(0.0001);
+    let remaining = (1.0 - progress).clamp(0.0, 1.0).max(0.0001);
+    sized_box(
+        flex_row((
+            sized_box(label(""))
+                .expand_width()
+                .height(PROGRESS_HEIGHT.px())
+                .background_color(UI_ACCENT)
+                .flex(completed),
+            sized_box(label(""))
+                .expand_width()
+                .height(PROGRESS_HEIGHT.px())
+                .background_color(UI_SURFACE_MUTED)
+                .flex(remaining),
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Fill),
+    )
+    .height(PROGRESS_HEIGHT.px())
+    .expand_width()
+}
+
+fn settings_overlay(
+    state: &DesktopReader,
+    progress: f32,
+) -> impl WidgetView<DesktopReader> + use<> {
+    let scale = 0.97 + 0.03 * f64::from(progress);
+    let offset = 12.0 * f64::from(1.0 - progress);
+    let dialog_transform =
+        Affine::scale_about(scale, (SETTINGS_WIDTH / 2.0, SETTINGS_HEIGHT / 2.0))
+            .then_translate((0.0, offset).into());
+    sized_box(zstack((
+        animated_scrim(modal_scrim_color(progress), DesktopReader::close_overlay),
+        sized_box(settings_dialog(state))
+            .width(SETTINGS_WIDTH.px())
+            .height(SETTINGS_HEIGHT.px())
+            .background_color(UI_SURFACE)
+            .border(UI_BORDER, 1.0)
+            .corner_radius(18.0)
+            .transform(dialog_transform),
+    )))
+    .expand()
+}
+
+fn settings_dialog(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
+    settings_content(state)
+}
+
+fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
+    let spread = state.ui.draft_spread;
+    flex_col((
+        flex_row((
+            flex_row((
+                icon_label(Icon::Settings, 18.0, UI_MUTED),
+                label("设置")
+                    .text_size(16.0)
+                    .weight(FontWeight::BOLD)
+                    .color(UI_TEXT),
+            ))
+            .gap(10.px())
+            .cross_axis_alignment(CrossAxisAlignment::Center),
+            FlexSpacer::Flex(1.0),
+            icon_button(Icon::X, false, DesktopReader::close_overlay),
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Center)
+        .padding(Padding::from_vh(10.0, 16.0)),
+        divider(),
+        flex_col((
+            label("排版")
+                .text_size(12.0)
+                .weight(FontWeight::BOLD)
+                .color(UI_MUTED),
+            sized_box(flex_col((
+                settings_value_row("阅读模式", "分页"),
+                divider(),
+                spread_settings_row(spread),
+            )))
+            .background_color(UI_SURFACE)
+            .border(UI_BORDER, 1.0)
+            .corner_radius(12.0),
+        ))
+        .gap(10.px())
+        .cross_axis_alignment(CrossAxisAlignment::Fill)
+        .padding(Padding::from_vh(18.0, 20.0))
+        .flex(1.0),
+        divider(),
+        sized_box(
+            flex_row((
+                FlexSpacer::Flex(1.0),
+                secondary_action_button("取消", DesktopReader::close_overlay),
+                primary_action_button("应用", DesktopReader::apply_settings),
+            ))
+            .gap(8.px())
+            .cross_axis_alignment(CrossAxisAlignment::Center),
+        )
+        .height(56.px())
+        .expand_width()
+        .padding(Padding::horizontal(16.0)),
+    ))
+}
+
+fn settings_value_row(name: &'static str, value: &'static str) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        flex_row((
+            label(name).text_size(13.0).color(UI_TEXT_SOFT),
+            FlexSpacer::Flex(1.0),
+            value_badge(value),
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(64.px())
+    .expand_width()
+    .padding(Padding::horizontal(16.0))
+}
+
+fn spread_settings_row(spread: SpreadMode) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        flex_row((
+            label("分页方式").text_size(13.0).color(UI_TEXT_SOFT),
+            FlexSpacer::Flex(1.0),
+            spread_choice("单栏", SpreadMode::Single, spread),
+            spread_choice("双栏", SpreadMode::Double, spread),
+        ))
+        .gap(6.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(64.px())
+    .expand_width()
+    .padding(Padding::horizontal(16.0))
+}
+
+fn spread_choice(
+    text: &'static str,
+    value: SpreadMode,
+    selected: SpreadMode,
+) -> impl WidgetView<DesktopReader> {
+    let active = value == selected;
+    sized_box(
+        button(
+            label(text)
+                .text_size(12.0)
+                .weight(if active {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
+            move |state: &mut DesktopReader| state.ui.draft_spread = value,
+        )
+        .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
+        .active_background_color(UI_ACCENT_SOFT)
+        .border_color(if active { UI_ACCENT_BORDER } else { UI_BORDER })
+        .hovered_border_color(UI_ACCENT_BORDER)
+        .corner_radius(8.0)
+        .padding(Padding::from_vh(6.0, 10.0)),
+    )
+    .width(62.px())
+    .height(34.px())
+}
+
+fn value_badge(text: &'static str) -> impl WidgetView<DesktopReader> {
+    sized_box(label(text).text_size(12.0).color(UI_TEXT_SOFT))
+        .height(34.px())
+        .background_color(UI_SURFACE)
+        .border(UI_BORDER, 1.0)
+        .corner_radius(8.0)
+        .padding(Padding::from_vh(7.0, 12.0))
+}
+
+fn primary_action_button(
+    text: &'static str,
+    callback: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
+) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        button(
+            label(text)
+                .text_size(12.5)
+                .weight(FontWeight::BOLD)
+                .color(UI_SURFACE),
+            callback,
+        )
+        .background_color(UI_ACCENT)
+        .active_background_color(UI_TEXT)
+        .border_color(UI_ACCENT)
+        .corner_radius(8.0)
+        .padding(Padding::from_vh(7.0, 14.0)),
+    )
+    .height(36.px())
+}
+
+fn secondary_action_button(
+    text: &'static str,
+    callback: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
+) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        button(label(text).text_size(12.5).color(UI_TEXT_SOFT), callback)
+            .background_color(UI_SURFACE)
+            .active_background_color(UI_SURFACE_MUTED)
+            .border_color(UI_SURFACE)
+            .hovered_border_color(UI_BORDER)
+            .corner_radius(8.0)
+            .padding(Padding::from_vh(7.0, 12.0)),
+    )
+    .height(36.px())
+}
+
+fn animated_scrim(
+    color: Color,
+    callback: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
+) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        button(label(""), callback)
+            .background_color(Color::TRANSPARENT)
+            .active_background_color(Color::TRANSPARENT)
+            .border_color(Color::TRANSPARENT)
+            .hovered_border_color(Color::TRANSPARENT)
+            .border_width(0.0)
+            .padding(0.0),
+    )
+    .expand()
+    .background_color(color)
+}
+
+fn transparent_catcher(
+    callback: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
+) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        button(label(""), callback)
+            .background_color(Color::TRANSPARENT)
+            .active_background_color(Color::TRANSPARENT)
+            .border_color(Color::TRANSPARENT)
+            .hovered_border_color(Color::TRANSPARENT)
+            .border_width(0.0)
+            .padding(0.0),
+    )
+    .expand()
+}
+
+fn divider() -> impl WidgetView<DesktopReader> {
+    sized_box(label(""))
+        .height(1.px())
+        .expand_width()
+        .background_color(UI_BORDER)
+}
+
+fn sidebar_scrim_color(progress: f32) -> Color {
+    Color::from_rgb8(0, 0, 0).with_alpha(SIDEBAR_SCRIM_ALPHA * progress)
+}
+
+fn modal_scrim_color(progress: f32) -> Color {
+    Color::from_rgb8(0x1f, 0x2d, 0x3d).with_alpha(MODAL_SCRIM_ALPHA * progress)
+}
+
+fn ui_color(color: Rgba) -> Color {
+    Color::from_rgba8(color.red, color.green, color.blue, color.alpha)
+}
+
+fn flatten_toc(entries: &[TocEntry], depth: usize, rows: &mut Vec<TocRow>) {
+    for entry in entries {
+        rows.push(TocRow {
+            label: entry.label.clone(),
+            target: entry.href.clone(),
+            depth,
+        });
+        flatten_toc(&entry.children, depth + 1, rows);
+    }
+}
+
+fn diagnose_reader(
+    mut reader: ReaderSession,
+    started: Instant,
+    parsed: Instant,
+    laid_out: Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prefetch_started = Instant::now();
+    reader.prefetch_adjacent()?;
+    let prefetch_dispatched = Instant::now();
+    reader.wait_for_prefetch()?;
+    let prefetched = Instant::now();
+    let switch_started = Instant::now();
+    let _ = reader.turn_page(PageDirection::Next)?;
+    let switched = Instant::now();
+    let cached_page_turn_ms = if reader.location().page_count > 1 {
+        let page_turn_started = Instant::now();
+        let _ = reader.turn_page(PageDirection::Next)?;
+        Some(page_turn_started.elapsed().as_secs_f64() * 1000.0)
+    } else {
+        None
+    };
+    let page = reader.current_page();
+    let scene_build_started = Instant::now();
+    let mut vello_scene = Scene::new();
+    {
+        let mut bridge = XilemVelloScene::new(&mut vello_scene);
+        page.paint(&mut bridge);
+    }
+    let scene_built = Instant::now();
+    let cpu_paint_started = Instant::now();
+    let rgba = anyrender::render_to_buffer::<VelloCpuImageRenderer, _>(
+        |scene| page.paint(scene),
+        page.width(),
+        page.height(),
+    );
+    let painted = Instant::now();
+    let distinct_colors = rgba
+        .chunks_exact(4)
+        .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+        .collect::<HashSet<_>>()
+        .len();
+    let non_transparent_pixels = rgba.chunks_exact(4).filter(|pixel| pixel[3] != 0).count();
+    let location = reader.location();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "architecture": "EPUB parser -> reading IR -> Parley pagination -> cached display list -> Vello",
+            "backend": "Vello CPU offscreen",
+            "parser_ms": elapsed_ms(started, parsed),
+            "layout_and_compile_ms": elapsed_ms(parsed, laid_out),
+            "prefetch_dispatch_ms": elapsed_ms(prefetch_started, prefetch_dispatched),
+            "prefetch_complete_ms": elapsed_ms(prefetch_started, prefetched),
+            "cached_section_switch_ms": elapsed_ms(switch_started, switched),
+            "cached_page_turn_ms": cached_page_turn_ms,
+            "vello_scene_build_ms": elapsed_ms(scene_build_started, scene_built),
+            "cpu_raster_paint_ms": elapsed_ms(cpu_paint_started, painted),
+            "total_ms": elapsed_ms(started, painted),
+            "book": {
+                "title": reader.book().metadata.title,
+                "section_count": reader.book().sections.len(),
+            },
+            "location": {
+                "section_index": location.section_index,
+                "page_index": location.page_index,
+                "page_count": location.page_count,
+            },
+            "display_list": {
+                "command_count": page.command_count(),
+                "width": page.width(),
+                "height": page.height(),
+            },
+            "render_target": {
+                "rgba_bytes": rgba.len(),
+                "non_transparent_pixels": non_transparent_pixels,
+                "distinct_colors": distinct_colors,
+            },
+        }))?
+    );
     Ok(())
 }
 
@@ -100,17 +1262,103 @@ fn usage(executable: &str) -> String {
     format!("usage: {executable} [--diagnose] <book.epub>")
 }
 
+fn decode_cover(bytes: &[u8]) -> Result<ImageData, ::image::ImageError> {
+    let pixels = ::image::load_from_memory(bytes)?.into_rgba8();
+    let width = pixels.width();
+    let height = pixels.height();
+    Ok(ImageData {
+        data: Blob::new(Arc::new(pixels.into_vec())),
+        format: ImageFormat::Rgba8,
+        alpha_type: ImageAlphaType::Alpha,
+        width,
+        height,
+    })
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn logical_dimension(value: f64) -> u32 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    value.round().clamp(1.0, f64::from(u32::MAX)) as u32
+}
+
 fn elapsed_ms(start: Instant, end: Instant) -> f64 {
     end.duration_since(start).as_secs_f64() * 1000.0
 }
 
-fn process_peak_resident_kib() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    status.lines().find_map(|line| {
-        line.strip_prefix("VmHWM:")?
-            .split_ascii_whitespace()
-            .next()?
-            .parse()
-            .ok()
-    })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flatten_toc_preserves_reading_order_and_depth() {
+        let first_target = PublicationUrl::parse("text/chapter-1.xhtml").unwrap();
+        let child_target = PublicationUrl::parse("text/chapter-1.xhtml#part-1").unwrap();
+        let entries = vec![
+            TocEntry {
+                label: "第一章".into(),
+                href: Some(first_target.clone()),
+                children: vec![TocEntry {
+                    label: "第一节".into(),
+                    href: Some(child_target.clone()),
+                    children: Vec::new(),
+                }],
+            },
+            TocEntry {
+                label: "第二章".into(),
+                href: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut rows = Vec::new();
+        flatten_toc(&entries, 0, &mut rows);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!((rows[0].label.as_str(), rows[0].depth), ("第一章", 0));
+        assert_eq!(rows[0].target.as_ref(), Some(&first_target));
+        assert_eq!((rows[1].label.as_str(), rows[1].depth), ("第一节", 1));
+        assert_eq!(rows[1].target.as_ref(), Some(&child_target));
+        assert_eq!((rows[2].label.as_str(), rows[2].depth), ("第二章", 0));
+        assert!(rows[2].target.is_none());
+    }
+
+    #[test]
+    fn logical_dimension_rejects_invalid_sizes_and_rounds_pixels() {
+        assert_eq!(logical_dimension(f64::NAN), 0);
+        assert_eq!(logical_dimension(f64::INFINITY), 0);
+        assert_eq!(logical_dimension(-1.0), 0);
+        assert_eq!(logical_dimension(0.0), 0);
+        assert_eq!(logical_dimension(10.4), 10);
+        assert_eq!(logical_dimension(10.6), 11);
+    }
+
+    #[test]
+    fn motion_reaches_its_target_with_ease_out_timing() {
+        let mut motion = Motion::settled(0.0);
+
+        assert!(motion.animate_to(1.0));
+        motion.advance(MOTION_DURATION / 2);
+        assert!(motion.value > 0.5);
+        assert!(motion.is_animating());
+
+        motion.advance(MOTION_DURATION / 2);
+        assert!((motion.value - 1.0).abs() <= f32::EPSILON);
+        assert!(!motion.is_animating());
+    }
+
+    #[test]
+    fn motion_can_reverse_without_jumping() {
+        let mut motion = Motion::settled(0.0);
+        motion.animate_to(1.0);
+        motion.advance(MOTION_DURATION / 3);
+        let value_before_reverse = motion.value;
+
+        assert!(motion.animate_to(0.0));
+        assert!((motion.value - value_before_reverse).abs() <= f32::EPSILON);
+        motion.advance(MOTION_DURATION);
+        assert!(motion.value.abs() <= f32::EPSILON);
+        assert!(!motion.is_visible());
+    }
 }

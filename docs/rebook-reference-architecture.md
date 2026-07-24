@@ -1,5 +1,7 @@
 # rebook / rebook-web 架构复盘与 Rust 迁移方案
 
+> 历史调研：其中的领域边界仍可参考，但 DOM/Stylo/Taffy/Blitz 主链已被破坏性替换。现行架构见 [ADR-0001](adr-0001-native-epub-renderer.md) 和 [当前状态](phase-0-status.md)。
+
 - 调研日期：2026-07-23
 - 调研对象：本地 `rebook` 与 `rebook-web` 当前工作树
 - 基线提交：`rebook@0176bae`、`rebook-web@b17d768`

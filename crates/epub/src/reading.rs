@@ -1,0 +1,894 @@
+use std::collections::HashMap;
+
+use rebook_publication::{
+    Block, BlockStyle, ImageBlock, ImageLength, ImageStyle, Inline, PublicationUrl, Rgba, Section,
+    SourceAnchor, SourceRange, SpineItem, SpineItemId, TextAlignment, TextBlock, TextBlockKind,
+    TextRun, TextStyle,
+};
+use roxmltree::{Document, Node};
+
+use super::{EpubError, attribute_local};
+
+pub(super) fn parse_section(
+    xml: &str,
+    descriptor: &SpineItem,
+    mut load_stylesheet: impl FnMut(&PublicationUrl) -> Result<String, EpubError>,
+) -> Result<Section, EpubError> {
+    let document = Document::parse(xml).map_err(|error| EpubError::InvalidXml {
+        resource: descriptor.href.to_string(),
+        message: error.to_string(),
+    })?;
+    let styles = StyleSheet::from_document(&document, &descriptor.href, &mut load_stylesheet);
+    let root = document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "body")
+        .unwrap_or_else(|| document.root_element());
+    let mut parser = ReadingIrParser::new(descriptor.id.clone(), descriptor.href.clone(), styles);
+    parser.parse_children(root)?;
+
+    if parser.blocks.is_empty() {
+        let style = parser.styles.block_style(root, BlockStyle::default());
+        parser.push_text_block(root, TextBlockKind::Paragraph, style)?;
+    }
+
+    Ok(Section {
+        id: descriptor.id.clone(),
+        href: descriptor.href.clone(),
+        blocks: parser.blocks,
+    })
+}
+
+struct ReadingIrParser {
+    section_id: SpineItemId,
+    section_href: PublicationUrl,
+    next_node: u64,
+    blocks: Vec<Block>,
+    styles: StyleSheet,
+}
+
+impl ReadingIrParser {
+    fn new(section_id: SpineItemId, section_href: PublicationUrl, styles: StyleSheet) -> Self {
+        Self {
+            section_id,
+            section_href,
+            next_node: 0,
+            blocks: Vec::new(),
+            styles,
+        }
+    }
+
+    fn parse_children(&mut self, parent: Node<'_, '_>) -> Result<(), EpubError> {
+        for node in parent.children() {
+            if !node.is_element() {
+                continue;
+            }
+            let name = node.tag_name().name().to_ascii_lowercase();
+            match name.as_str() {
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                    let level = name[1..].parse::<u8>().unwrap_or(1);
+                    let mut style = self.styles.block_style(
+                        node,
+                        BlockStyle {
+                            margin_before: 32.0,
+                            margin_after: 8.0,
+                            indent: 0.0,
+                            line_height: 1.3,
+                            ..BlockStyle::default()
+                        },
+                    );
+                    style.indent = 0.0;
+                    self.push_text_block(node, TextBlockKind::Heading(level), style)?;
+                }
+                "p" => {
+                    let mut style = self.styles.block_style(node, BlockStyle::default());
+                    style.indent = 0.0;
+                    self.push_text_block(node, TextBlockKind::Paragraph, style)?;
+                }
+                "blockquote" => {
+                    let mut style = self.styles.block_style(node, BlockStyle::default());
+                    style.indent += 24.0;
+                    self.push_text_block(node, TextBlockKind::Blockquote, style)?;
+                }
+                "pre" => {
+                    let style = self.styles.block_style(
+                        node,
+                        BlockStyle {
+                            line_height: 1.35,
+                            ..BlockStyle::default()
+                        },
+                    );
+                    self.push_text_block(node, TextBlockKind::Preformatted, style)?;
+                }
+                "ul" => self.parse_list(node, false)?,
+                "ol" => self.parse_list(node, true)?,
+                "img" => self.push_image(node)?,
+                "hr" => self.blocks.push(Block::Separator),
+                "br" => self.blocks.push(Block::PageBreak),
+                "script" | "style" | "head" | "nav" => {}
+                _ => self.parse_children(node)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_list(&mut self, list: Node<'_, '_>, ordered: bool) -> Result<(), EpubError> {
+        let mut ordinal = 1_u32;
+        for item in list
+            .children()
+            .filter(|node| node.is_element() && node.tag_name().name().eq_ignore_ascii_case("li"))
+        {
+            let mut style = self.styles.block_style(item, BlockStyle::default());
+            style.indent += 24.0;
+            self.push_text_block(item, TextBlockKind::ListItem { ordered, ordinal }, style)?;
+            ordinal = ordinal.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn push_text_block(
+        &mut self,
+        node: Node<'_, '_>,
+        kind: TextBlockKind,
+        style: BlockStyle,
+    ) -> Result<(), EpubError> {
+        let node_id = self.allocate_node();
+        let mut collector = InlineCollector::new(matches!(kind, TextBlockKind::Preformatted));
+        collect_inline(
+            node,
+            self.styles.text_style_for_block(node, kind),
+            None,
+            &self.section_href,
+            &self.styles,
+            &mut collector,
+        );
+        collector.finish();
+        let text_len = collector
+            .content
+            .iter()
+            .map(|inline| match inline {
+                Inline::Text(run) => run.text.chars().count() as u64,
+                Inline::Break => 1,
+            })
+            .sum();
+        if text_len > 0 {
+            self.blocks.push(Block::Text(TextBlock {
+                kind,
+                content: collector.content,
+                style,
+                source: Some(self.source_range(&node_id, text_len)),
+            }));
+        }
+
+        for image in node.descendants().filter(|descendant| {
+            descendant != &node
+                && descendant.is_element()
+                && descendant.tag_name().name().eq_ignore_ascii_case("img")
+        }) {
+            self.push_image(image)?;
+        }
+        Ok(())
+    }
+
+    fn push_image(&mut self, node: Node<'_, '_>) -> Result<(), EpubError> {
+        let Some(src) = attribute_local(node, "src").filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(());
+        };
+        let href = self.section_href.resolve(src)?.resource_url();
+        let node_id = self.allocate_node();
+        self.blocks.push(Block::Image(ImageBlock {
+            href,
+            alt: attribute_local(node, "alt").unwrap_or_default().to_owned(),
+            style: self.styles.image_style(node),
+            source: Some(self.source_range(&node_id, 0)),
+        }));
+        Ok(())
+    }
+
+    fn allocate_node(&mut self) -> String {
+        let id = format!("n{}", self.next_node);
+        self.next_node = self.next_node.saturating_add(1);
+        id
+    }
+
+    fn source_range(&self, node: &str, text_len: u64) -> SourceRange {
+        SourceRange {
+            start: SourceAnchor {
+                spine: self.section_id.clone(),
+                node: node.to_owned(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: self.section_id.clone(),
+                node: node.to_owned(),
+                text_offset: text_len,
+            },
+        }
+    }
+}
+
+struct InlineCollector {
+    content: Vec<Inline>,
+    preserve_whitespace: bool,
+    last_was_space: bool,
+}
+
+impl InlineCollector {
+    fn new(preserve_whitespace: bool) -> Self {
+        Self {
+            content: Vec::new(),
+            preserve_whitespace,
+            last_was_space: true,
+        }
+    }
+
+    fn push_text(&mut self, text: &str, style: TextStyle, link: Option<PublicationUrl>) {
+        let normalized = if self.preserve_whitespace {
+            text.to_owned()
+        } else {
+            let mut result = String::new();
+            for character in text.chars() {
+                if character.is_whitespace() {
+                    if !self.last_was_space {
+                        result.push(' ');
+                        self.last_was_space = true;
+                    }
+                } else {
+                    result.push(character);
+                    self.last_was_space = false;
+                }
+            }
+            result
+        };
+        if normalized.is_empty() {
+            return;
+        }
+        if let Some(Inline::Text(previous)) = self.content.last_mut()
+            && previous.style == style
+            && previous.link == link
+        {
+            previous.text.push_str(&normalized);
+        } else {
+            self.content.push(Inline::Text(TextRun {
+                text: normalized,
+                style,
+                link,
+            }));
+        }
+    }
+
+    fn push_break(&mut self) {
+        self.content.push(Inline::Break);
+        self.last_was_space = true;
+    }
+
+    fn finish(&mut self) {
+        if let Some(Inline::Text(run)) = self.content.last_mut() {
+            while run.text.ends_with(' ') {
+                run.text.pop();
+            }
+        }
+        self.content
+            .retain(|inline| !matches!(inline, Inline::Text(run) if run.text.is_empty()));
+    }
+}
+
+fn collect_inline(
+    node: Node<'_, '_>,
+    inherited: TextStyle,
+    link: Option<&PublicationUrl>,
+    base: &PublicationUrl,
+    styles: &StyleSheet,
+    collector: &mut InlineCollector,
+) {
+    for child in node.children() {
+        if child.is_text() {
+            collector.push_text(child.text().unwrap_or_default(), inherited, link.cloned());
+            continue;
+        }
+        if !child.is_element() {
+            continue;
+        }
+        let name = child.tag_name().name().to_ascii_lowercase();
+        if name == "br" {
+            collector.push_break();
+            continue;
+        }
+        if matches!(name.as_str(), "img" | "script" | "style") {
+            continue;
+        }
+
+        let mut style = inherited;
+        match name.as_str() {
+            "strong" | "b" => style.bold = true,
+            "em" | "i" | "cite" => style.italic = true,
+            "u" => style.underline = true,
+            "small" => style.size_scale *= 0.85,
+            "big" => style.size_scale *= 1.2,
+            _ => {}
+        }
+        styles.apply_text_node(child, &mut style, inherited.size_scale);
+        if name == "a" {
+            let resolved = attribute_local(child, "href").and_then(|href| base.resolve(href).ok());
+            collect_inline(
+                child,
+                style,
+                resolved.as_ref().or(link),
+                base,
+                styles,
+                collector,
+            );
+        } else {
+            collect_inline(child, style, link, base, styles, collector);
+        }
+    }
+}
+
+#[derive(Default)]
+struct StyleSheet {
+    rules: Vec<StyleRule>,
+    next_order: usize,
+}
+
+struct StyleRule {
+    selector: SimpleSelector,
+    specificity: u16,
+    order: usize,
+    declarations: Vec<(String, String)>,
+}
+
+struct SimpleSelector {
+    tag: Option<String>,
+    id: Option<String>,
+    classes: Vec<String>,
+}
+
+impl StyleSheet {
+    fn from_document(
+        document: &Document<'_>,
+        base: &PublicationUrl,
+        load_stylesheet: &mut impl FnMut(&PublicationUrl) -> Result<String, EpubError>,
+    ) -> Self {
+        let mut sheet = Self::default();
+        for node in document.descendants().filter(Node::is_element) {
+            match node.tag_name().name().to_ascii_lowercase().as_str() {
+                "style" => {
+                    let css = node
+                        .descendants()
+                        .filter(Node::is_text)
+                        .filter_map(|text| text.text())
+                        .collect::<String>();
+                    sheet.add_css(&css);
+                }
+                "link"
+                    if attribute_local(node, "rel").is_some_and(|rel| {
+                        rel.split_ascii_whitespace()
+                            .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+                    }) =>
+                {
+                    let Some(href) = attribute_local(node, "href") else {
+                        continue;
+                    };
+                    let Ok(href) = base.resolve(href).map(|url| url.resource_url()) else {
+                        continue;
+                    };
+                    if let Ok(css) = load_stylesheet(&href) {
+                        sheet.add_css(&css);
+                    }
+                }
+                _ => {}
+            }
+        }
+        sheet
+    }
+
+    fn add_css(&mut self, css: &str) {
+        let css = strip_css_comments(css);
+        let mut cursor = 0;
+        while let Some(relative_open) = css[cursor..].find('{') {
+            let open = cursor + relative_open;
+            let Some(close) = matching_brace(&css, open) else {
+                break;
+            };
+            let prelude = css[cursor..open].trim();
+            if !prelude.starts_with('@') {
+                let declarations = declarations(&css[open + 1..close]).collect::<Vec<_>>();
+                for raw_selector in prelude.split(',') {
+                    let Some(selector) = SimpleSelector::parse(raw_selector) else {
+                        continue;
+                    };
+                    self.rules.push(StyleRule {
+                        specificity: selector.specificity(),
+                        selector,
+                        order: self.next_order,
+                        declarations: declarations.clone(),
+                    });
+                }
+                self.next_order = self.next_order.saturating_add(1);
+            }
+            cursor = close.saturating_add(1);
+        }
+    }
+
+    fn block_style(&self, node: Node<'_, '_>, mut style: BlockStyle) -> BlockStyle {
+        let mut ancestors = node
+            .ancestors()
+            .filter(Node::is_element)
+            .collect::<Vec<_>>();
+        ancestors.reverse();
+        for ancestor in ancestors {
+            let inherited_only = ancestor != node;
+            let properties = self.cascaded_properties(ancestor);
+            apply_block_properties(&mut style, &properties, inherited_only);
+        }
+        style
+    }
+
+    fn text_style_for_block(&self, node: Node<'_, '_>, kind: TextBlockKind) -> TextStyle {
+        let mut ancestors = node
+            .ancestors()
+            .filter(Node::is_element)
+            .collect::<Vec<_>>();
+        ancestors.reverse();
+        let mut style = TextStyle::default();
+        for ancestor in ancestors {
+            let inherited_size = style.size_scale;
+            if ancestor == node {
+                apply_semantic_block_style(kind, &mut style, inherited_size);
+            }
+            self.apply_text_node(ancestor, &mut style, inherited_size);
+        }
+        style
+    }
+
+    fn image_style(&self, node: Node<'_, '_>) -> ImageStyle {
+        let mut style = ImageStyle {
+            width: attribute_local(node, "width").and_then(image_length),
+            height: attribute_local(node, "height").and_then(image_length),
+            ..ImageStyle::default()
+        };
+        let properties = self.cascaded_properties(node);
+        if let Some(value) = properties
+            .get("width")
+            .and_then(|value| image_length(value))
+        {
+            style.width = Some(value);
+        }
+        if let Some(value) = properties
+            .get("height")
+            .and_then(|value| image_length(value))
+        {
+            style.height = Some(value);
+        }
+        if let Some(value) = properties
+            .get("max-width")
+            .and_then(|value| image_length(value))
+        {
+            style.max_width = Some(value);
+        }
+        if let Some(value) = properties
+            .get("max-height")
+            .and_then(|value| image_length(value))
+        {
+            style.max_height = Some(value);
+        }
+        style
+    }
+
+    fn apply_text_node(&self, node: Node<'_, '_>, style: &mut TextStyle, inherited_size: f32) {
+        let properties = self.cascaded_properties(node);
+        apply_text_properties(style, &properties, inherited_size);
+    }
+
+    fn cascaded_properties(&self, node: Node<'_, '_>) -> HashMap<String, String> {
+        let mut matching = self
+            .rules
+            .iter()
+            .filter(|rule| rule.selector.matches(node))
+            .collect::<Vec<_>>();
+        matching.sort_by_key(|rule| (rule.specificity, rule.order));
+
+        let mut properties = HashMap::new();
+        for rule in matching {
+            insert_declarations(&mut properties, rule.declarations.iter().cloned());
+        }
+        if let Some(inline) = attribute_local(node, "style") {
+            insert_declarations(&mut properties, declarations(inline));
+        }
+        properties
+    }
+}
+
+impl SimpleSelector {
+    fn parse(raw: &str) -> Option<Self> {
+        let mut rest = raw.trim();
+        if rest.is_empty()
+            || rest
+                .chars()
+                .any(|character| character.is_whitespace() || ">+~[:*".contains(character))
+        {
+            return None;
+        }
+
+        let mut selector = Self {
+            tag: None,
+            id: None,
+            classes: Vec::new(),
+        };
+        if !rest.starts_with('.') && !rest.starts_with('#') {
+            let (tag, tail) = take_css_identifier(rest)?;
+            selector.tag = Some(tag.to_ascii_lowercase());
+            rest = tail;
+        }
+        while !rest.is_empty() {
+            let (kind, tail) = rest.split_at(1);
+            let (value, next) = take_css_identifier(tail)?;
+            match kind {
+                "." => selector.classes.push(value.to_owned()),
+                "#" => selector.id = Some(value.to_owned()),
+                _ => return None,
+            }
+            rest = next;
+        }
+        Some(selector)
+    }
+
+    fn specificity(&self) -> u16 {
+        u16::from(self.id.is_some()) * 100
+            + u16::try_from(self.classes.len()).unwrap_or(u16::MAX) * 10
+            + u16::from(self.tag.is_some())
+    }
+
+    fn matches(&self, node: Node<'_, '_>) -> bool {
+        if self
+            .tag
+            .as_deref()
+            .is_some_and(|tag| !node.tag_name().name().eq_ignore_ascii_case(tag))
+        {
+            return false;
+        }
+        if self
+            .id
+            .as_deref()
+            .is_some_and(|id| attribute_local(node, "id").is_none_or(|candidate| candidate != id))
+        {
+            return false;
+        }
+        let classes = attribute_local(node, "class").unwrap_or_default();
+        self.classes.iter().all(|class| {
+            classes
+                .split_ascii_whitespace()
+                .any(|candidate| candidate == class)
+        })
+    }
+}
+
+fn apply_semantic_block_style(kind: TextBlockKind, style: &mut TextStyle, inherited_size: f32) {
+    match kind {
+        TextBlockKind::Heading(level) => {
+            style.bold = true;
+            style.size_scale = inherited_size
+                * match level {
+                    1 => 1.5,
+                    2 => 1.3,
+                    3 => 1.15,
+                    _ => 1.05,
+                };
+        }
+        TextBlockKind::Preformatted => style.size_scale = inherited_size * 0.9,
+        _ => {}
+    }
+}
+
+fn apply_block_properties(
+    style: &mut BlockStyle,
+    properties: &HashMap<String, String>,
+    inherited_only: bool,
+) {
+    if let Some(value) = properties.get("text-align") {
+        style.align = match value.as_str() {
+            "center" => TextAlignment::Center,
+            "right" | "end" => TextAlignment::End,
+            "justify" => TextAlignment::Justify,
+            _ => TextAlignment::Start,
+        };
+    }
+    if let Some(value) = properties
+        .get("text-indent")
+        .and_then(|value| css_length(value))
+    {
+        style.indent = value;
+    }
+    if let Some(value) = properties
+        .get("line-height")
+        .and_then(|value| css_line_height(value))
+    {
+        style.line_height = value;
+    }
+    if inherited_only {
+        return;
+    }
+    if let Some(value) = properties
+        .get("margin-top")
+        .and_then(|value| css_length(value))
+    {
+        style.margin_before = value;
+    }
+    if let Some(value) = properties
+        .get("margin-bottom")
+        .and_then(|value| css_length(value))
+    {
+        style.margin_after = value;
+    }
+}
+
+fn apply_text_properties(
+    style: &mut TextStyle,
+    properties: &HashMap<String, String>,
+    inherited_size: f32,
+) {
+    if let Some(value) = properties
+        .get("font-size")
+        .and_then(|value| css_scale(value))
+    {
+        style.size_scale = inherited_size * value;
+    }
+    if let Some(value) = properties.get("font-weight") {
+        style.bold = value == "bold"
+            || value == "bolder"
+            || value.parse::<u16>().is_ok_and(|weight| weight >= 600);
+    }
+    if let Some(value) = properties.get("font-style") {
+        style.italic = matches!(value.as_str(), "italic" | "oblique");
+    }
+    if let Some(value) = properties
+        .get("text-decoration-line")
+        .or_else(|| properties.get("text-decoration"))
+    {
+        style.underline = value.contains("underline");
+    }
+    if let Some(color) = properties.get("color").and_then(|value| css_color(value)) {
+        style.color = color;
+    }
+}
+
+fn insert_declarations(
+    properties: &mut HashMap<String, String>,
+    declarations: impl IntoIterator<Item = (String, String)>,
+) {
+    for (name, value) in declarations {
+        if name == "margin" {
+            if let Some((top, bottom)) = vertical_margins(&value) {
+                properties.insert("margin-top".into(), top.to_owned());
+                properties.insert("margin-bottom".into(), bottom.to_owned());
+            }
+        } else {
+            properties.insert(name, value);
+        }
+    }
+}
+
+fn take_css_identifier(input: &str) -> Option<(&str, &str)> {
+    let end = input
+        .char_indices()
+        .find_map(|(index, character)| {
+            (!character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')).then_some(index)
+        })
+        .unwrap_or(input.len());
+    (end > 0).then(|| input.split_at(end))
+}
+
+fn strip_css_comments(css: &str) -> String {
+    let mut output = String::with_capacity(css.len());
+    let mut remaining = css;
+    while let Some(start) = remaining.find("/*") {
+        output.push_str(&remaining[..start]);
+        let Some(end) = remaining[start + 2..].find("*/") else {
+            return output;
+        };
+        remaining = &remaining[start + end + 4..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn matching_brace(css: &str, open: usize) -> Option<usize> {
+    let mut depth = 0_u32;
+    for (relative, character) in css[open..].char_indices() {
+        match character {
+            '{' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + relative);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn vertical_margins(value: &str) -> Option<(&str, &str)> {
+    let values = value.split_ascii_whitespace().collect::<Vec<_>>();
+    match values.as_slice() {
+        [all] | [all, _] => Some((all, all)),
+        [top, _, bottom] | [top, _, bottom, _] => Some((top, bottom)),
+        _ => None,
+    }
+}
+
+fn declarations(style: &str) -> impl Iterator<Item = (String, String)> + '_ {
+    style.split(';').filter_map(|declaration| {
+        let (name, value) = declaration.split_once(':')?;
+        Some((
+            name.trim().to_ascii_lowercase(),
+            value
+                .trim()
+                .trim_end_matches("!important")
+                .trim()
+                .to_ascii_lowercase(),
+        ))
+    })
+}
+
+fn css_length(value: &str) -> Option<f32> {
+    const BASE_FONT_SIZE: f32 = 16.0;
+    let value = value.trim();
+    let (number, scale) = if let Some(number) = value.strip_suffix("px") {
+        (number, 1.0)
+    } else if let Some(number) = value.strip_suffix("rem") {
+        (number, BASE_FONT_SIZE)
+    } else if let Some(number) = value.strip_suffix("em") {
+        (number, BASE_FONT_SIZE)
+    } else if let Some(number) = value.strip_suffix("pt") {
+        (number, 96.0 / 72.0)
+    } else {
+        (value, 1.0)
+    };
+    number.trim().parse::<f32>().ok().map(|v| v * scale)
+}
+
+fn css_scale(value: &str) -> Option<f32> {
+    const BASE_FONT_SIZE: f32 = 16.0;
+    let value = value.trim();
+    if let Some(percent) = value.strip_suffix('%') {
+        return percent.parse::<f32>().ok().map(|number| number / 100.0);
+    }
+    if let Some(em) = value
+        .strip_suffix("rem")
+        .or_else(|| value.strip_suffix("em"))
+    {
+        return em.parse::<f32>().ok();
+    }
+    if let Some(px) = value.strip_suffix("px") {
+        return px.parse::<f32>().ok().map(|number| number / BASE_FONT_SIZE);
+    }
+    None
+}
+
+fn css_line_height(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let parsed = if let Some(em) = value.strip_suffix("em") {
+        em.parse::<f32>().ok()
+    } else if let Some(percent) = value.strip_suffix('%') {
+        percent.parse::<f32>().ok().map(|number| number / 100.0)
+    } else if let Some(px) = value.strip_suffix("px") {
+        px.parse::<f32>().ok().map(|number| number / 16.0)
+    } else {
+        value.parse::<f32>().ok()
+    }?;
+    (0.8..=4.0).contains(&parsed).then_some(parsed)
+}
+
+fn css_color(value: &str) -> Option<Rgba> {
+    let hex = value.trim().strip_prefix('#')?;
+    let (red, green, blue) = match hex.len() {
+        3 => (
+            u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?,
+            u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()?,
+            u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()?,
+        ),
+        6 => (
+            u8::from_str_radix(&hex[0..2], 16).ok()?,
+            u8::from_str_radix(&hex[2..4], 16).ok()?,
+            u8::from_str_radix(&hex[4..6], 16).ok()?,
+        ),
+        _ => return None,
+    };
+    Some(Rgba {
+        red,
+        green,
+        blue,
+        alpha: 255,
+    })
+}
+
+fn image_length(value: &str) -> Option<ImageLength> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    if let Some(percent) = value.strip_suffix('%') {
+        let fraction = percent.trim().parse::<f32>().ok()? / 100.0;
+        return fraction
+            .is_finite()
+            .then_some(ImageLength::Fraction(fraction.max(0.0)));
+    }
+    let pixels = css_length(value)?;
+    pixels
+        .is_finite()
+        .then_some(ImageLength::Pixels(pixels.max(0.0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn applies_external_class_styles_and_inline_cascade() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml">
+            <head><link rel="stylesheet" href="styles/book.css"/></head>
+            <body><div class="centered"><p class="body" style="text-align:right">
+                Hello <span class="emphasis">world</span>
+            </p></div><img class="figure" src="images/chart.png" width="640"/></body>
+        </html>"#;
+        let css = r"
+            .centered { text-align: center; }
+            p.body {
+                font-size: 1.25em;
+                line-height: 1.8em;
+                margin: 2em 0 1em;
+                text-indent: 2em;
+            }
+            .emphasis { font-weight: bold; color: #123456; }
+            img.figure { width: 80%; max-width: 420px; max-height: 60%; }
+        ";
+        let mut loaded = false;
+
+        let section = parse_section(xml, &descriptor, |href| {
+            loaded = true;
+            assert_eq!(href.path(), "OPS/styles/book.css");
+            Ok(css.into())
+        })
+        .unwrap();
+
+        assert!(loaded);
+        let Some(Block::Text(block)) = section.blocks.first() else {
+            panic!("expected a text block");
+        };
+        assert_eq!(block.style.align, TextAlignment::End);
+        assert_close(block.style.line_height, 1.8);
+        assert_close(block.style.margin_before, 32.0);
+        assert_close(block.style.margin_after, 16.0);
+        assert_close(block.style.indent, 0.0);
+        let Inline::Text(regular) = &block.content[0] else {
+            panic!("expected regular text");
+        };
+        assert_close(regular.style.size_scale, 1.25);
+        let Inline::Text(emphasis) = &block.content[1] else {
+            panic!("expected emphasized text");
+        };
+        assert!(emphasis.style.bold);
+        assert_eq!(emphasis.style.color.red, 0x12);
+        assert_eq!(emphasis.style.color.green, 0x34);
+        assert_eq!(emphasis.style.color.blue, 0x56);
+        let Some(Block::Image(image)) = section.blocks.get(1) else {
+            panic!("expected an image block");
+        };
+        assert_eq!(image.style.width, Some(ImageLength::Fraction(0.8)));
+        assert_eq!(image.style.max_width, Some(ImageLength::Pixels(420.0)));
+        assert_eq!(image.style.max_height, Some(ImageLength::Fraction(0.6)));
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
+    }
+}

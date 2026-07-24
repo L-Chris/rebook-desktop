@@ -1,5 +1,7 @@
 //! Safe, pull-based EPUB publication parser.
 
+mod reading;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Cursor, Read};
@@ -9,8 +11,8 @@ use std::sync::Arc;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use rebook_publication::{
-    Link, Metadata, Publication, PublicationError, PublicationId, PublicationUrl, RenditionLayout,
-    Resource, SpineItem, SpineItemId, TocEntry,
+    Book, BookSource, Link, Metadata, PublicationError, PublicationId, PublicationUrl,
+    RenditionLayout, Resource, Section, SpineItem, SpineItemId, TocEntry,
 };
 use roxmltree::{Document, Node};
 use serde::{Deserialize, Serialize};
@@ -86,11 +88,8 @@ pub struct Diagnostic {
 /// Parsed EPUB backed by an immutable in-memory archive and lazy resource reads.
 #[derive(Debug)]
 pub struct EpubPublication {
-    id: PublicationId,
-    metadata: Metadata,
+    book: Book,
     manifest: Vec<Link>,
-    reading_order: Vec<SpineItem>,
-    table_of_contents: Vec<TocEntry>,
     diagnostics: Vec<Diagnostic>,
     media_types: HashMap<String, String>,
     archive: EpubArchive,
@@ -183,11 +182,14 @@ impl EpubPublication {
         }
 
         Ok(Self {
-            id,
-            metadata: package_model.metadata,
+            book: Book {
+                id,
+                metadata: package_model.metadata,
+                cover: package_model.cover,
+                sections: reading_order,
+                table_of_contents,
+            },
             manifest,
-            reading_order,
-            table_of_contents,
             diagnostics,
             media_types,
             archive,
@@ -205,21 +207,14 @@ impl EpubPublication {
     }
 }
 
-impl Publication for EpubPublication {
-    fn id(&self) -> &PublicationId {
-        &self.id
+impl BookSource for EpubPublication {
+    fn book(&self) -> &Book {
+        &self.book
     }
 
-    fn metadata(&self) -> &Metadata {
-        &self.metadata
-    }
-
-    fn reading_order(&self) -> &[SpineItem] {
-        &self.reading_order
-    }
-
-    fn table_of_contents(&self) -> &[TocEntry] {
-        &self.table_of_contents
+    fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+        self.parse_section_ir(index)
+            .map_err(EpubError::into_publication_error)
     }
 
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
@@ -241,6 +236,23 @@ impl Publication for EpubPublication {
     }
 }
 
+impl EpubPublication {
+    fn parse_section_ir(&self, index: usize) -> Result<Section, EpubError> {
+        let descriptor = self.book.sections.get(index).ok_or_else(|| {
+            EpubError::InvalidArchive(format!("section index out of bounds: {index}"))
+        })?;
+        if descriptor.media_type != "application/xhtml+xml" && descriptor.media_type != "text/html"
+        {
+            return Err(EpubError::Unsupported(format!(
+                "reflowable section media type: {}",
+                descriptor.media_type
+            )));
+        }
+
+        let xml = self.archive.read_xml(&descriptor.href)?;
+        reading::parse_section(&xml, descriptor, |href| self.archive.read_stylesheet(href))
+    }
+}
 #[derive(Debug)]
 struct EpubArchive {
     bytes: Arc<[u8]>,
@@ -370,14 +382,29 @@ impl EpubArchive {
         )?;
         let bytes = self.read(href)?;
         let text = decode_xml(&bytes, href)?;
-        validate_xml(&text, href, self.limits.max_xml_depth)?;
-        Ok(text)
+        sanitize_and_validate_xml(&text, href, self.limits.max_xml_depth)
+    }
+
+    fn read_stylesheet(&self, href: &PublicationUrl) -> Result<String, EpubError> {
+        let entry = self
+            .entries
+            .get(href.path())
+            .ok_or_else(|| EpubError::ResourceNotFound(href.to_string()))?;
+        ensure_limit(
+            entry.size <= self.limits.max_xml_bytes,
+            format!(
+                "stylesheet {} declares {} bytes; text limit is {}",
+                href, entry.size, self.limits.max_xml_bytes
+            ),
+        )?;
+        decode_xml(&self.read(href)?, href)
     }
 }
 
 #[derive(Debug)]
 struct PackageModel {
     metadata: Metadata,
+    cover: Option<PublicationUrl>,
     manifest: BTreeMap<String, ManifestItem>,
     manifest_order: Vec<String>,
     spine: Vec<SpineReference>,
@@ -458,16 +485,7 @@ fn parse_container(xml: &str) -> Result<String, EpubError> {
         })
 }
 
-fn parse_package(xml: &str, package_url: &PublicationUrl) -> Result<PackageModel, EpubError> {
-    let document = Document::parse(xml)?;
-    let package = document
-        .descendants()
-        .find(|node| node.is_element() && node.tag_name().name() == "package")
-        .ok_or_else(|| EpubError::InvalidXml {
-            resource: package_url.to_string(),
-            message: "package document has no package element".into(),
-        })?;
-
+fn parse_package_metadata(package: Node<'_, '_>) -> (Metadata, Option<String>) {
     let metadata_node = package
         .children()
         .find(|node| node.is_element() && node.tag_name().name() == "metadata");
@@ -491,6 +509,39 @@ fn parse_package(xml: &str, package_url: &PublicationUrl) -> Result<PackageModel
         .map_or(RenditionLayout::Reflowable, |_| {
             RenditionLayout::PrePaginated
         });
+    let epub2_cover_id = metadata_node.and_then(|metadata| {
+        metadata
+            .descendants()
+            .find(|node| {
+                node.is_element()
+                    && node.tag_name().name() == "meta"
+                    && attribute_local(*node, "name") == Some("cover")
+            })
+            .and_then(|node| attribute_local(node, "content"))
+            .map(str::to_owned)
+    });
+    (
+        Metadata {
+            title,
+            authors,
+            languages,
+            layout,
+        },
+        epub2_cover_id,
+    )
+}
+
+fn parse_package(xml: &str, package_url: &PublicationUrl) -> Result<PackageModel, EpubError> {
+    let document = Document::parse(xml)?;
+    let package = document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "package")
+        .ok_or_else(|| EpubError::InvalidXml {
+            resource: package_url.to_string(),
+            message: "package document has no package element".into(),
+        })?;
+
+    let (metadata, epub2_cover_id) = parse_package_metadata(package);
 
     let manifest_node = package
         .children()
@@ -524,6 +575,20 @@ fn parse_package(xml: &str, package_url: &PublicationUrl) -> Result<PackageModel
         }
         manifest_order.push(id);
     }
+    let cover = manifest_order
+        .iter()
+        .filter_map(|id| manifest.get(id))
+        .find(|item| {
+            item.properties
+                .iter()
+                .any(|property| property == "cover-image")
+        })
+        .or_else(|| {
+            epub2_cover_id
+                .as_ref()
+                .and_then(|cover_id| manifest.get(cover_id))
+        })
+        .map(|item| item.href.clone());
 
     let spine_node = package
         .children()
@@ -552,12 +617,8 @@ fn parse_package(xml: &str, package_url: &PublicationUrl) -> Result<PackageModel
     }
 
     Ok(PackageModel {
-        metadata: Metadata {
-            title,
-            authors,
-            languages,
-            layout,
-        },
+        metadata,
+        cover,
         manifest,
         manifest_order,
         spine,
@@ -721,10 +782,15 @@ fn parse_nav_points(
         .collect()
 }
 
-fn validate_xml(xml: &str, href: &PublicationUrl, max_depth: usize) -> Result<(), EpubError> {
+fn sanitize_and_validate_xml(
+    xml: &str,
+    href: &PublicationUrl,
+    max_depth: usize,
+) -> Result<String, EpubError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
     let mut depth = 0_usize;
+    let mut plain_html_doctype = None;
     loop {
         match reader.read_event() {
             Ok(Event::Start(_)) => {
@@ -736,13 +802,35 @@ fn validate_xml(xml: &str, href: &PublicationUrl, max_depth: usize) -> Result<()
                 }
             }
             Ok(Event::End(_)) => depth = depth.saturating_sub(1),
+            Ok(Event::DocType(doctype))
+                if href.path().to_ascii_lowercase().ends_with(".xhtml")
+                    && doctype.trim_ascii().eq_ignore_ascii_case(b"html") =>
+            {
+                let end = usize::try_from(reader.buffer_position()).unwrap_or(xml.len());
+                let Some(start) = xml[..end].to_ascii_lowercase().rfind("<!doctype") else {
+                    return Err(EpubError::InvalidXml {
+                        resource: href.to_string(),
+                        message: "failed to locate validated XHTML DOCTYPE".into(),
+                    });
+                };
+                plain_html_doctype = Some(start..end);
+            }
             Ok(Event::DocType(_)) => {
                 return Err(EpubError::InvalidXml {
                     resource: href.to_string(),
-                    message: "DOCTYPE is disabled for untrusted EPUB XML".into(),
+                    message: "DOCTYPE is disabled for untrusted EPUB XML except plain XHTML <!DOCTYPE html>"
+                        .into(),
                 });
             }
-            Ok(Event::Eof) => return Ok(()),
+            Ok(Event::Eof) => {
+                let Some(range) = plain_html_doctype else {
+                    return Ok(xml.to_owned());
+                };
+                let mut sanitized = String::with_capacity(xml.len() - range.len());
+                sanitized.push_str(&xml[..range.start]);
+                sanitized.push_str(&xml[range.end..]);
+                return Ok(sanitized);
+            }
             Ok(_) => {}
             Err(error) => {
                 return Err(EpubError::InvalidXml {
@@ -946,7 +1034,7 @@ impl EpubError {
 mod tests {
     use std::io::{Cursor, Write};
 
-    use rebook_publication::{Publication, PublicationUrl, RenditionLayout};
+    use rebook_publication::{Block, BookSource, PublicationUrl, RenditionLayout};
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
@@ -957,17 +1045,31 @@ mod tests {
         let bytes = minimal_epub();
         let publication = EpubPublication::open_bytes(bytes).expect("valid EPUB");
 
-        assert_eq!(publication.metadata().title, "原生阅读器");
-        assert_eq!(publication.metadata().authors, ["Rebook"]);
-        assert_eq!(publication.metadata().layout, RenditionLayout::Reflowable);
+        assert_eq!(publication.book().metadata.title, "原生阅读器");
+        assert_eq!(publication.book().metadata.authors, ["Rebook"]);
+        assert_eq!(
+            publication.book().cover.as_ref().map(PublicationUrl::path),
+            Some("OPS/Images/cover.png")
+        );
+        assert_eq!(
+            publication.book().metadata.layout,
+            RenditionLayout::Reflowable
+        );
         assert_eq!(publication.manifest()[0].href.path(), "OPS/nav.xhtml");
-        assert_eq!(publication.reading_order().len(), 1);
-        assert_eq!(publication.table_of_contents()[0].label, "第一章");
+        assert_eq!(publication.book().sections.len(), 1);
+        assert_eq!(publication.book().table_of_contents[0].label, "第一章");
         assert_eq!(publication.diagnostics().len(), 0);
 
         let href = PublicationUrl::parse("OPS/Text/chapter.xhtml").expect("valid URL");
         let resource = publication.resource(&href).expect("chapter resource");
         assert!(String::from_utf8_lossy(&resource.bytes).contains("你好，Rust"));
+
+        let section = publication.parse_section(0).expect("reading IR");
+        assert!(matches!(section.blocks.first(), Some(Block::Text(_))));
+        let cover = publication
+            .resource(publication.book().cover.as_ref().expect("EPUB 3 cover"))
+            .expect("cover resource");
+        assert_eq!(cover.bytes.as_ref(), b"fake-png");
     }
 
     #[test]
@@ -1022,9 +1124,13 @@ mod tests {
         let publication = EpubPublication::open_bytes(zip_entries(&epub2_entries()))
             .expect("valid EPUB 2 publication");
 
-        assert_eq!(publication.table_of_contents()[0].label, "NCX 第一章");
+        assert_eq!(publication.book().table_of_contents[0].label, "NCX 第一章");
         assert_eq!(
-            publication.table_of_contents()[0]
+            publication.book().cover.as_ref().map(PublicationUrl::path),
+            Some("OPS/Images/cover.jpg")
+        );
+        assert_eq!(
+            publication.book().table_of_contents[0]
                 .href
                 .as_ref()
                 .expect("NCX href")
@@ -1043,6 +1149,39 @@ mod tests {
         );
         let error = EpubPublication::open_bytes(zip_entries(&entries))
             .expect_err("untrusted DOCTYPE must fail");
+
+        assert!(matches!(error, EpubError::InvalidXml { .. }));
+        assert!(error.to_string().contains("DOCTYPE is disabled"));
+    }
+
+    #[test]
+    fn allows_plain_html_doctype_for_xhtml_navigation() {
+        let mut entries = minimal_entries();
+        entries[3] = (
+            "OPS/nav.xhtml",
+            r#"<?xml version="1.0"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+              <body><nav epub:type="toc"><ol><li><a href="Text/chapter.xhtml#start">第一章</a></li></ol></nav></body>
+            </html>"#
+                .as_bytes(),
+            CompressionMethod::Deflated,
+        );
+
+        let publication = EpubPublication::open_bytes(zip_entries(&entries))
+            .expect("plain HTML DOCTYPE in XHTML navigation must be accepted");
+
+        assert_eq!(publication.book().table_of_contents[0].label, "第一章");
+    }
+
+    #[test]
+    fn rejects_xhtml_doctype_with_external_identifier() {
+        let mut entries = minimal_entries();
+        entries[3] = (
+            "OPS/nav.xhtml",
+            br#"<?xml version="1.0"?><!DOCTYPE html SYSTEM "https://example.com/xhtml.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><body/></html>"#,
+            CompressionMethod::Deflated,
+        );
+        let error = EpubPublication::open_bytes(zip_entries(&entries))
+            .expect_err("external XHTML DOCTYPE must fail");
 
         assert!(matches!(error, EpubError::InvalidXml { .. }));
         assert!(error.to_string().contains("DOCTYPE is disabled"));
@@ -1073,6 +1212,7 @@ mod tests {
                   </metadata>
                   <manifest>
                     <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+                    <item id="cover" href="Images/cover.png" media-type="image/png" properties="cover-image"/>
                     <item id="chapter" href="Text/chapter.xhtml" media-type="application/xhtml+xml"/>
                   </manifest>
                   <spine><itemref idref="chapter"/></spine>
@@ -1086,6 +1226,11 @@ mod tests {
                   <body><nav epub:type="toc"><ol><li><a href="Text/chapter.xhtml#start">第一章</a></li></ol></nav></body>
                 </html>"#
                     .as_bytes(),
+                CompressionMethod::Deflated,
+            ),
+            (
+                "OPS/Images/cover.png",
+                b"fake-png",
                 CompressionMethod::Deflated,
             ),
             (
@@ -1109,9 +1254,10 @@ mod tests {
                 "OPS/package.opf",
                 br#"<?xml version="1.0"?>
                 <package version="2.0">
-                  <metadata><title>EPUB 2</title></metadata>
+                  <metadata><title>EPUB 2</title><meta name="cover" content="cover-art"/></metadata>
                   <manifest>
                     <item id="chapter" href="Text/chapter.xhtml" media-type="application/xhtml+xml"/>
+                    <item id="cover-art" href="Images/cover.jpg" media-type="image/jpeg"/>
                     <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
                   </manifest>
                   <spine toc="ncx"><itemref idref="chapter"/></spine>
@@ -1126,6 +1272,11 @@ mod tests {
                   </navPoint>
                 </navMap></ncx>"#
                     .as_bytes(),
+                CompressionMethod::Deflated,
+            ),
+            (
+                "OPS/Images/cover.jpg",
+                b"fake-jpeg",
                 CompressionMethod::Deflated,
             ),
             (

@@ -1,5 +1,7 @@
 # rebook-desktop EPUB 技术方案
 
+> 历史调研：本文记录早期以 Blitz/DOM/CSS 浏览器组件为主的方案，不再描述当前实现。现行架构见 [ADR-0001](adr-0001-native-epub-renderer.md) 和 [当前状态](phase-0-status.md)。
+
 - 调研日期：2026-07-23
 - 目标平台：Windows、macOS、Linux
 - 第一格式：EPUB 3.3，兼容常见 EPUB 2
@@ -12,7 +14,7 @@
 1. “能高质量阅读大多数小说类 EPUB”可以用 Rust 原生栈在数月内做到。
 2. “完整 EPUB 3 Reading System”接近持续维护的小型浏览器工程。W3C 要求 CSS 达到官方 CSS 定义，视觉系统还涉及 OpenType/WOFF、SVG、固定版式、MathML、双向文字和全球排版，不能用一个富文本组件代替。
 
-推荐采用“EPUB 专用引擎 + 复用浏览器级 Rust 组件”的路线：以 Blitz 当前采用的 `xml5ever + Stylo + Taffy + Parley + Vello` 为起点，在本项目内实现 EPUB 容器、资源沙箱、阅读器样式、分页/碎片化、Locator、选择/高亮和缓存。Blitz 仍是 pre-alpha，因此必须固定版本并放在后端适配层后面。
+当前采用“EPUB 专用 parser → Reading IR → layout/pagination → retained display list → renderer”的路线。项目直接组合 `quick-xml + Parley + Vello`，不把浏览器 DOM/CSS 引擎放入阅读主链；CSS 能力按真实 EPUB 需求显式进入 Reading IR。桌面壳使用 crates.io 发布版 Xilem 0.4.0/Masonry，并放在 renderer 边界之外。
 
 MVP 先支持无 DRM、无脚本、可重排 EPUB，默认连续滚动；分页紧随其后。这样能先验证最危险的文字、CSS、资源和命中测试链路，又不会让一个尚未实现的完整分页算法阻塞首个可用版本。
 
@@ -194,7 +196,7 @@ pub trait RenderBackend {
 
 静态 SVG 可用 [`resvg`](https://github.com/linebender/resvg) 解析/栅格化作为首版方案，后续再接入 Vello scene；必须区分外链 SVG 与内联 SVG 的 CSS 作用域。
 
-桌面层使用 `winit + wgpu`。书架、目录、设置、搜索框和工具条可以用 `egui-winit + egui-wgpu` 快速实现，两套绘制共享同一设备/队列；正文区域始终由 renderer 输出，不使用 `egui` 的文本布局。无障碍树用 AccessKit，并由 DOM/fragment tree 生成语义节点，不从绘制命令反推。
+桌面层由 Xilem 0.4.0/Masonry 封装 `winit + wgpu`。目录、设置、搜索框和工具条使用原生 Xilem 组件；正文区域始终由 renderer 输出，不使用 UI toolkit 的文本布局。AnyRender/Vello 0.9 到 Xilem/Vello 0.6 的窄桥接只转换 scene 命令并共享资源，不做 CPU 位图回读。组件无障碍由 Masonry/AccessKit 提供；正文语义树后续从 Reading IR/layout 快照生成，不能从绘制命令反推。
 
 ### 6. Locator、选择、书签和批注
 
@@ -257,7 +259,7 @@ EPUB 是不可信输入。即使没有 JavaScript，也要防归档、XML、图�
 
 目标不是做 UI，而是验证最高风险链路。
 
-- 建立 workspace 和 CI；固定 Blitz/Stylo/Parley/Vello commit。
+- 建立 workspace 和 CI；核心依赖使用 crates.io 发布版并由 `Cargo.lock` 锁定，升级经过真实书籍回归。
 - 内存读取一个 EPUB，解析 container、OPF、spine、nav。
 - 通过自定义 ResourceResolver 原生渲染一个 XHTML spine item。
 - 覆盖外链/内联 CSS、相对图片、书内字体、中文 fallback、滚动、链接和文字命中测试。
@@ -335,7 +337,7 @@ Go/No-Go 门槛：
 
 | 风险 | 影响 | 缓解 |
 | --- | --- | --- |
-| Blitz/Vello API 和行为快速变化 | 升级破坏、渲染回归 | 固定 commit、内部适配层、定期升级窗口、保留小 fork |
+| Xilem/Vello API 和行为快速变化 | 升级破坏、渲染回归 | 使用正式发布版、内部 scene 适配层、定期升级窗口、真实 EPUB 回归 |
 | 分页不是 Taffy 的现成功能 | 页断、表格、浮动错误 | 先滚动，独立 FragmentTree，从 line/block 边界逐步实现 |
 | 竖排目前是上游明显缺口 | 中文/日文书兼容性不足 | 早建 writing-mode 抽象，Phase 0 不伪装支持，Phase 3 专项投入 |
 | 字体/Unicode 长尾巨大 | 漏字、错序、平台差异 | Parley/ICU4X、固定测试字体、跨平台脚本矩阵 |
@@ -348,13 +350,13 @@ Go/No-Go 门槛：
 Phase 0 已冻结工具链和渲染适配边界；产品/平台项留到对应里程碑决定：
 
 1. MSRV 为 1.97，`rust-toolchain.toml` 固定 1.97.1；
-2. Blitz 固定 `0.3.0-beta.1`，其 Stylo/Parley/Vello 依赖由 `Cargo.lock` 固定，升级必须经过回归窗口；
-3. `egui` 是否只用于开发壳，还是作为首版正式 chrome；
+2. Xilem 固定 crates.io `0.4.0`，其 Masonry/Vello 依赖由 `Cargo.lock` 固定，升级必须经过回归窗口；
+3. 正式 chrome 使用 Xilem/Masonry；正文只经过 renderer/Vello scene bridge；
 4. 持久化用纯 Rust KV/数据库还是系统 SQLite；
 5. 三个平台的最低系统版本与 GPU fallback；
 6. 测试 EPUB 的许可清单和 CI 制品策略。
 
-当前工作环境已通过 `rustup` 安装 stable `1.97.1`（`aarch64-unknown-linux-gnu`），配置 RsProxy Cargo Sparse 镜像，并由项目级 `rust-toolchain.toml` 固定工具链、rustfmt 和 clippy。
+当前工作环境已通过 `rustup` 安装 stable `1.97.1`（`x86_64-pc-windows-msvc`），配置 RsProxy Cargo Sparse 镜像，并由项目级 `rust-toolchain.toml` 固定工具链、rustfmt 和 clippy。
 
 ## 参考资料
 

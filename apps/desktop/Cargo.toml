@@ -1,17 +1,26 @@
 [package]
 name = "rebook-desktop"
-description = "Native Vello/wgpu Phase 0 shell for rebook-desktop"
+description = "Native parser-IR-layout-Vello EPUB reader"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-anyrender_vello.workspace = true
-blitz-shell.workspace = true
+anyrender.workspace = true
+anyrender_vello_cpu.workspace = true
+image.workspace = true
+kurbo.workspace = true
+lucide-icons.workspace = true
+peniko.workspace = true
 rebook-epub = { path = "../../crates/epub" }
+rebook-layout = { path = "../../crates/layout" }
+rebook-publication = { path = "../../crates/publication" }
+rebook-reader = { path = "../../crates/reader" }
 rebook-renderer = { path = "../../crates/renderer" }
 serde_json.workspace = true
+tracing.workspace = true
+xilem.workspace = true
 
 [lints]
 workspace = true

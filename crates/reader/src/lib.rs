@@ -1,647 +1,749 @@
-//! Explicit reader command state machine with cancellation and stale-result rejection.
+//! Reader session with section, layout, and display-list caches.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
 
-use rebook_publication::{LocatorV1, PublicationId};
-use serde::{Deserialize, Serialize};
+use rebook_layout::{LayoutEngine, LayoutError, LayoutViewport, ReaderStyle};
+use rebook_publication::{Book, BookSource, PublicationError, PublicationUrl};
+use rebook_renderer::{DisplayListCompiler, PageDisplayList};
 use thiserror::Error;
 
-/// Cooperative task cancellation shared with parser and layout workers.
-#[derive(Debug, Clone, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
+const PREFETCH_DISTANCE: usize = 2;
+const DEFAULT_SECTION_CACHE_CAPACITY: usize = PREFETCH_DISTANCE * 2 + 1;
 
-impl CancellationToken {
-    /// Requests cancellation.
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-
-    /// Returns whether cancellation has been requested.
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-}
-
-/// Reader lifecycle visible to the desktop shell.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ReaderState {
-    /// No publication is open.
-    Idle,
-    /// A parser task is opening a publication.
-    Opening,
-    /// Publication metadata and reading order are available.
-    Ready,
-    /// Content is being styled or laid out.
-    LayingOut,
-    /// A surface is ready for display.
-    Displaying,
-    /// The most recent active task failed.
-    Error,
-}
-
-/// Logical viewport used to invalidate layout.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Viewport {
-    /// Logical width in device-independent pixels.
-    pub width: f32,
-    /// Logical height in device-independent pixels.
-    pub height: f32,
-    /// Device scale factor.
-    pub scale_factor: f32,
-}
-
-impl Viewport {
-    /// Validates finite positive dimensions and scale.
-    pub fn validate(self) -> Result<Self, ReaderError> {
-        if self.width.is_finite()
-            && self.height.is_finite()
-            && self.scale_factor.is_finite()
-            && self.width > 0.0
-            && self.height > 0.0
-            && self.scale_factor > 0.0
-        {
-            Ok(self)
-        } else {
-            Err(ReaderError::InvalidViewport)
-        }
-    }
-}
-
-/// Durable preferences whose changes can trigger reflow.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ReaderPreferences {
-    /// Base font size in logical pixels.
-    pub font_size: f32,
-    /// Unitless line-height multiplier.
-    pub line_height: f32,
-    /// Reader page or viewport margin in logical pixels.
-    pub margin: f32,
-    /// Optional user-selected font family.
-    pub font_family: Option<String>,
-    /// Reader color scheme.
-    pub color_scheme: ColorScheme,
-    /// Continuous or paginated flow.
-    pub flow: ReaderFlow,
-}
-
-impl Default for ReaderPreferences {
-    fn default() -> Self {
-        Self {
-            font_size: 18.0,
-            line_height: 1.6,
-            margin: 32.0,
-            font_family: None,
-            color_scheme: ColorScheme::Light,
-            flow: ReaderFlow::Scrolled,
-        }
-    }
-}
-
-/// Reader color scheme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ColorScheme {
-    /// Light paper and dark text.
-    Light,
-    /// Dark paper and light text.
-    Dark,
-    /// Warm low-contrast paper.
-    Sepia,
-}
-
-/// Layout flow selected by the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ReaderFlow {
-    /// Continuous vertical flow.
-    Scrolled,
-    /// Fragmented pages.
-    Paginated,
-}
-
-/// Commands accepted from the desktop shell.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ReaderCommand {
-    /// Start opening a new publication.
-    Open { display_name: String },
-    /// Close the current publication and cancel all work.
-    Close,
-    /// Navigate to a durable location.
-    GoTo { locator: Box<LocatorV1> },
-    /// Change viewport geometry.
-    SetViewport(Viewport),
-    /// Replace all layout-affecting preferences.
-    SetPreferences(ReaderPreferences),
-}
-
-/// Reason for a layout task.
+/// Direction requested by keyboard, pointer, or command navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LayoutReason {
-    /// First content after opening.
-    Initial,
-    /// Explicit navigation.
-    Navigation,
-    /// Viewport size or DPI changed.
-    Viewport,
-    /// Reader preferences changed.
-    Preferences,
+pub enum PageDirection {
+    Next,
+    Previous,
 }
 
-/// Work item that the controller delegates to a worker pool.
-#[derive(Debug, Clone)]
-pub enum ReaderTask {
-    /// Detect and parse a publication.
-    Open {
-        /// Generation that must be supplied when completing the task.
-        generation: u64,
-        /// Display name for diagnostics.
-        display_name: String,
-        /// Cooperative cancellation token.
-        cancellation: CancellationToken,
+/// Result of moving through cached pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageTurn {
+    Moved {
+        section_index: usize,
+        page_index: usize,
     },
-    /// Produce a new surface for the current location.
-    Layout {
-        /// Generation that must be supplied when completing the task.
-        generation: u64,
-        /// Why layout was scheduled.
-        reason: LayoutReason,
-        /// Target location.
-        locator: Box<LocatorV1>,
-        /// Current viewport, if already known.
-        viewport: Option<Viewport>,
-        /// Preferences snapshot for deterministic layout.
-        preferences: ReaderPreferences,
-        /// Cooperative cancellation token.
-        cancellation: CancellationToken,
+    Boundary {
+        section_index: usize,
+        page_index: usize,
     },
 }
 
-/// Observable events produced by the controller.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ReaderEvent {
-    /// Lifecycle state changed.
-    StateChanged(ReaderState),
-    /// Publication metadata became available.
-    PublicationOpened { publication_id: PublicationId },
-    /// A display surface was committed at this locator.
-    Relocated { locator: Box<LocatorV1> },
-    /// Active work failed.
-    Failed { message: String },
-    /// Publication was closed.
-    Closed,
+/// Stable current position exposed to the application shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderLocation {
+    pub section_index: usize,
+    pub page_index: usize,
+    pub page_count: usize,
 }
 
-/// Result of dispatching a command.
-#[derive(Debug, Clone, Default)]
-pub struct CommandOutcome {
-    /// Events that should be broadcast immediately.
-    pub events: Vec<ReaderEvent>,
-    /// Optional worker task to enqueue.
-    pub task: Option<ReaderTask>,
+struct CachedSection {
+    pages: Vec<PageDisplayList>,
 }
 
-/// Immutable state exposed to UI render code.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReaderSnapshot {
-    /// Current lifecycle state.
-    pub state: ReaderState,
-    /// Monotonic active generation.
-    pub generation: u64,
-    /// Currently open publication.
-    pub publication_id: Option<PublicationId>,
-    /// Last committed or requested locator.
-    pub locator: Option<LocatorV1>,
-    /// Current viewport.
-    pub viewport: Option<Viewport>,
-    /// Current reader preferences.
-    pub preferences: ReaderPreferences,
+struct PrefetchRequest {
+    index: usize,
+    viewport: LayoutViewport,
+    style: ReaderStyle,
+    generation: u64,
 }
 
-/// Single-owner reader state machine.
-#[derive(Debug)]
-pub struct ReaderController {
-    snapshot: ReaderSnapshot,
-    active_cancellation: Option<CancellationToken>,
+struct PrefetchResult {
+    index: usize,
+    generation: u64,
+    section: Result<Arc<CachedSection>, ReaderError>,
 }
 
-impl Default for ReaderController {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Single-owner reader orchestration. The parser and renderer communicate only
+/// through the publication and layout IR crates.
+pub struct ReaderSession {
+    source: Arc<dyn BookSource>,
+    layout_engine: LayoutEngine,
+    display_compiler: DisplayListCompiler,
+    viewport: LayoutViewport,
+    style: ReaderStyle,
+    cache_capacity: usize,
+    cache: HashMap<usize, Arc<CachedSection>>,
+    lru: VecDeque<usize>,
+    prefetch_requests: Sender<PrefetchRequest>,
+    prefetch_results: Receiver<PrefetchResult>,
+    prefetch_inflight: HashSet<usize>,
+    prefetch_failures: HashMap<usize, ReaderError>,
+    prefetch_generation: Arc<AtomicU64>,
+    current_section: usize,
+    current_page: usize,
 }
 
-impl ReaderController {
-    /// Creates an idle reader.
-    pub fn new() -> Self {
-        Self {
-            snapshot: ReaderSnapshot {
-                state: ReaderState::Idle,
-                generation: 0,
-                publication_id: None,
-                locator: None,
-                viewport: None,
-                preferences: ReaderPreferences::default(),
-            },
-            active_cancellation: None,
+impl ReaderSession {
+    /// Opens the first section and compiles its pages once.
+    pub fn open(
+        source: Arc<dyn BookSource>,
+        viewport: LayoutViewport,
+        style: ReaderStyle,
+    ) -> Result<Self, ReaderError> {
+        if source.book().sections.is_empty() {
+            return Err(ReaderError::EmptyBook);
         }
-    }
-
-    /// Returns an immutable UI snapshot.
-    pub fn snapshot(&self) -> &ReaderSnapshot {
-        &self.snapshot
-    }
-
-    /// Applies one UI command and optionally schedules worker work.
-    pub fn dispatch(&mut self, command: ReaderCommand) -> Result<CommandOutcome, ReaderError> {
-        match command {
-            ReaderCommand::Open { display_name } => Ok(self.begin_open(display_name)),
-            ReaderCommand::Close => Ok(self.close()),
-            ReaderCommand::GoTo { locator } => self.go_to(*locator),
-            ReaderCommand::SetViewport(viewport) => self.set_viewport(viewport),
-            ReaderCommand::SetPreferences(preferences) => self.set_preferences(preferences),
-        }
-    }
-
-    /// Commits a parser result if it still belongs to the active generation.
-    pub fn complete_open(
-        &mut self,
-        generation: u64,
-        publication_id: PublicationId,
-        initial_locator: LocatorV1,
-    ) -> Result<CommandOutcome, ReaderError> {
-        if !self.is_active(generation) {
-            return Ok(CommandOutcome::default());
-        }
-        initial_locator.validate()?;
-        if initial_locator.publication_id != publication_id {
-            return Err(ReaderError::LocatorPublicationMismatch);
-        }
-
-        self.snapshot.publication_id = Some(publication_id.clone());
-        self.snapshot.locator = Some(initial_locator.clone());
-        self.snapshot.state = ReaderState::LayingOut;
-        let viewport = self.snapshot.viewport;
-        let preferences = self.snapshot.preferences.clone();
-        let task = self.replace_task(move |generation, cancellation| ReaderTask::Layout {
-            generation,
-            reason: LayoutReason::Initial,
-            locator: Box::new(initial_locator),
+        let prefetch_generation = Arc::new(AtomicU64::new(0));
+        let (prefetch_requests, prefetch_results) =
+            spawn_prefetch_worker(Arc::clone(&source), Arc::clone(&prefetch_generation))?;
+        let mut session = Self {
+            source,
+            layout_engine: LayoutEngine::new(),
+            display_compiler: DisplayListCompiler,
             viewport,
-            preferences,
-            cancellation,
-        });
-        Ok(CommandOutcome {
-            events: vec![
-                ReaderEvent::PublicationOpened { publication_id },
-                ReaderEvent::StateChanged(ReaderState::LayingOut),
-            ],
-            task: Some(task),
-        })
-    }
-
-    /// Commits a layout result if it still belongs to the active generation.
-    pub fn complete_layout(
-        &mut self,
-        generation: u64,
-        locator: LocatorV1,
-    ) -> Result<CommandOutcome, ReaderError> {
-        if !self.is_active(generation) {
-            return Ok(CommandOutcome::default());
-        }
-        self.validate_locator(&locator)?;
-        self.active_cancellation = None;
-        self.snapshot.locator = Some(locator.clone());
-        self.snapshot.state = ReaderState::Displaying;
-        Ok(CommandOutcome {
-            events: vec![
-                ReaderEvent::Relocated {
-                    locator: Box::new(locator),
-                },
-                ReaderEvent::StateChanged(ReaderState::Displaying),
-            ],
-            task: None,
-        })
-    }
-
-    /// Fails the active generation while silently ignoring stale results.
-    pub fn fail_task(&mut self, generation: u64, message: impl Into<String>) -> CommandOutcome {
-        if !self.is_active(generation) {
-            return CommandOutcome::default();
-        }
-        self.active_cancellation = None;
-        self.snapshot.state = ReaderState::Error;
-        CommandOutcome {
-            events: vec![
-                ReaderEvent::Failed {
-                    message: message.into(),
-                },
-                ReaderEvent::StateChanged(ReaderState::Error),
-            ],
-            task: None,
-        }
-    }
-
-    fn begin_open(&mut self, display_name: String) -> CommandOutcome {
-        self.cancel_active();
-        self.snapshot.generation = self.snapshot.generation.saturating_add(1);
-        self.snapshot.state = ReaderState::Opening;
-        self.snapshot.publication_id = None;
-        self.snapshot.locator = None;
-        let cancellation = CancellationToken::default();
-        self.active_cancellation = Some(cancellation.clone());
-        CommandOutcome {
-            events: vec![ReaderEvent::StateChanged(ReaderState::Opening)],
-            task: Some(ReaderTask::Open {
-                generation: self.snapshot.generation,
-                display_name,
-                cancellation,
-            }),
-        }
-    }
-
-    fn close(&mut self) -> CommandOutcome {
-        self.cancel_active();
-        self.snapshot.generation = self.snapshot.generation.saturating_add(1);
-        self.snapshot.state = ReaderState::Idle;
-        self.snapshot.publication_id = None;
-        self.snapshot.locator = None;
-        CommandOutcome {
-            events: vec![
-                ReaderEvent::Closed,
-                ReaderEvent::StateChanged(ReaderState::Idle),
-            ],
-            task: None,
-        }
-    }
-
-    fn go_to(&mut self, locator: LocatorV1) -> Result<CommandOutcome, ReaderError> {
-        self.validate_locator(&locator)?;
-        self.snapshot.locator = Some(locator.clone());
-        Ok(self.schedule_layout(locator, LayoutReason::Navigation))
-    }
-
-    fn set_viewport(&mut self, viewport: Viewport) -> Result<CommandOutcome, ReaderError> {
-        let viewport = viewport.validate()?;
-        if self.snapshot.viewport == Some(viewport) {
-            return Ok(CommandOutcome::default());
-        }
-        self.snapshot.viewport = Some(viewport);
-        Ok(self
-            .snapshot
-            .locator
-            .clone()
-            .map_or_else(CommandOutcome::default, |locator| {
-                self.schedule_layout(locator, LayoutReason::Viewport)
-            }))
-    }
-
-    fn set_preferences(
-        &mut self,
-        preferences: ReaderPreferences,
-    ) -> Result<CommandOutcome, ReaderError> {
-        validate_preferences(&preferences)?;
-        if self.snapshot.preferences == preferences {
-            return Ok(CommandOutcome::default());
-        }
-        self.snapshot.preferences = preferences;
-        Ok(self
-            .snapshot
-            .locator
-            .clone()
-            .map_or_else(CommandOutcome::default, |locator| {
-                self.schedule_layout(locator, LayoutReason::Preferences)
-            }))
-    }
-
-    fn schedule_layout(&mut self, locator: LocatorV1, reason: LayoutReason) -> CommandOutcome {
-        self.snapshot.state = ReaderState::LayingOut;
-        let viewport = self.snapshot.viewport;
-        let preferences = self.snapshot.preferences.clone();
-        let task = self.replace_task(move |generation, cancellation| ReaderTask::Layout {
-            generation,
-            reason,
-            locator: Box::new(locator),
-            viewport,
-            preferences,
-            cancellation,
-        });
-        CommandOutcome {
-            events: vec![ReaderEvent::StateChanged(ReaderState::LayingOut)],
-            task: Some(task),
-        }
-    }
-
-    fn replace_task(
-        &mut self,
-        build: impl FnOnce(u64, CancellationToken) -> ReaderTask,
-    ) -> ReaderTask {
-        self.cancel_active();
-        self.snapshot.generation = self.snapshot.generation.saturating_add(1);
-        let cancellation = CancellationToken::default();
-        self.active_cancellation = Some(cancellation.clone());
-        build(self.snapshot.generation, cancellation)
-    }
-
-    fn validate_locator(&self, locator: &LocatorV1) -> Result<(), ReaderError> {
-        locator.validate()?;
-        let Some(publication_id) = &self.snapshot.publication_id else {
-            return Err(ReaderError::NoPublication);
+            style,
+            cache_capacity: DEFAULT_SECTION_CACHE_CAPACITY,
+            cache: HashMap::new(),
+            lru: VecDeque::new(),
+            prefetch_requests,
+            prefetch_results,
+            prefetch_inflight: HashSet::new(),
+            prefetch_failures: HashMap::new(),
+            prefetch_generation,
+            current_section: 0,
+            current_page: 0,
         };
-        if &locator.publication_id != publication_id {
-            return Err(ReaderError::LocatorPublicationMismatch);
+        session.ensure_section(0)?;
+        Ok(session)
+    }
+
+    pub fn book(&self) -> &Book {
+        self.source.book()
+    }
+
+    pub fn viewport(&self) -> LayoutViewport {
+        self.viewport
+    }
+
+    pub fn style(&self) -> ReaderStyle {
+        self.style
+    }
+
+    pub fn location(&self) -> ReaderLocation {
+        ReaderLocation {
+            section_index: self.current_section,
+            page_index: self.current_page,
+            page_count: self.current_page_count(),
+        }
+    }
+
+    /// Returns the compiled display list for the current page.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reader's internal invariant is broken and the current
+    /// section or page is missing from the cache.
+    pub fn current_page(&self) -> &PageDisplayList {
+        &self
+            .cache
+            .get(&self.current_section)
+            .expect("current section must remain cached")
+            .pages[self.current_page]
+    }
+
+    /// Resolves a publication URL to its spine section, ignoring a fragment
+    /// until source anchors retain authored element IDs.
+    pub fn section_index_for_href(&self, href: &PublicationUrl) -> Option<usize> {
+        let resource = href.resource_url();
+        self.source
+            .book()
+            .sections
+            .iter()
+            .position(|section| section.href.resource_url() == resource)
+    }
+
+    /// Navigates to the beginning of a spine section.
+    pub fn go_to_section(&mut self, index: usize) -> Result<PageTurn, ReaderError> {
+        self.poll_prefetch()?;
+        if index >= self.source.book().sections.len() {
+            return Err(ReaderError::SectionOutOfBounds(index));
+        }
+        self.ensure_section(index)?;
+        self.current_section = index;
+        self.current_page = 0;
+        self.touch(index);
+        Ok(self.moved())
+    }
+
+    /// Navigates a TOC or link target to the beginning of its containing section.
+    pub fn go_to_href(&mut self, href: &PublicationUrl) -> Result<PageTurn, ReaderError> {
+        let index = self
+            .section_index_for_href(href)
+            .ok_or_else(|| ReaderError::NavigationTargetNotFound(href.to_string()))?;
+        self.go_to_section(index)
+    }
+
+    /// Moves in constant time while pages are cached. Section boundaries compile
+    /// only the destination section, never the previous one again.
+    pub fn turn_page(&mut self, direction: PageDirection) -> Result<PageTurn, ReaderError> {
+        self.poll_prefetch()?;
+        match direction {
+            PageDirection::Next => self.next_page(),
+            PageDirection::Previous => self.previous_page(),
+        }
+    }
+
+    /// Queues a small chapter window around the current position for background
+    /// parsing, pagination, and display-list compilation. Looking two chapters
+    /// ahead keeps short, single-page chapters from outrunning the worker.
+    /// This method never performs chapter layout on the caller thread.
+    pub fn prefetch_adjacent(&mut self) -> Result<(), ReaderError> {
+        self.poll_prefetch()?;
+        let section_count = self.source.book().sections.len();
+        for distance in 1..=PREFETCH_DISTANCE {
+            if let Some(index) = self.current_section.checked_add(distance)
+                && index < section_count
+            {
+                self.queue_prefetch(index)?;
+            }
+        }
+        for distance in 1..=PREFETCH_DISTANCE {
+            if let Some(index) = self.current_section.checked_sub(distance) {
+                self.queue_prefetch(index)?;
+            }
+        }
+        self.touch(self.current_section);
+        Ok(())
+    }
+
+    /// Blocks until all currently queued prefetch work has been collected.
+    /// Intended for diagnostics and deterministic tests, not interactive shells.
+    pub fn wait_for_prefetch(&mut self) -> Result<(), ReaderError> {
+        while !self.prefetch_inflight.is_empty() {
+            let result = self
+                .prefetch_results
+                .recv()
+                .map_err(|_| ReaderError::PrefetchWorkerStopped)?;
+            self.install_prefetch(result);
+        }
+        if let Some(index) = self.prefetch_failures.keys().next().copied()
+            && let Some(error) = self.prefetch_failures.remove(&index)
+        {
+            return Err(error);
         }
         Ok(())
     }
 
-    fn is_active(&self, generation: u64) -> bool {
-        self.snapshot.generation == generation
-            && self
-                .active_cancellation
-                .as_ref()
-                .is_some_and(|token| !token.is_cancelled())
+    /// Invalidates layout/display caches while preserving approximate progress
+    /// inside the active section.
+    pub fn resize(&mut self, viewport: LayoutViewport) -> Result<(), ReaderError> {
+        if self.viewport == viewport {
+            return Ok(());
+        }
+        let old_count = self.current_page_count();
+        let fraction = page_fraction(self.current_page, old_count);
+        self.viewport = viewport;
+        self.invalidate_layout(fraction)
     }
 
-    fn cancel_active(&mut self) {
-        if let Some(token) = self.active_cancellation.take() {
-            token.cancel();
+    pub fn set_style(&mut self, style: ReaderStyle) -> Result<(), ReaderError> {
+        if self.style == style {
+            return Ok(());
+        }
+        let fraction = page_fraction(self.current_page, self.current_page_count());
+        self.style = style;
+        self.invalidate_layout(fraction)
+    }
+
+    pub fn cached_section_count(&self) -> usize {
+        self.cache.len()
+    }
+
+    fn next_page(&mut self) -> Result<PageTurn, ReaderError> {
+        if self.current_page + 1 < self.current_page_count() {
+            self.current_page += 1;
+            return Ok(self.moved());
+        }
+        let next = self.current_section + 1;
+        if next >= self.source.book().sections.len() {
+            return Ok(self.boundary());
+        }
+        self.ensure_section(next)?;
+        self.current_section = next;
+        self.current_page = 0;
+        self.touch(next);
+        Ok(self.moved())
+    }
+
+    fn previous_page(&mut self) -> Result<PageTurn, ReaderError> {
+        if self.current_page > 0 {
+            self.current_page -= 1;
+            return Ok(self.moved());
+        }
+        let Some(previous) = self.current_section.checked_sub(1) else {
+            return Ok(self.boundary());
+        };
+        self.ensure_section(previous)?;
+        self.current_section = previous;
+        self.current_page = self.current_page_count().saturating_sub(1);
+        self.touch(previous);
+        Ok(self.moved())
+    }
+
+    fn ensure_section(&mut self, index: usize) -> Result<(), ReaderError> {
+        if self.cache.contains_key(&index) {
+            self.touch(index);
+            return Ok(());
+        }
+        if let Some(error) = self.prefetch_failures.remove(&index) {
+            return Err(error);
+        }
+        if self.prefetch_inflight.contains(&index) {
+            self.wait_for_section(index)?;
+            if self.cache.contains_key(&index) {
+                self.touch(index);
+                return Ok(());
+            }
+        }
+        let section = compile_section(
+            self.source.as_ref(),
+            index,
+            self.viewport,
+            self.style,
+            &mut self.layout_engine,
+            &self.display_compiler,
+        )?;
+        self.cache.insert(index, Arc::new(section));
+        self.touch(index);
+        self.evict();
+        Ok(())
+    }
+
+    fn invalidate_layout(&mut self, fraction: f32) -> Result<(), ReaderError> {
+        self.prefetch_generation.fetch_add(1, Ordering::Release);
+        self.prefetch_inflight.clear();
+        self.prefetch_failures.clear();
+        self.cache.clear();
+        self.lru.clear();
+        self.ensure_section(self.current_section)?;
+        let count = self.current_page_count();
+        self.current_page = page_for_fraction(fraction, count);
+        Ok(())
+    }
+
+    fn queue_prefetch(&mut self, index: usize) -> Result<(), ReaderError> {
+        if self.cache.contains_key(&index) || self.prefetch_inflight.contains(&index) {
+            return Ok(());
+        }
+        self.prefetch_requests
+            .send(PrefetchRequest {
+                index,
+                viewport: self.viewport,
+                style: self.style,
+                generation: self.prefetch_generation.load(Ordering::Acquire),
+            })
+            .map_err(|_| ReaderError::PrefetchWorkerStopped)?;
+        self.prefetch_inflight.insert(index);
+        Ok(())
+    }
+
+    fn poll_prefetch(&mut self) -> Result<(), ReaderError> {
+        loop {
+            match self.prefetch_results.try_recv() {
+                Ok(result) => self.install_prefetch(result),
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) if self.prefetch_inflight.is_empty() => {
+                    return Ok(());
+                }
+                Err(TryRecvError::Disconnected) => {
+                    return Err(ReaderError::PrefetchWorkerStopped);
+                }
+            }
+        }
+    }
+
+    fn wait_for_section(&mut self, index: usize) -> Result<(), ReaderError> {
+        while self.prefetch_inflight.contains(&index) {
+            let result = self
+                .prefetch_results
+                .recv()
+                .map_err(|_| ReaderError::PrefetchWorkerStopped)?;
+            self.install_prefetch(result);
+        }
+        if let Some(error) = self.prefetch_failures.remove(&index) {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn install_prefetch(&mut self, result: PrefetchResult) {
+        self.prefetch_inflight.remove(&result.index);
+        if result.generation != self.prefetch_generation.load(Ordering::Acquire) {
+            return;
+        }
+        let section = match result.section {
+            Ok(section) => section,
+            Err(error) => {
+                self.prefetch_failures.insert(result.index, error);
+                return;
+            }
+        };
+        if self.cache.insert(result.index, section).is_none() {
+            self.touch(result.index);
+            self.evict();
+        }
+        self.touch(self.current_section);
+    }
+
+    fn current_page_count(&self) -> usize {
+        self.cache
+            .get(&self.current_section)
+            .map_or(0, |section| section.pages.len())
+    }
+
+    fn touch(&mut self, index: usize) {
+        self.lru.retain(|cached| *cached != index);
+        self.lru.push_back(index);
+    }
+
+    fn evict(&mut self) {
+        while self.cache.len() > self.cache_capacity {
+            let Some(candidate) = self.lru.pop_front() else {
+                break;
+            };
+            if candidate == self.current_section {
+                self.lru.push_back(candidate);
+                continue;
+            }
+            self.cache.remove(&candidate);
+        }
+    }
+
+    fn moved(&self) -> PageTurn {
+        PageTurn::Moved {
+            section_index: self.current_section,
+            page_index: self.current_page,
+        }
+    }
+
+    fn boundary(&self) -> PageTurn {
+        PageTurn::Boundary {
+            section_index: self.current_section,
+            page_index: self.current_page,
         }
     }
 }
 
-/// Reader state-machine validation errors.
+fn spawn_prefetch_worker(
+    source: Arc<dyn BookSource>,
+    active_generation: Arc<AtomicU64>,
+) -> Result<(Sender<PrefetchRequest>, Receiver<PrefetchResult>), ReaderError> {
+    let (request_sender, request_receiver) = mpsc::channel::<PrefetchRequest>();
+    let (result_sender, result_receiver) = mpsc::channel::<PrefetchResult>();
+    thread::Builder::new()
+        .name("rebook-prefetch".into())
+        .spawn(move || {
+            let mut layout_engine = LayoutEngine::new();
+            let display_compiler = DisplayListCompiler;
+            while let Ok(request) = request_receiver.recv() {
+                if active_generation.load(Ordering::Acquire) != request.generation {
+                    continue;
+                }
+                let section = compile_section(
+                    source.as_ref(),
+                    request.index,
+                    request.viewport,
+                    request.style,
+                    &mut layout_engine,
+                    &display_compiler,
+                )
+                .map(Arc::new);
+                if active_generation.load(Ordering::Acquire) != request.generation {
+                    continue;
+                }
+                if result_sender
+                    .send(PrefetchResult {
+                        index: request.index,
+                        generation: request.generation,
+                        section,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .map_err(ReaderError::PrefetchWorkerStart)?;
+    Ok((request_sender, result_receiver))
+}
+
+fn compile_section(
+    source: &dyn BookSource,
+    index: usize,
+    viewport: LayoutViewport,
+    style: ReaderStyle,
+    layout_engine: &mut LayoutEngine,
+    display_compiler: &DisplayListCompiler,
+) -> Result<CachedSection, ReaderError> {
+    let section = source.parse_section(index)?;
+    let layout = layout_engine.layout_section(source, &section, viewport, style)?;
+    let pages = layout
+        .pages
+        .iter()
+        .map(|page| display_compiler.compile(page))
+        .collect();
+    Ok(CachedSection { pages })
+}
+
+// Page counts are bounded by the pages that fit in memory, so they remain far
+// below f32's exact-integer limit. These conversions intentionally map the
+// discrete page index to and from a normalized viewport-resize progress value.
+#[allow(clippy::cast_precision_loss)]
+fn page_fraction(page: usize, count: usize) -> f32 {
+    if count <= 1 {
+        0.0
+    } else {
+        page as f32 / (count - 1) as f32
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn page_for_fraction(fraction: f32, count: usize) -> usize {
+    if count <= 1 {
+        0
+    } else {
+        (fraction.clamp(0.0, 1.0) * (count - 1) as f32).round() as usize
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ReaderError {
-    /// Navigation was requested before a publication was opened.
-    #[error("no publication is open")]
-    NoPublication,
-    /// A locator belongs to another publication.
-    #[error("locator belongs to a different publication")]
-    LocatorPublicationMismatch,
-    /// Viewport dimensions or scale were not finite and positive.
-    #[error("viewport dimensions and scale must be finite and positive")]
-    InvalidViewport,
-    /// One or more reader preferences were outside supported bounds.
-    #[error("reader preferences are invalid")]
-    InvalidPreferences,
-    /// Publication model validation failed.
+    #[error("publication has no readable sections")]
+    EmptyBook,
+    #[error("section index is outside the reading order: {0}")]
+    SectionOutOfBounds(usize),
+    #[error("navigation target is not in the reading order: {0}")]
+    NavigationTargetNotFound(String),
     #[error(transparent)]
-    Publication(#[from] rebook_publication::PublicationError),
-}
-
-fn validate_preferences(preferences: &ReaderPreferences) -> Result<(), ReaderError> {
-    if preferences.font_size.is_finite()
-        && preferences.line_height.is_finite()
-        && preferences.margin.is_finite()
-        && (6.0..=144.0).contains(&preferences.font_size)
-        && (0.8..=4.0).contains(&preferences.line_height)
-        && (0.0..=512.0).contains(&preferences.margin)
-    {
-        Ok(())
-    } else {
-        Err(ReaderError::InvalidPreferences)
-    }
+    Publication(#[from] PublicationError),
+    #[error(transparent)]
+    Layout(#[from] LayoutError),
+    #[error("failed to start the section prefetch worker: {0}")]
+    PrefetchWorkerStart(std::io::Error),
+    #[error("section prefetch worker stopped unexpectedly")]
+    PrefetchWorkerStopped,
 }
 
 #[cfg(test)]
 mod tests {
-    use rebook_publication::{LocatorV1, PublicationId, PublicationUrl};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
-    use super::{LayoutReason, ReaderCommand, ReaderController, ReaderState, ReaderTask, Viewport};
+    use rebook_publication::{
+        Block, BlockStyle, Inline, Metadata, PublicationId, PublicationUrl, Resource, Section,
+        SpineItem, SpineItemId, TextBlock, TextBlockKind, TextRun, TextStyle,
+    };
 
-    fn publication_id(value: &str) -> PublicationId {
-        PublicationId::new(value).expect("valid publication ID")
+    use super::*;
+
+    struct CountingSource {
+        book: Book,
+        sections: Vec<Section>,
+        parse_counts: Vec<AtomicUsize>,
+        background_delay: Duration,
     }
 
-    fn locator(publication_id: PublicationId) -> LocatorV1 {
-        LocatorV1::at_start(
-            publication_id,
-            PublicationUrl::parse("OPS/chapter.xhtml").expect("valid URL"),
-        )
+    impl CountingSource {
+        fn new(texts: &[String]) -> Arc<Self> {
+            Self::with_background_delay(texts, Duration::ZERO)
+        }
+
+        fn with_background_delay(texts: &[String], background_delay: Duration) -> Arc<Self> {
+            let mut descriptors = Vec::with_capacity(texts.len());
+            let mut sections = Vec::with_capacity(texts.len());
+            for (index, text) in texts.iter().enumerate() {
+                let id = SpineItemId::new(format!("section-{index}")).unwrap();
+                let href = PublicationUrl::parse(&format!("section-{index}.xhtml")).unwrap();
+                descriptors.push(SpineItem {
+                    id: id.clone(),
+                    href: href.clone(),
+                    media_type: "application/xhtml+xml".into(),
+                    linear: true,
+                    properties: Vec::new(),
+                });
+                sections.push(Section {
+                    id,
+                    href,
+                    blocks: vec![Block::Text(TextBlock {
+                        kind: TextBlockKind::Paragraph,
+                        content: vec![Inline::Text(TextRun {
+                            text: text.clone(),
+                            style: TextStyle::default(),
+                            link: None,
+                        })],
+                        style: BlockStyle::default(),
+                        source: None,
+                    })],
+                });
+            }
+
+            Arc::new(Self {
+                book: Book {
+                    id: PublicationId::new("reader-test").unwrap(),
+                    metadata: Metadata::default(),
+                    cover: None,
+                    sections: descriptors,
+                    table_of_contents: Vec::new(),
+                },
+                parse_counts: (0..sections.len()).map(|_| AtomicUsize::new(0)).collect(),
+                sections,
+                background_delay,
+            })
+        }
+
+        fn parse_count(&self, index: usize) -> usize {
+            self.parse_counts[index].load(Ordering::Relaxed)
+        }
+    }
+
+    impl BookSource for CountingSource {
+        fn book(&self) -> &Book {
+            &self.book
+        }
+
+        fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+            if index > 0 {
+                thread::sleep(self.background_delay);
+            }
+            let section =
+                self.sections.get(index).cloned().ok_or_else(|| {
+                    PublicationError::ResourceNotFound(format!("section {index}"))
+                })?;
+            self.parse_counts[index].fetch_add(1, Ordering::Relaxed);
+            Ok(section)
+        }
+
+        fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+            Err(PublicationError::ResourceNotFound(href.to_string()))
+        }
+    }
+
+    fn viewport(width: u32, height: u32) -> LayoutViewport {
+        LayoutViewport::new(width, height).unwrap()
     }
 
     #[test]
-    fn a_new_open_cancels_the_previous_task_and_rejects_stale_completion() {
-        let mut reader = ReaderController::new();
-        let first = reader
-            .dispatch(ReaderCommand::Open {
-                display_name: "first.epub".into(),
-            })
-            .expect("open command");
-        let ReaderTask::Open {
-            generation: first_generation,
-            cancellation: first_cancellation,
-            ..
-        } = first.task.expect("open task")
-        else {
-            panic!("expected open task");
-        };
+    fn cached_page_turns_and_boundaries_do_not_reparse() {
+        let source = CountingSource::new(&["缓存翻页测试。".repeat(600)]);
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+        let page_count = reader.location().page_count;
+        assert!(page_count > 2);
+        assert_eq!(source.parse_count(0), 1);
 
-        let second = reader
-            .dispatch(ReaderCommand::Open {
-                display_name: "second.epub".into(),
-            })
-            .expect("second open command");
-        assert!(first_cancellation.is_cancelled());
-        assert!(matches!(second.task, Some(ReaderTask::Open { .. })));
-
-        let stale = reader
-            .complete_open(
-                first_generation,
-                publication_id("first"),
-                locator(publication_id("first")),
-            )
-            .expect("stale completion is ignored");
-        assert!(stale.events.is_empty());
-        assert_eq!(reader.snapshot().state, ReaderState::Opening);
-    }
-
-    #[test]
-    fn open_completion_schedules_initial_layout() {
-        let mut reader = ReaderController::new();
-        let open = reader
-            .dispatch(ReaderCommand::Open {
-                display_name: "book.epub".into(),
-            })
-            .expect("open command");
-        let ReaderTask::Open { generation, .. } = open.task.expect("open task") else {
-            panic!("expected open task");
-        };
-        let id = publication_id("book");
-        let completed = reader
-            .complete_open(generation, id.clone(), locator(id))
-            .expect("complete open");
-
-        assert_eq!(reader.snapshot().state, ReaderState::LayingOut);
         assert!(matches!(
-            completed.task,
-            Some(ReaderTask::Layout {
-                reason: LayoutReason::Initial,
-                ..
-            })
+            reader.turn_page(PageDirection::Previous).unwrap(),
+            PageTurn::Boundary { .. }
         ));
-    }
-
-    #[test]
-    fn viewport_change_replaces_an_active_layout_generation() {
-        let mut reader = ReaderController::new();
-        let open = reader
-            .dispatch(ReaderCommand::Open {
-                display_name: "book.epub".into(),
-            })
-            .expect("open command");
-        let ReaderTask::Open { generation, .. } = open.task.expect("open task") else {
-            panic!("expected open task");
-        };
-        let id = publication_id("book");
-        let initial = reader
-            .complete_open(generation, id.clone(), locator(id))
-            .expect("complete open");
-        let ReaderTask::Layout {
-            cancellation: initial_cancellation,
-            ..
-        } = initial.task.expect("layout task")
-        else {
-            panic!("expected layout task");
-        };
-
-        let resized = reader
-            .dispatch(ReaderCommand::SetViewport(Viewport {
-                width: 1200.0,
-                height: 800.0,
-                scale_factor: 2.0,
-            }))
-            .expect("viewport command");
-        assert!(initial_cancellation.is_cancelled());
+        for _ in 1..page_count {
+            assert!(matches!(
+                reader.turn_page(PageDirection::Next).unwrap(),
+                PageTurn::Moved { .. }
+            ));
+        }
         assert!(matches!(
-            resized.task,
-            Some(ReaderTask::Layout {
-                reason: LayoutReason::Viewport,
-                ..
-            })
+            reader.turn_page(PageDirection::Next).unwrap(),
+            PageTurn::Boundary { .. }
         ));
+        assert_eq!(source.parse_count(0), 1);
     }
 
     #[test]
-    fn rejects_locator_from_another_publication() {
-        let mut reader = ReaderController::new();
-        let open = reader
-            .dispatch(ReaderCommand::Open {
-                display_name: "book.epub".into(),
-            })
-            .expect("open command");
-        let ReaderTask::Open { generation, .. } = open.task.expect("open task") else {
-            panic!("expected open task");
-        };
-        let id = publication_id("book");
-        reader
-            .complete_open(generation, id.clone(), locator(id))
-            .expect("complete open");
+    fn chapter_window_prefetch_makes_short_section_switches_cache_only() {
+        let source = CountingSource::new(&["第一章".into(), "第二章".into(), "第三章".into()]);
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
 
-        let result = reader.dispatch(ReaderCommand::GoTo {
-            locator: Box::new(locator(publication_id("different"))),
-        });
-        assert!(result.is_err());
+        reader.prefetch_adjacent().unwrap();
+        reader.wait_for_prefetch().unwrap();
+        assert_eq!(reader.cached_section_count(), 3);
+        assert_eq!(source.parse_count(1), 1);
+        assert_eq!(source.parse_count(2), 1);
+        reader.turn_page(PageDirection::Next).unwrap();
+        assert_eq!(reader.location().section_index, 1);
+        assert_eq!(source.parse_count(1), 1);
+
+        reader.prefetch_adjacent().unwrap();
+        reader.wait_for_prefetch().unwrap();
+        assert_eq!(reader.cached_section_count(), 3);
+        assert_eq!(source.parse_count(2), 1);
+        reader.turn_page(PageDirection::Next).unwrap();
+        assert_eq!(reader.location().section_index, 2);
+        assert_eq!(source.parse_count(2), 1);
+    }
+
+    #[test]
+    fn toc_href_navigation_resolves_fragments_and_uses_the_section_cache() {
+        let source = CountingSource::new(&[
+            "第一章".repeat(100),
+            "第二章".repeat(100),
+            "第三章".repeat(100),
+        ]);
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+        reader.prefetch_adjacent().unwrap();
+        reader.wait_for_prefetch().unwrap();
+
+        let target = PublicationUrl::parse("section-1.xhtml#part-2").unwrap();
+        assert_eq!(reader.section_index_for_href(&target), Some(1));
+        reader.go_to_href(&target).unwrap();
+
+        assert_eq!(reader.location().section_index, 1);
+        assert_eq!(reader.location().page_index, 0);
+        assert_eq!(source.parse_count(1), 1);
+    }
+
+    #[test]
+    fn adjacent_prefetch_never_blocks_the_caller_thread() {
+        let source = CountingSource::with_background_delay(
+            &["第一章".into(), "第二章".into()],
+            Duration::from_millis(300),
+        );
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+
+        let started = Instant::now();
+        reader.prefetch_adjacent().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        reader.wait_for_prefetch().unwrap();
+        assert_eq!(source.parse_count(1), 1);
+    }
+
+    #[test]
+    fn resize_rebuilds_layout_and_preserves_approximate_progress() {
+        let source = CountingSource::new(&["调整窗口后保持阅读进度。".repeat(600)]);
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+        let old_count = reader.location().page_count;
+        assert!(old_count > 4);
+        for _ in 0..old_count / 2 {
+            reader.turn_page(PageDirection::Next).unwrap();
+        }
+        let old_fraction = page_fraction(reader.location().page_index, old_count);
+
+        reader.resize(viewport(500, 300)).unwrap();
+
+        let location = reader.location();
+        let new_fraction = page_fraction(location.page_index, location.page_count);
+        let one_page = page_fraction(1, location.page_count);
+        assert!((new_fraction - old_fraction).abs() <= one_page);
+        assert_eq!(source.parse_count(0), 2);
+        assert_eq!(reader.cached_section_count(), 1);
     }
 }

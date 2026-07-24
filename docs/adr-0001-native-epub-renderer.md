@@ -1,57 +1,59 @@
-# ADR-0001：Rust 原生 EPUB 渲染栈
+# ADR-0001：Reading IR 驱动的 Rust 原生 EPUB 渲染器
 
-- 状态：接受，Phase 0 有条件验证通过
+- 状态：接受，替代早期 Blitz/DOM 方案
 - 日期：2026-07-23
 
 ## 背景
 
-EPUB 3 的正文由 XHTML、CSS、SVG、字体、图片以及可选的 MathML、脚本和媒体资源组成。W3C 的 [EPUB Reading Systems 3.3](https://www.w3.org/TR/epub-rs-33/) 要求视觉阅读系统处理 XHTML、CSS、字体、SVG、固定版式和国际化排版；因此这不是一个“ZIP + 富文本控件”问题，而是受约束的文档浏览器问题。
+产品需要原生分页、稳定的阅读位置和低延迟翻页，但不需要复刻浏览器或完全兼容 Web。早期样板复用了 Blitz、Stylo 和 Taffy，能够显示 XHTML，却把 DOM/CSS 浏览器模型、同步整章布局和上游内部类型带入了核心路径；分页难以成为一等能力，缓存边界也不清晰。
 
-产品同时要求：桌面原生、不嵌入 Web 容器、核心渲染逻辑由 Rust 实现。
+`rebook` 已验证更适合本产品的领域边界：parser 先把书籍归一化成中间表示，renderer 只消费稳定的阅读语义。这里接受破坏性重构，不兼容旧 renderer API。
 
 ## 决策
 
-正式路线采用 EPUB 专用的 Rust 原生渲染管线：
+采用以下单向管线：
 
-1. OCF/OPF/导航和资源安全由 `rebook-epub` 自己控制。
-2. XHTML/XML 解析复用 `xml5ever`，CSS 级联复用 `Stylo`。
-3. 块级盒布局以 `Taffy` 为基础，富文本排版使用 `Parley`。
-4. 绘制使用 `Vello`/`wgpu`，桌面事件循环使用 `winit`。
-5. 以 [Blitz](https://github.com/DioxusLabs/blitz) 的模块化 crate 作为集成起点，但只通过项目内部适配接口调用，并固定到经过验证的精确版本。
-6. EPUB 特有的资源 URL、用户样式、分页/碎片化、Locator、选择、高亮和阅读状态由本项目实现。
+```text
+EPUB container -> Reading IR -> PageLayout -> PageDisplayList -> Vello
+```
 
-应用控件首期可使用 `egui`，但正文表面不使用 `egui` 的文本布局。
+1. `publication` 定义格式和 renderer 无关的 `BookSource` 与 Reading IR：`Book/Section/Block/Inline`。
+2. `epub` 负责安全容器、metadata/spine/resource，并按章节懒解析 XHTML；容器解析与 Reading IR 解析分模块。
+3. `layout` 持有 Parley 字体与布局上下文，直接从 Reading IR 产生分页后的 `PageLayout`。长段落必须可跨页，图片只解码一次；图片作者尺寸和最大尺寸在列宽/页高内解析。单页和双页 spread 使用同一分页器，双页只改变每个 surface 的列几何。
+4. `renderer` 把页面编译为 retained `PageDisplayList`，缓存 glyph/font/image/rule 命令；GPU 和 CPU 后端共享同一绘制协议。
+5. `reader` 是唯一的会话编排者。当前章节页面常驻，当前章前后各两章使用五项 LRU；持久 prefetch worker 拥有独立的 `LayoutEngine`/字体缓存，在 UI 线程外解析、分页并编译章节窗口。Reader 解析 TOC href 到 spine section，普通翻页不得触发解析、排版或 display-list 编译。
+6. `desktop` 使用 crates.io 发布版 Xilem 0.4.0/Masonry 管理窗口生命周期、输入、DPI/resize、目录侧边栏、滚动和无障碍，不持有 EPUB/DOM 逻辑。阅读页继续消费 retained `PageDisplayList`；窄桥接层把 AnyRender/Vello 0.9 命令转换为 Xilem 所用的 Vello 0.6 scene，并共享字体/图片 blob，不进行 CPU 位图回读。桌面层可缓存最近使用的 Vello Scene，但该后端缓存不能反向进入 renderer-independent Reading IR、PageLayout 或 PageDisplayList。
 
-## 为什么不是其他路线
+核心 crate 的依赖方向为：
 
-### 直接嵌入 Servo
+```text
+desktop -> reader -> layout -> publication <- epub
+                 \-> renderer -> layout
+```
 
-[Servo](https://book.servo.org/embedding/overview.html) 已提供嵌入 API，网页兼容性最高，也不等同于系统 WebView。它适合作为兼容性对照和技术兜底，但包含完整浏览器能力、JavaScript 引擎和更多原生依赖，体积、构建和安全面明显超过无脚本 EPUB 阅读器的需要，也削弱了对分页、Locator 和书籍样式策略的控制。因此不作为正式内核。
+## 明确不采用
 
-### 完全从基础 crate 重写
-
-从 `cssparser`、字体 shaping 和绘图原语开始重写，理论控制力最高，但 CSS 级联、Unicode 双向算法、字体回退、复杂文字 shaping、表格和碎片化会吞掉大量工期。项目的差异化应放在 EPUB Reading System 和阅读体验，不应重新实现已有的浏览器级基础算法。
-
-### 把 Blitz 当稳定黑盒
-
-Blitz 的 README 明确标注为 pre-alpha；其 [CSS 状态表](https://blitz.is/status/css) 目前仍缺 `writing-mode`、`unicode-bidi`、`hyphens` 等电子书关键能力。直接绑定其高层 API 会把上游变更和缺失能力泄漏到整个应用。因此只在内部适配层后使用，并保留维护小型 fork 或替换后端的能力。
+- 不把 Blitz、DOM、Stylo 或 Taffy 作为正文主链。
+- 不为旧的 Blitz renderer API 保留适配层。
+- 不以完整 HTML/CSS 兼容作为 MVP 验收标准。
+- 不在 display list 或桌面层反向读取 EPUB ZIP。
 
 ## 后果
 
-收益：没有 WebView，主体栈为 Rust；复用浏览器级 CSS 和文本组件；可以原生实现分页、命中测试和稳定阅读位置；长期可以把修复回馈上游。
+收益是分页和缓存成为显式模型，同章翻页为 O(1) 索引切换；解析、排版、绘制可以独立测试或替换；EPUB 层不会依赖 GPU/window 类型。
 
-代价：Blitz/Vello 仍快速演进；真正分页和竖排需要项目投入；“完整 EPUB 3”只能通过长期测试覆盖逐步达到，不能在 MVP 阶段宣称完成。
+代价是项目需要自行定义并逐步扩展 Reading IR/CSS 子集。复杂 table/float/ruby/竖排和 fixed-layout 不能从浏览器引擎自动获得，必须按真实书籍需求进入 IR 与 layout。当前打开的首章仍同步整章排版；相邻章节已后台整章预取，超长章节后续仍可演进为增量分页。
 
-## Phase 0 的否决条件
+## 架构不变量
 
-出现下列任一情况且两周内无法在适配层或小型补丁中解决，就暂停正式路线并重新比较 Servo：
-
-- 无法从内存资源提供器可靠加载相对 CSS、图片和 `@font-face`。
-- 无法获得字符范围到几何矩形的映射，导致选择和 Locator 不可实现。
-- 普通中文章节在目标机器上无法稳定字体回退或存在明显错字、漏字。
-- 一章 10 万汉字的首次排版、内存或窗口缩放表现不可接受，且无法按章节/视口增量化。
-- 上游 API 迫使 EPUB 层依赖其内部 DOM ID、窗口或网络实现，无法通过适配层隔离。
-
-## Phase 0 结果
-
-Publication CSS、资源沙箱、CJK 排版、文字命中和 Vello CPU 首屏已经贯通，Blitz 类型也被限制在 renderer/desktop 边界内，因此不触发立即否决。20k/100k 章节暴露出同步整章布局缺少协作取消，当前无头 ARM 环境无法完成 Vello/wgpu presentation 验收；路线继续，但这两项作为 alpha 前置门槛。具体数据见 [Phase 0 状态](phase-0-status.md)。
+- `BookSource::parse_section` 保持章节懒加载。
+- 缓存页面翻页不再次调用 parser。
+- 章节窗口预取只能向 worker 投递任务，不能在 winit/UI 线程执行 parser、layout 或 display-list 编译。
+- resize/样式失效通过 generation 隔离旧预取结果，过期结果不得回填当前缓存。
+- resize/样式变化会失效布局，但保留近似阅读进度。
+- 单页/双页切换属于阅读样式失效；双页模式在最小列宽不足时自动使用单页几何。
+- 目录组件只消费 `Book.table_of_contents` 和 Reader 跳转 API，不直接读取 EPUB Nav/NCX。
+- `LayoutViewport` 和 `PageLayout` 只使用逻辑像素；设备 DPI 只在最终 `paint_scaled` 中应用一次，不能改变分页结果。
+- `PageLayout` 不包含 Vello 类型，`PageDisplayList` 不包含 EPUB 类型。
+- 新能力优先扩展 Reading IR 和对应测试，不绕过中间层直接把 XHTML 交给 renderer。
+- 桌面 UI 视觉 token 可以参考 `rebook-web`，但组件实现和正文渲染保持原生；产品 chrome 的变化不得侵入 parser、Reading IR、layout 或 renderer。

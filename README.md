@@ -1,65 +1,64 @@
 # rebook-desktop
 
-Rust 原生桌面电子书阅读器实验工程。正文不嵌入 WebView，也不使用 Electron、Wry、CEF；EPUB 解析、CSS 级联、文字排版、命中测试和绘制都在 Rust 进程内完成。
+Rust 原生桌面电子书阅读器。正文不嵌入 WebView，也不追求完整浏览器兼容；当前主链是：
 
-Phase 0 纵向样板已经可构建、可测试：`EPUB -> Publication -> XHTML/CSS -> Stylo/Taffy/Parley -> Vello -> 原生窗口或离屏 RGBA`。当前是内核样板，不是可日常使用的阅读器；多章节滚动、稳定 Locator 映射、分页、书架和持久化仍未实现。实测与验收缺口见 [Phase 0 状态](docs/phase-0-status.md)。
+```text
+EPUB container/parser
+  -> renderer-independent Reading IR
+  -> Parley layout and native pagination
+  -> retained page display list
+  -> Vello GPU/CPU renderer
+```
+
+同章翻页只切换已编译页面的缓存索引，跨章通过前后各两章的五章节 LRU 窗口后台预取。解析、分页和 display-list 编译在持久 worker 上完成，交互线程只投递任务和安装已完成结果；桌面端再保留最近 32 页的 Vello Scene，纯 UI 状态变化和已访问页面翻页不会重复回放 display list。窗口尺寸或阅读样式变化时才重新分页并失效 Scene 缓存。
 
 ## Workspace
 
-- `crates/publication`：格式无关的 Publication、SpineItem、资源 URL、Locator 和 SourceRange。
-- `crates/reader`：串行 ReaderController、generation、任务取消和过期结果隔离。
-- `crates/epub`：受限 ZIP、OCF、OPF、EPUB 3 Nav、EPUB 2 NCX、懒资源读取。
-- `crates/renderer`：隔离 Blitz 内部类型的 XHTML/CSS 布局、资源沙箱、文字命中和 Vello CPU 回归绘制。
-- `apps/inspect`：EPUB 结构与诊断 JSON。
-- `apps/desktop`：Blitz shell + Vello/wgpu 的原生窗口，以及无显示服务器的诊断模式。
+- `crates/publication`：格式无关的 `BookSource`、Reading IR、资源 URL 与 SourceRange。
+- `crates/epub`：受限 ZIP/OCF/OPF/Nav/NCX，以及 XHTML 到 Reading IR 的懒章节解析。
+- `crates/layout`：持久化 Parley 上下文、文字塑形、受控图片尺寸和单页/双页 spread 原生分页。
+- `crates/renderer`：把页面布局编译成 retained display list，并交给 Vello GPU/CPU 绘制。
+- `crates/reader`：阅读位置、翻页、TOC/href 跳转、布局失效、后台两章前瞻/回看预取和五章节 LRU 缓存。
+- `apps/inspect`：EPUB 结构诊断 JSON。
+- `apps/desktop`：Xilem 0.4.0/Masonry 原生窗口与组件、Vello GPU 阅读页、可交互目录侧边栏，以及无窗口 CPU 诊断模式。
 
-## Rust 环境
+## 环境与质量门禁
 
-项目固定 Rust `1.97.1`，MSRV 为 `1.97`。当前机器使用 `rustup` 管理工具链，Cargo crates.io 已替换为 RsProxy Sparse 国内镜像；配置位于 `~/.cargo/config.toml`。在本机验证：
+项目固定 Rust `1.97.1`，进入目录后 `rust-toolchain.toml` 会让 rustup 自动选择工具链。本机 Cargo 使用 RsProxy sparse 国内镜像。开发 profile 对工作区使用 `opt-level = 1`、对第三方依赖使用 `opt-level = 3` 并启用增量编译，避免 Parley/Vello 在 O0 预览中造成不必要的卡顿。
 
-```bash
-rustup show active-toolchain
-rustc -V
-cargo -V
+```powershell
+cargo fmt --all --check
+cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-进入此目录后，`rust-toolchain.toml` 会自动选择项目工具链并安装 `rustfmt`、`clippy`。
+## 运行
 
-## 构建与运行
+```powershell
+# 启动真实测试书籍
+cargo run -p rebook-desktop -- "test-data\数学觉醒学会更清晰地思考.epub"
 
-```bash
-# 全工作区测试
-cargo test --workspace --all-targets
+# 输出 parser/layout/cache/paint 性能诊断
+cargo run -p rebook-desktop -- --diagnose "test-data\数学觉醒学会更清晰地思考.epub"
 
-# 生成自研的规范 EPUB 3 样本并检查结构
-cargo run -p rebook-inspect --example build_fixture
-cargo run -p rebook-inspect -- target/fixtures/minimal.epub
-
-# 启动 Vello/wgpu 原生窗口（需要桌面会话和兼容 GPU）
-cargo run -p rebook-desktop -- target/fixtures/minimal.epub
-
-# 无窗口完成排版和 Vello CPU 首屏绘制，输出 JSON 性能/资源诊断
-cargo run -p rebook-desktop -- --diagnose target/fixtures/minimal.epub
+# 修改 Rust/TOML/EPUB 后自动重启预览
+watchexec -r -e rs,toml,epub -- cargo run --locked -p rebook-desktop -- "test-data\数学觉醒学会更清晰地思考.epub"
 ```
 
-可生成约 2 万或任意规模的中文长章节：
+阅读区顶部 44px 工具栏仅在鼠标进入顶部区域时显示；它复用页面背景，并占用同为 44px 的页面上边距，不覆盖正文也不叠加第二层顶部 padding。方向键 `←` / `→` 翻页；右上角 Lucide 菜单可打开设置弹窗，单栏/双栏在“排版”中配置，默认使用双栏。目录侧栏默认固定并占据布局宽度，左上角按钮收起/展开，右上角图钉可取消固定并切换为覆盖层；目录文字左对齐，使用无滚动条的虚拟列表，支持点击和滚轮导航。侧栏封面优先读取 EPUB 3 `cover-image`，并兼容 EPUB 2 `meta name="cover"`。双栏模式要求每栏至少 320px，窄窗口会自动退回单栏。底部 4px 轨道显示全书阅读进度；窗口 resize 和单双栏切换都会按当前章节的相对页进度恢复位置。
 
-```bash
-cargo run -p rebook-inspect --example build_benchmark
-cargo run -p rebook-inspect --example build_benchmark -- \
-  target/fixtures/benchmark-100k.epub 100000
-cargo run -p rebook-desktop -- --diagnose target/fixtures/benchmark-20k.epub
-```
+桌面 chrome 复用 `rebook-web` 的浅色阅读设计 token：暖灰页面与工具栏、紧凑顶栏、Lucide 图标、柔和青绿色强调色和低对比度目录选中态。Xilem/Masonry 只负责窗口、组件布局、滚动与无障碍；正文仍由 retained `PageDisplayList` 直接桥接到 Vello GPU scene，不经过 WebView 或 CPU 位图回读。
 
-## 当前支持边界
+## 当前能力边界
 
-已实现 EPUB 3 常用容器、OPF/manifest/spine、Nav，兼容 EPUB 2 NCX；所有归档资源按需读取，并限制路径、entry 数量、单项/总解压大小、压缩比和 XML 深度，禁止加密 entry、符号链接、DOCTYPE 与网络子资源。渲染器支持外链 publication CSS、中文复杂脚本分词/塑形、首屏绘制和 point-to-text 命中。
+已实现 EPUB 3 常用容器、EPUB 2 NCX、层级目录、懒资源读取和归档/XML 安全预算；Reading IR 支持标题、段落、列表、引用、pre、图片、分隔线，以及受控的文字/块样式。EPUB parser 会级联 `<style>`、本地 `<link rel="stylesheet">` 和 inline style，支持 tag、class、id、`tag.class`、selector group，并把 `text-align`、`text-indent`、行高、边距、字号、字重、斜体、装饰、颜色，以及图片 `width/height/max-width/max-height` 归一化到 Reading IR；阅读器默认样式会把段落缩进覆盖为 0。图片尺寸支持 px/em/rem/pt 与百分比，最终按栏宽、页高约束并保持纵横比。布局支持中文字体回退、长段落跨页、单页/双页 spread。默认正文采用 rebook demo 的 16px、1.72 行高和 44px 页面边距。
 
-尚未实现书内字体混淆、图片像素预算、规范 XML DOM 到稳定 SourceAnchor 的双向映射、多 spine 连续滚动、增量布局、分页、fixed-layout、完整 SVG/MathML、竖排、批注和无障碍树。JavaScript、表单、远程资源和 DRM 是明确禁用或非 MVP 能力。
+当前不实现完整 DOM/CSS/Web 能力。复杂 selector、完整盒模型、fixed-layout、完整 SVG/MathML、ruby/竖排、选择批注、无障碍树、书内字体混淆和持久化书架仍待后续实现。TOC fragment 当前定位到所属章节开头，待 Reading IR 保留 authored element ID 后再支持章内精确锚点。JavaScript、表单、远程资源和 DRM 明确不属于当前阅读内核。
 
-## 设计文档
+## 文档
 
-- [完整技术方案](docs/technical-plan.md)
-- [`rebook` / `rebook-web` 架构复盘与迁移边界](docs/rebook-reference-architecture.md)
-- [原生 EPUB 渲染栈 ADR](docs/adr-0001-native-epub-renderer.md)
-- [Phase 0 实现、实测和下一阶段门槛](docs/phase-0-status.md)
+- [当前原生渲染架构 ADR](docs/adr-0001-native-epub-renderer.md)
+- [当前实现与性能状态](docs/phase-0-status.md)
+- [早期技术调研（历史）](docs/technical-plan.md)
+- [`rebook` / `rebook-web` 架构复盘（历史）](docs/rebook-reference-architecture.md)

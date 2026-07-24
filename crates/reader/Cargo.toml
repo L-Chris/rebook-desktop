@@ -1,14 +1,15 @@
 [package]
 name = "rebook-reader"
-description = "Reader session state machine and commands for rebook-desktop"
+description = "Cached reader session orchestrating parser, layout, and renderer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+rebook-layout = { path = "../layout" }
 rebook-publication = { path = "../publication" }
-serde.workspace = true
+rebook-renderer = { path = "../renderer" }
 thiserror.workspace = true
 
 [lints]

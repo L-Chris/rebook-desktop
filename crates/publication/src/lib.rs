@@ -233,17 +233,226 @@ pub struct Resource {
     pub bytes: Arc<[u8]>,
 }
 
-/// Format-neutral contract consumed by reader and renderer layers.
-pub trait Publication: Send + Sync {
-    /// Stable publication identity.
-    fn id(&self) -> &PublicationId;
-    /// Normalized metadata.
-    fn metadata(&self) -> &Metadata;
-    /// Ordered spine items.
-    fn reading_order(&self) -> &[SpineItem];
-    /// Table of contents.
-    fn table_of_contents(&self) -> &[TocEntry];
-    /// Loads one resource subject to the publication's resource budgets.
+/// Format-neutral description returned before individual sections are parsed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Book {
+    /// Stable identity derived from the source publication.
+    pub id: PublicationId,
+    /// Normalized package metadata.
+    pub metadata: Metadata,
+    /// Canonical cover resource, when declared by the publication.
+    pub cover: Option<PublicationUrl>,
+    /// Ordered reflowable sections.
+    pub sections: Vec<SpineItem>,
+    /// Hierarchical navigation entries.
+    pub table_of_contents: Vec<TocEntry>,
+}
+
+/// Fully parsed, renderer-independent section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Section {
+    /// Stable section identity.
+    pub id: SpineItemId,
+    /// Canonical source document URL.
+    pub href: PublicationUrl,
+    /// Semantic reading blocks in source order.
+    pub blocks: Vec<Block>,
+}
+
+/// Normalized reading block. It intentionally contains no DOM or renderer types.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Block {
+    /// Reflowable text content.
+    Text(TextBlock),
+    /// Raster or vector image resource.
+    Image(ImageBlock),
+    /// Thematic separator.
+    Separator,
+    /// Explicit page boundary requested by the source.
+    PageBreak,
+}
+
+/// Semantic role of a text block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextBlockKind {
+    /// Ordinary paragraph.
+    Paragraph,
+    /// Heading with a one-based source level.
+    Heading(u8),
+    /// Quoted prose.
+    Blockquote,
+    /// Preformatted text.
+    Preformatted,
+    /// Ordered or unordered list item.
+    ListItem {
+        /// Whether numbering should be displayed.
+        ordered: bool,
+        /// One-based item number when ordered.
+        ordinal: u32,
+    },
+}
+
+/// A block of styled inline content.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextBlock {
+    /// Semantic role.
+    pub kind: TextBlockKind,
+    /// Inline content after whitespace normalization.
+    pub content: Vec<Inline>,
+    /// Portable block style subset.
+    pub style: BlockStyle,
+    /// Stable source range for navigation and selection.
+    pub source: Option<SourceRange>,
+}
+
+/// Inline reading content.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Inline {
+    /// Styled Unicode text.
+    Text(TextRun),
+    /// Forced line break.
+    Break,
+}
+
+/// Styled text span with an optional link target.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextRun {
+    /// Normalized text.
+    pub text: String,
+    /// Portable inline style subset.
+    pub style: TextStyle,
+    /// Resolved link target.
+    pub link: Option<PublicationUrl>,
+}
+
+/// Image block referencing a publication resource.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageBlock {
+    /// Canonical image URL.
+    pub href: PublicationUrl,
+    /// Alternative text.
+    pub alt: String,
+    /// Author sizing constraints normalized from attributes and CSS.
+    pub style: ImageStyle,
+    /// Stable source range.
+    pub source: Option<SourceRange>,
+}
+
+/// A portable image length resolved by layout against the containing column.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ImageLength {
+    /// Absolute CSS pixels.
+    Pixels(f32),
+    /// Fraction of the containing width or height, where `1.0` is 100%.
+    Fraction(f32),
+}
+
+impl ImageLength {
+    /// Resolves this value against one containing dimension.
+    pub fn resolve(self, containing: f32) -> f32 {
+        match self {
+            Self::Pixels(value) => value,
+            Self::Fraction(value) => containing * value,
+        }
+    }
+}
+
+/// Reflowable image sizing subset modeled after the rebook text-image IR.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ImageStyle {
+    pub width: Option<ImageLength>,
+    pub height: Option<ImageLength>,
+    pub max_width: Option<ImageLength>,
+    pub max_height: Option<ImageLength>,
+}
+
+/// RGBA color stored without renderer coupling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rgba {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+impl Rgba {
+    /// Opaque black, used for inherited body text.
+    pub const BLACK: Self = Self {
+        red: 0,
+        green: 0,
+        blue: 0,
+        alpha: 255,
+    };
+}
+
+impl Default for Rgba {
+    fn default() -> Self {
+        Self::BLACK
+    }
+}
+
+/// Renderer-independent inline style subset.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    /// Scale relative to the reader's base font size.
+    pub size_scale: f32,
+    pub color: Rgba,
+}
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self {
+            bold: false,
+            italic: false,
+            underline: false,
+            size_scale: 1.0,
+            color: Rgba::BLACK,
+        }
+    }
+}
+
+/// Text alignment supported by the native layout engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextAlignment {
+    #[default]
+    Start,
+    Center,
+    End,
+    Justify,
+}
+
+/// Portable block style subset, expressed in CSS pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BlockStyle {
+    pub align: TextAlignment,
+    pub margin_before: f32,
+    pub margin_after: f32,
+    pub indent: f32,
+    pub line_height: f32,
+}
+
+impl Default for BlockStyle {
+    fn default() -> Self {
+        Self {
+            align: TextAlignment::Start,
+            margin_before: 0.0,
+            margin_after: 16.0,
+            indent: 0.0,
+            line_height: 1.72,
+        }
+    }
+}
+
+/// Lazy source boundary: parsers produce stable reading IR one section at a time.
+pub trait BookSource: Send + Sync {
+    /// Lightweight descriptor available immediately after opening.
+    fn book(&self) -> &Book;
+    /// Parses one section into the normalized reading IR.
+    fn parse_section(&self, index: usize) -> Result<Section, PublicationError>;
+    /// Loads a referenced resource subject to format-specific budgets.
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError>;
 }
 
