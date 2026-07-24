@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use image::ImageError;
 use parley::{
-    Alignment, AlignmentOptions, FontContext, FontStyle, FontWeight, Layout, LayoutContext,
-    LineHeight, StyleProperty,
+    Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontWeight, Layout,
+    LayoutContext, LineHeight, StyleProperty,
 };
 use rebook_publication::{
     Block, BookSource, ImageStyle, Inline, PublicationError, Rgba, Section, SourceRange,
@@ -15,7 +15,8 @@ use rebook_publication::{
 use thiserror::Error;
 
 const COLUMN_GAP: f32 = 36.0;
-const MIN_COLUMN_WIDTH: f32 = 320.0;
+const MIN_COLUMN_WIDTH: f32 = 360.0;
+const MAX_COLUMN_WIDTH: f32 = 960.0;
 
 /// Logical viewport in device-independent pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,11 +38,43 @@ impl LayoutViewport {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReaderStyle {
     pub font_size: f32,
+    pub font_family: ReaderFontFamily,
     pub horizontal_margin: f32,
     pub vertical_margin: f32,
     pub spread: SpreadMode,
     pub foreground: Rgba,
     pub background: Rgba,
+}
+
+/// Semantic font family selected by the reader.
+///
+/// Native platforms resolve these through their installed system fonts, matching
+/// the generic family model used by rebook's browser renderer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReaderFontFamily {
+    #[default]
+    Serif,
+    SansSerif,
+    Monospace,
+    MicrosoftYaHei,
+    SimSun,
+    KaiTi,
+}
+
+impl ReaderFontFamily {
+    #[must_use]
+    pub const fn css_stack(self) -> &'static str {
+        match self {
+            Self::Serif => "serif",
+            Self::SansSerif => "sans-serif",
+            Self::Monospace => "monospace",
+            Self::MicrosoftYaHei => {
+                "'Microsoft YaHei', 'Microsoft YaHei UI', 'PingFang SC', sans-serif"
+            }
+            Self::SimSun => "SimSun, 'Songti SC', 'Noto Serif CJK SC', serif",
+            Self::KaiTi => "KaiTi, STKaiti, 'Noto Serif CJK SC', serif",
+        }
+    }
 }
 
 /// Maximum number of book pages shown in one viewport.
@@ -68,6 +101,7 @@ impl Default for ReaderStyle {
     fn default() -> Self {
         Self {
             font_size: 16.0,
+            font_family: ReaderFontFamily::default(),
             horizontal_margin: 44.0,
             vertical_margin: 44.0,
             spread: SpreadMode::Double,
@@ -175,38 +209,10 @@ impl LayoutEngine {
     ) -> Result<SectionLayout, LayoutError> {
         let page_width = viewport.width as f32;
         let page_height = viewport.height as f32;
-        let horizontal_margin = reader_style
-            .horizontal_margin
-            .min(page_width.mul_add(0.2, -8.0).max(20.0));
-        let vertical_margin = reader_style
-            .vertical_margin
-            .min(page_height.mul_add(0.2, -8.0).max(20.0));
-        let double_available = page_width - horizontal_margin * 2.0 - COLUMN_GAP;
-        let column_count = if reader_style.spread == SpreadMode::Double
-            && double_available >= MIN_COLUMN_WIDTH * 2.0
-        {
-            2
-        } else {
-            1
-        };
-        let column_gap = if column_count == 2 { COLUMN_GAP } else { 0.0 };
-        let column_divisor = if column_count == 2 { 2.0 } else { 1.0 };
-        let content_width =
-            ((page_width - horizontal_margin * 2.0 - column_gap) / column_divisor).max(80.0);
-        let content_bottom = (page_height - vertical_margin).max(vertical_margin + 40.0);
+        let geometry = resolve_page_geometry(page_width, page_height, reader_style);
+        let content_width = geometry.width;
 
-        let mut paginator = Paginator::new(
-            viewport,
-            reader_style.background,
-            PageGeometry {
-                left: horizontal_margin,
-                top: vertical_margin,
-                width: content_width,
-                bottom: content_bottom,
-                column_count,
-                column_gap,
-            },
-        );
+        let mut paginator = Paginator::new(viewport, reader_style.background, geometry);
 
         for block in &section.blocks {
             match block {
@@ -245,6 +251,9 @@ impl LayoutEngine {
         let mut builder =
             self.layout_context
                 .ranged_builder(&mut self.font_context, &text, 1.0, false);
+        builder.push_default(StyleProperty::FontFamily(FontFamily::from(
+            reader_style.font_family.css_stack(),
+        )));
         builder.push_default(StyleProperty::FontSize(reader_style.font_size));
         builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(
             block.style.line_height,
@@ -291,6 +300,43 @@ impl LayoutEngine {
         };
         layout.align(alignment, AlignmentOptions::default());
         Arc::new(layout)
+    }
+}
+
+fn resolve_page_geometry(
+    page_width: f32,
+    page_height: f32,
+    reader_style: ReaderStyle,
+) -> PageGeometry {
+    let horizontal_margin = reader_style
+        .horizontal_margin
+        .min(page_width.mul_add(0.2, -8.0).max(20.0));
+    let vertical_margin = reader_style
+        .vertical_margin
+        .min(page_height.mul_add(0.2, -8.0).max(20.0));
+    let double_available = page_width - horizontal_margin * 2.0 - COLUMN_GAP;
+    let column_count = if reader_style.spread == SpreadMode::Double
+        && double_available >= MIN_COLUMN_WIDTH * 2.0
+    {
+        2
+    } else {
+        1
+    };
+    let column_gap = if column_count == 2 { COLUMN_GAP } else { 0.0 };
+    let column_divisor = if column_count == 2 { 2.0 } else { 1.0 };
+    let content_width = ((page_width - horizontal_margin * 2.0 - column_gap) / column_divisor)
+        .clamp(80.0, MAX_COLUMN_WIDTH);
+    let spread_width = content_width * column_divisor + column_gap;
+    let content_left = ((page_width - spread_width) / 2.0).max(horizontal_margin);
+    let content_bottom = (page_height - vertical_margin).max(vertical_margin + 40.0);
+
+    PageGeometry {
+        left: content_left,
+        top: vertical_margin,
+        width: content_width,
+        bottom: content_bottom,
+        column_count,
+        column_gap,
     }
 }
 
@@ -574,6 +620,51 @@ pub enum LayoutError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_font_families_expose_generic_and_named_fallback_stacks() {
+        assert_eq!(ReaderStyle::default().font_family, ReaderFontFamily::Serif);
+        assert_eq!(ReaderFontFamily::Serif.css_stack(), "serif");
+        assert_eq!(ReaderFontFamily::SansSerif.css_stack(), "sans-serif");
+        assert_eq!(ReaderFontFamily::Monospace.css_stack(), "monospace");
+        assert!(
+            ReaderFontFamily::MicrosoftYaHei
+                .css_stack()
+                .contains("Microsoft YaHei")
+        );
+        assert!(ReaderFontFamily::SimSun.css_stack().ends_with("serif"));
+        assert!(ReaderFontFamily::KaiTi.css_stack().ends_with("serif"));
+    }
+
+    #[test]
+    fn wide_viewports_cap_and_center_each_reading_column() {
+        let viewport_width = 3_000.0;
+        let page_height = 900.0;
+        let single = resolve_page_geometry(
+            viewport_width,
+            page_height,
+            ReaderStyle {
+                spread: SpreadMode::Single,
+                ..ReaderStyle::default()
+            },
+        );
+        assert_eq!(single.column_count, 1);
+        assert!((single.width - MAX_COLUMN_WIDTH).abs() < f32::EPSILON);
+        assert!((single.left - (viewport_width - MAX_COLUMN_WIDTH) / 2.0).abs() < f32::EPSILON);
+
+        let double = resolve_page_geometry(
+            viewport_width,
+            page_height,
+            ReaderStyle {
+                spread: SpreadMode::Double,
+                ..ReaderStyle::default()
+            },
+        );
+        let spread_width = MAX_COLUMN_WIDTH * 2.0 + COLUMN_GAP;
+        assert_eq!(double.column_count, 2);
+        assert!((double.width - MAX_COLUMN_WIDTH).abs() < f32::EPSILON);
+        assert!((double.left - (viewport_width - spread_width) / 2.0).abs() < f32::EPSILON);
+    }
     use rebook_publication::{
         Book, ImageLength, Metadata, PublicationId, PublicationUrl, Resource, SpineItemId, TocEntry,
     };

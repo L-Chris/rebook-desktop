@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 anyrender.workspace = true
 anyrender_vello_cpu.workspace = true
+directories.workspace = true
 image.workspace = true
 kurbo.workspace = true
 lucide-icons.workspace = true
@@ -18,9 +19,15 @@ rebook-layout = { path = "../../crates/layout" }
 rebook-publication = { path = "../../crates/publication" }
 rebook-reader = { path = "../../crates/reader" }
 rebook-renderer = { path = "../../crates/renderer" }
+rfd.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 xilem.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+zip.workspace = true

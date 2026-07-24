@@ -9,8 +9,8 @@ use xilem::masonry::accesskit::{Node, Role};
 use xilem::masonry::core::keyboard::{Key, KeyState, NamedKey};
 use xilem::masonry::core::{
     AccessCtx, AccessEvent, BoxConstraints, ChildrenIds, EventCtx, LayoutCtx, PaintCtx,
-    PointerEvent, PropertiesMut, PropertiesRef, RegisterCtx, TextEvent, Widget, WidgetId,
-    WidgetMut,
+    PointerEvent, PointerScrollEvent, PropertiesMut, PropertiesRef, RegisterCtx, ScrollDelta,
+    TextEvent, Widget, WidgetId, WidgetMut,
 };
 use xilem::masonry::kurbo::Size;
 use xilem::masonry::vello::Scene;
@@ -180,6 +180,12 @@ impl Widget for ReaderCanvas {
                     ));
                 }
             }
+            PointerEvent::Scroll(PointerScrollEvent { delta, .. }) => {
+                if let Some(action) = page_action_for_scroll_delta(*delta) {
+                    ctx.submit_action::<Self::Action>(action);
+                    ctx.set_handled();
+                }
+            }
             _ => {}
         }
     }
@@ -269,6 +275,18 @@ fn page_action_for_key(key: &Key) -> Option<ReaderCanvasAction> {
     }
 }
 
+fn page_action_for_scroll_delta(delta: ScrollDelta) -> Option<ReaderCanvasAction> {
+    let vertical = match delta {
+        ScrollDelta::PageDelta(_, y) | ScrollDelta::LineDelta(_, y) => f64::from(y),
+        ScrollDelta::PixelDelta(position) => position.y,
+    };
+    match vertical.partial_cmp(&0.0) {
+        Some(std::cmp::Ordering::Greater) => Some(ReaderCanvasAction::PreviousPage),
+        Some(std::cmp::Ordering::Less) => Some(ReaderCanvasAction::NextPage),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +311,21 @@ mod tests {
             Some(ReaderCanvasAction::NextPage)
         );
         assert_eq!(page_action_for_key(&Key::Named(NamedKey::ArrowUp)), None);
+    }
+
+    #[test]
+    fn vertical_scroll_maps_to_page_turns() {
+        assert_eq!(
+            page_action_for_scroll_delta(ScrollDelta::LineDelta(0.0, 1.0)),
+            Some(ReaderCanvasAction::PreviousPage)
+        );
+        assert_eq!(
+            page_action_for_scroll_delta(ScrollDelta::LineDelta(0.0, -1.0)),
+            Some(ReaderCanvasAction::NextPage)
+        );
+        assert_eq!(
+            page_action_for_scroll_delta(ScrollDelta::LineDelta(1.0, 0.0)),
+            None
+        );
     }
 }

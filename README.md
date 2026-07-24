@@ -20,7 +20,7 @@ EPUB container/parser
 - `crates/renderer`：把页面布局编译成 retained display list，并交给 Vello GPU/CPU 绘制。
 - `crates/reader`：阅读位置、翻页、TOC/href 跳转、布局失效、后台两章前瞻/回看预取和五章节 LRU 缓存。
 - `apps/inspect`：EPUB 结构诊断 JSON。
-- `apps/desktop`：Xilem 0.4.0/Masonry 原生窗口与组件、Vello GPU 阅读页、可交互目录侧边栏，以及无窗口 CPU 诊断模式。
+- `apps/desktop`：Xilem 0.4.0/Masonry 原生书架与阅读窗口、Vello GPU 阅读页、可交互目录侧边栏，以及无窗口 CPU 诊断模式。
 
 ## 环境与质量门禁
 
@@ -36,15 +36,20 @@ cargo test --workspace
 ## 运行
 
 ```powershell
-# 启动真实测试书籍
+# 启动本地书架，可多选导入 EPUB
+cargo run -p rebook-desktop
+
+# 直接打开真实测试书籍（不导入书架）
 cargo run -p rebook-desktop -- "test-data\数学觉醒学会更清晰地思考.epub"
 
 # 输出 parser/layout/cache/paint 性能诊断
 cargo run -p rebook-desktop -- --diagnose "test-data\数学觉醒学会更清晰地思考.epub"
 
-# 修改 Rust/TOML/EPUB 后自动重启预览
-watchexec -r -e rs,toml,epub -- cargo run --locked -p rebook-desktop -- "test-data\数学觉醒学会更清晰地思考.epub"
+# 修改 Rust/TOML 后自动重启书架预览
+watchexec -r -e rs,toml -- cargo run --locked -p rebook-desktop
 ```
+
+默认首页参考 `rebook-web` 的书架布局，提供标题/作者搜索、封面卡片、本地状态、多选导入和移除。导入的 EPUB 会复制到系统应用数据目录，书架清单、元数据和封面也只保存在本机；内容哈希用于跳过重复导入，当前不连接账号、服务端或云盘。点击封面或书名进入阅读器，阅读器顶部返回按钮和菜单均可回到书架。命令行直接传入 EPUB 时仍保持原有的快速预览流程，不会自动写入书架。
 
 阅读区顶部 44px 工具栏仅在鼠标进入顶部区域时显示；它复用页面背景，并占用同为 44px 的页面上边距，不覆盖正文也不叠加第二层顶部 padding。方向键 `←` / `→` 翻页；右上角 Lucide 菜单可打开设置弹窗，单栏/双栏在“排版”中配置，默认使用双栏。目录侧栏默认固定并占据布局宽度，左上角按钮收起/展开，右上角图钉可取消固定并切换为覆盖层；目录文字左对齐，使用无滚动条的虚拟列表，支持点击和滚轮导航。侧栏封面优先读取 EPUB 3 `cover-image`，并兼容 EPUB 2 `meta name="cover"`。双栏模式要求每栏至少 320px，窄窗口会自动退回单栏。底部 4px 轨道显示全书阅读进度；窗口 resize 和单双栏切换都会按当前章节的相对页进度恢复位置。
 
@@ -54,7 +59,7 @@ watchexec -r -e rs,toml,epub -- cargo run --locked -p rebook-desktop -- "test-da
 
 已实现 EPUB 3 常用容器、EPUB 2 NCX、层级目录、懒资源读取和归档/XML 安全预算；Reading IR 支持标题、段落、列表、引用、pre、图片、分隔线，以及受控的文字/块样式。EPUB parser 会级联 `<style>`、本地 `<link rel="stylesheet">` 和 inline style，支持 tag、class、id、`tag.class`、selector group，并把 `text-align`、`text-indent`、行高、边距、字号、字重、斜体、装饰、颜色，以及图片 `width/height/max-width/max-height` 归一化到 Reading IR；阅读器默认样式会把段落缩进覆盖为 0。图片尺寸支持 px/em/rem/pt 与百分比，最终按栏宽、页高约束并保持纵横比。布局支持中文字体回退、长段落跨页、单页/双页 spread。默认正文采用 rebook demo 的 16px、1.72 行高和 44px 页面边距。
 
-当前不实现完整 DOM/CSS/Web 能力。复杂 selector、完整盒模型、fixed-layout、完整 SVG/MathML、ruby/竖排、选择批注、无障碍树、书内字体混淆和持久化书架仍待后续实现。TOC fragment 当前定位到所属章节开头，待 Reading IR 保留 authored element ID 后再支持章内精确锚点。JavaScript、表单、远程资源和 DRM 明确不属于当前阅读内核。
+当前不实现完整 DOM/CSS/Web 能力。复杂 selector、完整盒模型、fixed-layout、完整 SVG/MathML、ruby/竖排、选择批注、无障碍树、书内字体混淆、阅读进度持久化和网络书架同步仍待后续实现。TOC fragment 当前定位到所属章节开头，待 Reading IR 保留 authored element ID 后再支持章内精确锚点。JavaScript、表单、远程资源和 DRM 明确不属于当前阅读内核。
 
 ## 文档
 

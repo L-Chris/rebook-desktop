@@ -101,7 +101,7 @@ impl ReadingIrParser {
                 }
                 "ul" => self.parse_list(node, false)?,
                 "ol" => self.parse_list(node, true)?,
-                "img" => self.push_image(node)?,
+                "img" | "image" => self.push_image(node)?,
                 "hr" => self.blocks.push(Block::Separator),
                 "br" => self.blocks.push(Block::PageBreak),
                 "script" | "style" | "head" | "nav" => {}
@@ -162,7 +162,10 @@ impl ReadingIrParser {
         for image in node.descendants().filter(|descendant| {
             descendant != &node
                 && descendant.is_element()
-                && descendant.tag_name().name().eq_ignore_ascii_case("img")
+                && matches!(
+                    descendant.tag_name().name().to_ascii_lowercase().as_str(),
+                    "img" | "image"
+                )
         }) {
             self.push_image(image)?;
         }
@@ -170,7 +173,9 @@ impl ReadingIrParser {
     }
 
     fn push_image(&mut self, node: Node<'_, '_>) -> Result<(), EpubError> {
-        let Some(src) = attribute_local(node, "src").filter(|value| !value.trim().is_empty())
+        let Some(src) = attribute_local(node, "src")
+            .or_else(|| attribute_local(node, "href"))
+            .filter(|value| !value.trim().is_empty())
         else {
             return Ok(());
         };
@@ -886,6 +891,31 @@ mod tests {
         assert_eq!(image.style.width, Some(ImageLength::Fraction(0.8)));
         assert_eq!(image.style.max_width, Some(ImageLength::Pixels(420.0)));
         assert_eq!(image.style.max_height, Some(ImageLength::Fraction(0.6)));
+    }
+
+    #[test]
+    fn parses_svg_image_href_as_an_image_block() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("cover").unwrap(),
+            href: PublicationUrl::parse("OPS/titlepage.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml">
+            <body><svg xmlns="http://www.w3.org/2000/svg"
+                xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 622 910">
+                <image width="622" height="910" xlink:href="images/cover.jpeg"/>
+            </svg></body>
+        </html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let Some(Block::Image(image)) = section.blocks.first() else {
+            panic!("expected an SVG image block");
+        };
+        assert_eq!(image.href.path(), "OPS/images/cover.jpeg");
+        assert_eq!(image.style.width, Some(ImageLength::Pixels(622.0)));
+        assert_eq!(image.style.height, Some(ImageLength::Pixels(910.0)));
     }
 
     fn assert_close(actual: f32, expected: f32) {

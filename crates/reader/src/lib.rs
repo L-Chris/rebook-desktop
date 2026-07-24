@@ -539,6 +539,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
+    use rebook_layout::ReaderFontFamily;
     use rebook_publication::{
         Block, BlockStyle, Inline, Metadata, PublicationId, PublicationUrl, Resource, Section,
         SpineItem, SpineItemId, TextBlock, TextBlockKind, TextRun, TextStyle,
@@ -743,6 +744,32 @@ mod tests {
         let new_fraction = page_fraction(location.page_index, location.page_count);
         let one_page = page_fraction(1, location.page_count);
         assert!((new_fraction - old_fraction).abs() <= one_page);
+        assert_eq!(source.parse_count(0), 2);
+        assert_eq!(reader.cached_section_count(), 1);
+    }
+
+    #[test]
+    fn font_family_change_rebuilds_layout_and_preserves_approximate_progress() {
+        let source = CountingSource::new(&["字体切换后保持阅读进度。".repeat(600)]);
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+        let old_count = reader.location().page_count;
+        assert!(old_count > 4);
+        for _ in 0..old_count / 2 {
+            reader.turn_page(PageDirection::Next).unwrap();
+        }
+        let old_fraction = page_fraction(reader.location().page_index, old_count);
+
+        let mut style = reader.style();
+        style.font_family = ReaderFontFamily::SansSerif;
+        reader.set_style(style).unwrap();
+
+        let location = reader.location();
+        let new_fraction = page_fraction(location.page_index, location.page_count);
+        let one_page = page_fraction(1, location.page_count);
+        assert!((new_fraction - old_fraction).abs() <= one_page);
+        assert_eq!(reader.style().font_family, ReaderFontFamily::SansSerif);
         assert_eq!(source.parse_count(0), 2);
         assert_eq!(reader.cached_section_count(), 1);
     }

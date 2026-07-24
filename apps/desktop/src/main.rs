@@ -1,32 +1,38 @@
 //! Native EPUB reader: parser -> reading IR -> page layout -> display list -> Xilem/Vello.
 
+mod library;
+mod pointer_button;
 mod reader_canvas;
 mod vello_bridge;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
-use std::ffi::OsString;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyrender_vello_cpu::VelloCpuImageRenderer;
+use library::{LibraryBook, LocalLibrary, publication_cover_bytes};
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
+use pointer_button::button;
 use reader_canvas::{ReaderCanvasAction, reader_canvas};
 use rebook_epub::EpubPublication;
-use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode};
+use rebook_layout::{LayoutViewport, ReaderFontFamily, ReaderStyle, SpreadMode};
 use rebook_publication::{BookSource, PublicationUrl, Rgba, TocEntry};
 use rebook_reader::{PageDirection, PageTurn, ReaderSession};
 use vello_bridge::XilemVelloScene;
-use xilem::core::fork;
+use xilem::core::{fork, map_state};
 use xilem::masonry::kurbo::Size;
 use xilem::masonry::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
+use xilem::masonry::properties::LineBreaking;
 use xilem::masonry::properties::types::{AsUnit, UnitPoint};
 use xilem::masonry::vello::Scene;
 use xilem::style::{Padding, Style};
 use xilem::view::{
-    CrossAxisAlignment, FlexExt, FlexSpacer, MainAxisAlignment, ObjectFit, ZStackExt, button,
-    flex_col, flex_row, image, label, portal, prose, sized_box, task, zstack,
+    CrossAxisAlignment, FlexExt, FlexSpacer, MainAxisAlignment, ObjectFit, ZStackExt, flex_col,
+    flex_row, image, label, portal, prose, sized_box, task, text_input, zstack,
 };
 use xilem::{
     Affine, AnyWidgetView, Color, EventLoop, FontWeight, WidgetView, WindowOptions, Xilem,
@@ -37,10 +43,16 @@ const INITIAL_HEIGHT: u32 = 800;
 const TOOLBAR_HEIGHT: f64 = 44.0;
 const PROGRESS_HEIGHT: f64 = 4.0;
 const TOC_WIDTH: f64 = 240.0;
-const SETTINGS_WIDTH: f64 = 520.0;
-const SETTINGS_HEIGHT: f64 = 360.0;
+const SETTINGS_WIDTH: f64 = 640.0;
+const SETTINGS_HEIGHT: f64 = 460.0;
+const SHELF_CARD_WIDTH: f64 = 144.0;
+const SHELF_COVER_HEIGHT: f64 = 216.0;
+const SHELF_COLUMNS: usize = 4;
+const SHELF_TITLE_MAX_DISPLAY_UNITS: usize = 18;
 const PAGE_SCENE_CACHE_CAPACITY: usize = 32;
 const MOTION_DURATION: Duration = Duration::from_millis(180);
+const TOOLBAR_MOTION_DURATION: Duration = Duration::from_millis(200);
+const TOOLBAR_HIDE_DELAY: Duration = Duration::from_millis(500);
 const MOTION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const SIDEBAR_SCRIM_ALPHA: f32 = 0.28;
 const MODAL_SCRIM_ALPHA: f32 = 0.35;
@@ -58,6 +70,7 @@ const UI_BORDER: Color = Color::from_rgb8(0xdd, 0xe5, 0xee);
 const UI_ACCENT: Color = Color::from_rgb8(0x0f, 0x76, 0x6e);
 const UI_ACCENT_SOFT: Color = Color::from_rgb8(0xe2, 0xf3, 0xf1);
 const UI_ACCENT_BORDER: Color = Color::from_rgb8(0xba, 0xe6, 0xe1);
+const UI_FONT_STACK: &str = "'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', 'Segoe UI Symbol', sans-serif";
 
 fn main() -> ExitCode {
     match run() {
@@ -70,58 +83,173 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let (diagnose, path) = parse_arguments()?;
-    let started = Instant::now();
-    let publication = Arc::new(EpubPublication::open_file(path)?);
-    let parsed = Instant::now();
-    let cover = publication
-        .book()
-        .cover
-        .as_ref()
-        .and_then(|href| publication.resource(href).ok())
-        .and_then(|resource| decode_cover(&resource.bytes).ok());
-    let source: Arc<dyn BookSource> = publication;
-    let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
-    let reader = ReaderSession::open(source, viewport, ReaderStyle::default())?;
-    let laid_out = Instant::now();
+    let launch = match parse_arguments()? {
+        LaunchMode::Diagnose(path) => {
+            let started = Instant::now();
+            let publication = Arc::new(EpubPublication::open_file(path)?);
+            let parsed = Instant::now();
+            let source: Arc<dyn BookSource> = publication;
+            let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
+            let reader = ReaderSession::open(source, viewport, ReaderStyle::default())?;
+            let laid_out = Instant::now();
+            diagnose_reader(reader, started, parsed, laid_out)?;
+            return Ok(());
+        }
+        launch => launch,
+    };
 
-    if diagnose {
-        diagnose_reader(reader, started, parsed, laid_out)?;
-        return Ok(());
+    let library =
+        LocalLibrary::load_default().map_err(|error| io::Error::other(error.to_string()))?;
+    let mut state = DesktopApp::new(library);
+    if let LaunchMode::Open(path) = launch {
+        state.open_book(&path);
     }
-
-    let title = reader.book().metadata.title.clone();
-    let state = DesktopReader::new(reader, cover);
-    let window = WindowOptions::new(title)
+    let window = WindowOptions::new("Rebook")
         .with_initial_inner_size(xilem::winit::dpi::LogicalSize::new(
             INITIAL_WIDTH,
             INITIAL_HEIGHT,
         ))
         .with_min_inner_size(xilem::winit::dpi::LogicalSize::new(720_u32, 520_u32));
-    Xilem::new_simple(state, app_view, window)
+    Xilem::new_simple(state, root_view, window)
         .with_font(LUCIDE_FONT_BYTES.to_vec())
         .run_in(EventLoop::with_user_event())?;
     Ok(())
 }
 
-fn parse_arguments() -> Result<(bool, OsString), Box<dyn std::error::Error>> {
+fn open_reader(path: &Path) -> Result<DesktopReader, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let publication = Arc::new(EpubPublication::open_file(path)?);
+    let cover = publication_cover_bytes(&publication)
+        .as_deref()
+        .and_then(|bytes| decode_cover(bytes).ok());
+    let source: Arc<dyn BookSource> = publication;
+    let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
+    let reader = ReaderSession::open(source, viewport, ReaderStyle::default())?;
+    tracing::debug!(
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "opened book"
+    );
+    Ok(DesktopReader::new(reader, cover))
+}
+
+enum LaunchMode {
+    Shelf,
+    Open(PathBuf),
+    Diagnose(PathBuf),
+}
+
+fn parse_arguments() -> Result<LaunchMode, Box<dyn std::error::Error>> {
     let mut arguments = env::args_os();
     let executable = arguments
         .next()
         .and_then(|value| value.into_string().ok())
         .unwrap_or_else(|| "rebook-desktop".into());
     let Some(first) = arguments.next() else {
-        return Err(usage(&executable).into());
+        return Ok(LaunchMode::Shelf);
     };
-    let (diagnose, path) = if first == "--diagnose" {
-        (true, arguments.next().ok_or_else(|| usage(&executable))?)
+    let launch = if first == "--diagnose" {
+        LaunchMode::Diagnose(PathBuf::from(
+            arguments.next().ok_or_else(|| usage(&executable))?,
+        ))
     } else {
-        (false, first)
+        LaunchMode::Open(PathBuf::from(first))
     };
     if arguments.next().is_some() {
         return Err(usage(&executable).into());
     }
-    Ok((diagnose, path))
+    Ok(launch)
+}
+
+struct DesktopApp {
+    shelf: ShelfState,
+    reader: Option<DesktopReader>,
+}
+
+struct ShelfState {
+    library: LocalLibrary,
+    covers: HashMap<String, ImageData>,
+    query: String,
+    notice: Option<String>,
+    error: Option<String>,
+}
+
+impl DesktopApp {
+    fn new(library: LocalLibrary) -> Self {
+        Self {
+            shelf: ShelfState::new(library),
+            reader: None,
+        }
+    }
+
+    fn open_book(&mut self, path: &Path) {
+        match open_reader(path) {
+            Ok(reader) => {
+                self.reader = Some(reader);
+                self.shelf.error = None;
+            }
+            Err(error) => self.shelf.error = Some(format!("无法打开书籍：{error}")),
+        }
+    }
+
+    fn import_books(&mut self, paths: &[PathBuf]) {
+        self.shelf.error = None;
+        match self.shelf.library.import_files(paths) {
+            Ok(summary) => {
+                self.shelf.refresh_covers();
+                self.shelf.notice = Some(match (summary.imported, summary.duplicates) {
+                    (0, duplicates) => format!("所选的 {duplicates} 本书已在书架中"),
+                    (imported, 0) => format!("已导入 {imported} 本书"),
+                    (imported, duplicates) => {
+                        format!("已导入 {imported} 本书，跳过 {duplicates} 本重复书籍")
+                    }
+                });
+            }
+            Err(error) => {
+                self.shelf.notice = None;
+                self.shelf.error = Some(format!("导入失败：{error}"));
+            }
+        }
+    }
+
+    fn remove_book(&mut self, id: &str) {
+        match self.shelf.library.remove(id) {
+            Ok(true) => {
+                self.shelf.covers.remove(id);
+                self.shelf.notice = Some("已从本地书架移除".into());
+                self.shelf.error = None;
+            }
+            Ok(false) => self.shelf.error = Some("书籍已不在本地书架中".into()),
+            Err(error) => self.shelf.error = Some(format!("移除失败：{error}")),
+        }
+    }
+}
+
+impl ShelfState {
+    fn new(library: LocalLibrary) -> Self {
+        let mut state = Self {
+            library,
+            covers: HashMap::new(),
+            query: String::new(),
+            notice: None,
+            error: None,
+        };
+        state.refresh_covers();
+        state
+    }
+
+    fn refresh_covers(&mut self) {
+        self.covers = self
+            .library
+            .books()
+            .iter()
+            .filter_map(|book| {
+                book.cover_bytes
+                    .as_deref()
+                    .and_then(|bytes| decode_cover(bytes).ok())
+                    .map(|cover| (book.id.clone(), cover))
+            })
+            .collect();
+    }
 }
 
 struct DesktopReader {
@@ -134,6 +262,7 @@ struct DesktopReader {
     page_scenes: HashMap<PageSceneKey, Arc<Scene>>,
     page_scene_lru: VecDeque<PageSceneKey>,
     error: Option<String>,
+    exit_requested: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -149,21 +278,34 @@ enum ReaderOverlay {
     Settings,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SettingsTab {
+    #[default]
+    Reading,
+    Font,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Motion {
     value: f32,
     start: f32,
     target: f32,
     elapsed: Duration,
+    duration: Duration,
 }
 
 impl Motion {
     const fn settled(value: f32) -> Self {
+        Self::settled_with_duration(value, MOTION_DURATION)
+    }
+
+    const fn settled_with_duration(value: f32, duration: Duration) -> Self {
         Self {
             value,
             start: value,
             target: value,
             elapsed: Duration::ZERO,
+            duration,
         }
     }
 
@@ -182,7 +324,11 @@ impl Motion {
             return;
         }
         self.elapsed = self.elapsed.saturating_add(delta);
-        let progress = (self.elapsed.as_secs_f32() / MOTION_DURATION.as_secs_f32()).min(1.0);
+        let progress = if self.duration.is_zero() {
+            1.0
+        } else {
+            (self.elapsed.as_secs_f32() / self.duration.as_secs_f32()).min(1.0)
+        };
         let eased = 1.0 - (1.0 - progress).powi(3);
         self.value = self.start + (self.target - self.start) * eased;
         if progress >= 1.0 {
@@ -204,20 +350,53 @@ impl Motion {
 struct ReaderUiState {
     sidebar_open: bool,
     sidebar_pinned: bool,
-    toolbar_visible: bool,
+    toolbar_hovered: bool,
+    toolbar_hide_at: Option<Instant>,
     overlay: ReaderOverlay,
+    settings_tab: SettingsTab,
     draft_spread: SpreadMode,
+    draft_font_family: ReaderFontFamily,
+    draft_font_size: f32,
+    toolbar_motion: Motion,
     sidebar_motion: Motion,
     menu_motion: Motion,
     settings_motion: Motion,
     last_motion_tick: Option<Instant>,
+    expanded_toc: HashSet<String>,
+    active_toc_row: Option<String>,
 }
 
 impl ReaderUiState {
     fn is_animating(&self) -> bool {
-        self.sidebar_motion.is_animating()
+        self.toolbar_motion.is_animating()
+            || self.sidebar_motion.is_animating()
             || self.menu_motion.is_animating()
             || self.settings_motion.is_animating()
+    }
+
+    fn needs_motion_tick(&self) -> bool {
+        self.is_animating() || self.toolbar_hide_at.is_some()
+    }
+
+    fn refresh_motion_clock(&mut self, now: Instant) {
+        if self.needs_motion_tick() {
+            self.last_motion_tick.get_or_insert(now);
+        } else {
+            self.last_motion_tick = None;
+        }
+    }
+
+    fn reveal_toolbar(&mut self, now: Instant) {
+        self.toolbar_hide_at = None;
+        self.toolbar_motion.animate_to(1.0);
+        self.refresh_motion_clock(now);
+    }
+
+    fn schedule_toolbar_hide(&mut self, now: Instant) {
+        if self.toolbar_motion.is_visible() || self.toolbar_motion.is_animating() {
+            self.toolbar_hide_at = Some(now + TOOLBAR_HIDE_DELAY);
+        }
+        self.refresh_motion_clock(now);
     }
 
     fn overlay_visible(&self) -> bool {
@@ -227,41 +406,58 @@ impl ReaderUiState {
 
 #[derive(Clone)]
 struct TocRow {
+    id: String,
     label: String,
     target: Option<PublicationUrl>,
     depth: usize,
+    ancestors: Vec<String>,
+    has_children: bool,
 }
 
 impl DesktopReader {
     fn new(mut reader: ReaderSession, cover: Option<ImageData>) -> Self {
         let mut toc_rows = Vec::new();
-        flatten_toc(&reader.book().table_of_contents, 0, &mut toc_rows);
-        let draft_spread = reader.style().spread;
+        flatten_toc(&reader.book().table_of_contents, 0, &[], &mut toc_rows);
+        let draft_style = reader.style();
         let error = reader
             .prefetch_adjacent()
             .err()
             .map(|error| error.to_string());
-        Self {
+        let mut state = Self {
             reader: Mutex::new(reader),
             toc_rows,
             cover,
             ui: ReaderUiState {
                 sidebar_open: true,
                 sidebar_pinned: true,
-                toolbar_visible: false,
+                toolbar_hovered: false,
+                toolbar_hide_at: None,
                 overlay: ReaderOverlay::None,
-                draft_spread,
+                settings_tab: SettingsTab::Reading,
+                draft_spread: draft_style.spread,
+                draft_font_family: draft_style.font_family,
+                draft_font_size: draft_style.font_size,
+                toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
                 sidebar_motion: Motion::settled(1.0),
                 menu_motion: Motion::settled(0.0),
                 settings_motion: Motion::settled(0.0),
                 last_motion_tick: None,
+                expanded_toc: HashSet::new(),
+                active_toc_row: None,
             },
             canvas_size: None,
             scene_revision: 0,
             page_scenes: HashMap::new(),
             page_scene_lru: VecDeque::new(),
             error,
-        }
+            exit_requested: false,
+        };
+        state.expand_active_toc_path();
+        state
+    }
+
+    fn request_exit(&mut self) {
+        self.exit_requested = true;
     }
 
     fn turn_page(&mut self, direction: PageDirection) {
@@ -278,6 +474,7 @@ impl DesktopReader {
                 if section_index != previous_section {
                     self.prefetch();
                 }
+                self.expand_active_toc_path();
             }
             Ok(PageTurn::Boundary { .. }) => self.error = None,
             Err(error) => self.error = Some(format!("翻页失败：{error}")),
@@ -285,14 +482,18 @@ impl DesktopReader {
     }
 
     fn open_settings(&mut self) {
-        let spread = self.reader().style().spread;
-        self.ui.draft_spread = spread;
+        let style = self.reader().style();
+        self.ui.draft_spread = style.spread;
+        self.ui.draft_font_family = style.font_family;
+        self.ui.draft_font_size = style.font_size;
         self.set_overlay(ReaderOverlay::Settings);
     }
 
     fn apply_settings(&mut self) {
         let mut style = self.reader().style();
         style.spread = self.ui.draft_spread;
+        style.font_family = self.ui.draft_font_family;
+        style.font_size = self.ui.draft_font_size;
         let result = self.reader().set_style(style);
         match result {
             Ok(()) => {
@@ -300,17 +501,19 @@ impl DesktopReader {
                 self.invalidate_page_scenes();
                 self.prefetch();
             }
-            Err(error) => self.error = Some(format!("切换布局失败：{error}")),
+            Err(error) => self.error = Some(format!("应用阅读设置失败：{error}")),
         }
     }
 
-    fn go_to(&mut self, target: &PublicationUrl) {
+    fn go_to(&mut self, row_id: &str, target: &PublicationUrl) {
         let result = self.reader().go_to_href(target);
         match result {
             Ok(_) => {
                 self.bump_scene_revision();
                 self.error = None;
                 self.prefetch();
+                self.ui.active_toc_row = Some(row_id.to_owned());
+                self.expand_active_toc_path();
             }
             Err(error) => self.error = Some(format!("目录跳转失败：{error}")),
         }
@@ -346,6 +549,51 @@ impl DesktopReader {
             .err()
             .map(|error| format!("章节预取失败：{error}"));
         self.error = result;
+    }
+
+    fn toggle_toc(&mut self, id: &str) {
+        if !self.ui.expanded_toc.remove(id) {
+            self.ui.expanded_toc.insert(id.to_owned());
+        }
+    }
+
+    fn expand_active_toc_path(&mut self) {
+        let active_row = self.ui.active_toc_row.clone();
+        let path = {
+            let reader = self.reader();
+            let current_section = reader.location().section_index;
+            let matching_active_row = active_row.as_ref().and_then(|active_row| {
+                self.toc_rows.iter().find(|row| {
+                    &row.id == active_row
+                        && row
+                            .target
+                            .as_ref()
+                            .and_then(|target| reader.section_index_for_href(target))
+                            == Some(current_section)
+                })
+            });
+            matching_active_row
+                .or_else(|| {
+                    self.toc_rows.iter().find(|row| {
+                        let target_section = row
+                            .target
+                            .as_ref()
+                            .and_then(|target| reader.section_index_for_href(target));
+                        target_section == Some(current_section)
+                    })
+                })
+                .map(|row| {
+                    let mut path = row.ancestors.clone();
+                    if row.has_children {
+                        path.push(row.id.clone());
+                    }
+                    (row.id.clone(), path)
+                })
+        };
+        if let Some((row_id, path)) = path {
+            self.ui.active_toc_row = Some(row_id);
+            self.ui.expanded_toc.extend(path);
+        }
     }
 
     fn page_scene(&mut self) -> Arc<Scene> {
@@ -424,6 +672,16 @@ impl DesktopReader {
         }
     }
 
+    fn set_toolbar_hovered(&mut self, hovered: bool) {
+        let now = Instant::now();
+        self.ui.toolbar_hovered = hovered;
+        if hovered {
+            self.ui.reveal_toolbar(now);
+        } else if self.ui.overlay != ReaderOverlay::Menu {
+            self.ui.schedule_toolbar_hide(now);
+        }
+    }
+
     fn toggle_menu(&mut self) {
         if self.ui.overlay == ReaderOverlay::Menu {
             self.close_overlay();
@@ -437,6 +695,7 @@ impl DesktopReader {
     }
 
     fn set_overlay(&mut self, overlay: ReaderOverlay) {
+        let was_menu_open = self.ui.overlay == ReaderOverlay::Menu;
         self.ui.overlay = overlay;
         let menu_changed = self
             .ui
@@ -454,8 +713,14 @@ impl DesktopReader {
                 } else {
                     0.0
                 });
+        let now = Instant::now();
+        if overlay == ReaderOverlay::Menu {
+            self.ui.reveal_toolbar(now);
+        } else if was_menu_open && !self.ui.toolbar_hovered {
+            self.ui.schedule_toolbar_hide(now);
+        }
         if menu_changed || settings_changed {
-            self.ui.last_motion_tick = Some(Instant::now());
+            self.ui.last_motion_tick = Some(now);
         }
     }
 
@@ -466,6 +731,17 @@ impl DesktopReader {
             .replace(now)
             .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
         let sidebar_was_animating = self.ui.sidebar_motion.is_animating();
+        if self
+            .ui
+            .toolbar_hide_at
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.ui.toolbar_hide_at = None;
+            if !self.ui.toolbar_hovered && self.ui.overlay != ReaderOverlay::Menu {
+                self.ui.toolbar_motion.animate_to(0.0);
+            }
+        }
+        self.ui.toolbar_motion.advance(delta);
         self.ui.sidebar_motion.advance(delta);
         self.ui.menu_motion.advance(delta);
         self.ui.settings_motion.advance(delta);
@@ -475,10 +751,441 @@ impl DesktopReader {
             // final canvas draw so the EPUB is reflowed only once at the settled width.
             self.bump_scene_revision();
         }
-        if !self.ui.is_animating() {
+        if !self.ui.needs_motion_tick() {
             self.ui.last_motion_tick = None;
         }
     }
+}
+
+fn root_view(state: &mut DesktopApp) -> Box<AnyWidgetView<DesktopApp>> {
+    if state
+        .reader
+        .as_ref()
+        .is_some_and(|reader| reader.exit_requested)
+    {
+        state.reader = None;
+    }
+
+    if let Some(reader) = state.reader.as_mut() {
+        let reader_view = app_view(reader);
+        map_state(reader_view, |state: &mut DesktopApp| {
+            state.reader.as_mut().expect("reader exists")
+        })
+        .boxed()
+    } else {
+        shelf_view(state).boxed()
+    }
+}
+
+fn shelf_view(state: &mut DesktopApp) -> impl WidgetView<DesktopApp> + use<> {
+    let query = state.shelf.query.trim().to_lowercase();
+    let books = state
+        .shelf
+        .library
+        .books()
+        .iter()
+        .filter(|book| book_matches_query(book, &query))
+        .cloned()
+        .collect::<Vec<_>>();
+    let book_count = state.shelf.library.books().len();
+    let notice = state.shelf.notice.clone().map(|message| {
+        sized_box(label(message).text_size(13.0).color(UI_ACCENT))
+            .expand_width()
+            .background_color(UI_ACCENT_SOFT)
+            .border(UI_ACCENT_BORDER, 1.0)
+            .corner_radius(10.0)
+            .padding(Padding::from_vh(10.0, 14.0))
+    });
+    let error = state.shelf.error.clone().map(|message| {
+        sized_box(
+            label(message)
+                .text_size(13.0)
+                .color(Color::from_rgb8(0xb4, 0x23, 0x18)),
+        )
+        .expand_width()
+        .background_color(Color::from_rgb8(0xfe, 0xf3, 0xf2))
+        .border(Color::from_rgb8(0xfe, 0xcd, 0xca), 1.0)
+        .corner_radius(10.0)
+        .padding(Padding::from_vh(10.0, 14.0))
+    });
+    let content: Box<AnyWidgetView<DesktopApp>> = if books.is_empty() && !query.is_empty() {
+        sized_box(
+            flex_col((
+                FlexSpacer::Fixed(96.px()),
+                icon_label_for_app(Icon::Search, 30.0, UI_MUTED),
+                label("没有匹配的书籍").text_size(14.0).color(UI_MUTED),
+            ))
+            .gap(14.px())
+            .cross_axis_alignment(CrossAxisAlignment::Center),
+        )
+        .expand_width()
+        .boxed()
+    } else {
+        shelf_grid(state, books, query.is_empty()).boxed()
+    };
+
+    sized_box(
+        flex_col((
+            shelf_toolbar(state.shelf.query.clone(), book_count),
+            divider_for_app(),
+            portal(
+                flex_col((notice, error, content))
+                    .gap(12.px())
+                    .cross_axis_alignment(CrossAxisAlignment::Fill)
+                    .padding(Padding::from_vh(24.0, 28.0)),
+            )
+            .flex(1.0),
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Fill),
+    )
+    .expand()
+    .background_color(UI_BACKGROUND)
+}
+
+fn shelf_toolbar(query: String, book_count: usize) -> impl WidgetView<DesktopApp> {
+    let search = sized_box(
+        flex_row((
+            icon_label_for_app(Icon::Search, 16.0, UI_MUTED),
+            text_input(query, |state: &mut DesktopApp, value| {
+                state.shelf.query = value;
+            })
+            .placeholder(format!("搜索 {book_count} 本书"))
+            .text_color(UI_TEXT)
+            .background_color(Color::TRANSPARENT)
+            .border_color(Color::TRANSPARENT)
+            .border_width(0.0)
+            .corner_radius(0.0)
+            .padding(0.0)
+            .flex(1.0),
+        ))
+        .gap(8.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(40.px())
+    .background_color(UI_SURFACE)
+    .border(UI_BORDER, 1.0)
+    .corner_radius(9.0)
+    .padding(Padding::horizontal(12.0))
+    .flex(1.0);
+
+    sized_box(
+        flex_row((
+            search,
+            sized_box(label(""))
+                .width(1.px())
+                .height(24.px())
+                .background_color(UI_BORDER),
+            shelf_icon_button(Icon::Plus, import_with_dialog),
+        ))
+        .gap(12.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(64.px())
+    .expand_width()
+    .background_color(UI_SURFACE)
+    .padding(Padding::horizontal(20.0))
+}
+
+fn shelf_grid(
+    state: &DesktopApp,
+    books: Vec<LibraryBook>,
+    include_import: bool,
+) -> impl WidgetView<DesktopApp> + use<> {
+    let mut cards = books
+        .into_iter()
+        .map(|book| {
+            let cover = state.shelf.covers.get(&book.id).cloned();
+            shelf_book_card(&book, cover).boxed()
+        })
+        .collect::<Vec<Box<AnyWidgetView<DesktopApp>>>>();
+    if include_import {
+        cards.push(import_card().boxed());
+    }
+
+    let mut rows = Vec::new();
+    let mut cards = cards.into_iter();
+    loop {
+        let mut row = cards.by_ref().take(SHELF_COLUMNS).collect::<Vec<_>>();
+        if row.is_empty() {
+            break;
+        }
+        while row.len() < SHELF_COLUMNS {
+            row.push(
+                sized_box(label(""))
+                    .width(SHELF_CARD_WIDTH.px())
+                    .height(1.px())
+                    .boxed(),
+            );
+        }
+        rows.push(
+            flex_row(row)
+                .gap(24.px())
+                .cross_axis_alignment(CrossAxisAlignment::Start),
+        );
+    }
+
+    flex_col(rows)
+        .gap(28.px())
+        .cross_axis_alignment(CrossAxisAlignment::Start)
+}
+
+fn shelf_book_card(book: &LibraryBook, cover: Option<ImageData>) -> impl WidgetView<DesktopApp> {
+    let open_path = book.path.clone();
+    let open_path_from_title = book.path.clone();
+    let title = ellipsize_shelf_title(&book.title);
+    let available = book.path.exists();
+    let cover_button = sized_box(
+        button(
+            shelf_cover_content(book, cover),
+            move |state: &mut DesktopApp| {
+                state.open_book(&open_path);
+            },
+        )
+        .background_color(cover_color(&book.id))
+        .active_background_color(UI_TEXT_SOFT)
+        .border_color(UI_BORDER)
+        .hovered_border_color(UI_ACCENT_BORDER)
+        .border_width(1.0)
+        .corner_radius(4.0)
+        .padding(0.0),
+    )
+    .width(SHELF_CARD_WIDTH.px())
+    .height(SHELF_COVER_HEIGHT.px());
+
+    sized_box(
+        flex_col((
+            zstack((
+                cover_button,
+                shelf_remove_button(book.id.clone(), book.title.clone())
+                    .alignment(UnitPoint::TOP_RIGHT),
+            )),
+            sized_box(
+                button(
+                    label(title)
+                        .text_size(13.5)
+                        .weight(FontWeight::BOLD)
+                        .line_break_mode(LineBreaking::Clip)
+                        .color(UI_TEXT),
+                    move |state: &mut DesktopApp| state.open_book(&open_path_from_title),
+                )
+                .background_color(Color::TRANSPARENT)
+                .active_background_color(Color::TRANSPARENT)
+                .border_color(Color::TRANSPARENT)
+                .hovered_border_color(Color::TRANSPARENT)
+                .border_width(0.0)
+                .padding(0.0),
+            )
+            .height(24.px())
+            .expand_width(),
+            shelf_book_status(available),
+        ))
+        .gap(7.px())
+        .cross_axis_alignment(CrossAxisAlignment::Fill),
+    )
+    .width(SHELF_CARD_WIDTH.px())
+}
+
+fn shelf_cover_content(
+    book: &LibraryBook,
+    cover: Option<ImageData>,
+) -> Box<AnyWidgetView<DesktopApp>> {
+    if let Some(cover) = cover {
+        return image(cover).fit(ObjectFit::Contain).boxed();
+    }
+    let author = if book.authors.is_empty() {
+        "未知作者".to_owned()
+    } else {
+        book.authors.join(" / ")
+    };
+    flex_col((
+        icon_label_for_app(Icon::BookOpen, 20.0, Color::from_rgba8(255, 255, 255, 150)),
+        FlexSpacer::Flex(1.0),
+        prose(book.title.clone())
+            .text_size(17.0)
+            .weight(FontWeight::BOLD)
+            .text_color(Color::WHITE),
+        label(author)
+            .text_size(11.0)
+            .color(Color::from_rgba8(255, 255, 255, 180)),
+    ))
+    .gap(8.px())
+    .cross_axis_alignment(CrossAxisAlignment::Start)
+    .padding(18.0)
+    .boxed()
+}
+
+fn shelf_remove_button(id: String, title: String) -> impl WidgetView<DesktopApp> {
+    sized_box(
+        button(
+            icon_label_for_app(Icon::Trash2, 14.0, Color::WHITE),
+            move |state: &mut DesktopApp| {
+                let confirmed = rfd::MessageDialog::new()
+                    .set_title("从书架移除")
+                    .set_description(format!(
+                        "确定要移除《{title}》吗？本地书架中的副本将被删除。"
+                    ))
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show();
+                if confirmed == rfd::MessageDialogResult::Yes {
+                    state.remove_book(&id);
+                }
+            },
+        )
+        .background_color(Color::from_rgba8(31, 45, 61, 205))
+        .active_background_color(Color::from_rgb8(0xb4, 0x23, 0x18))
+        .border_color(Color::TRANSPARENT)
+        .hovered_border_color(Color::from_rgb8(0xfe, 0xcd, 0xca))
+        .corner_radius(15.0)
+        .padding(0.0),
+    )
+    .width(30.px())
+    .height(30.px())
+    .transform(Affine::translate((-8.0, 8.0)))
+}
+
+fn shelf_book_status(available: bool) -> impl WidgetView<DesktopApp> {
+    let (icon, text, color) = if available {
+        (Icon::HardDrive, "本地", UI_MUTED)
+    } else {
+        (
+            Icon::AlertTriangle,
+            "文件缺失",
+            Color::from_rgb8(0xb4, 0x23, 0x18),
+        )
+    };
+    flex_row((
+        icon_label_for_app(icon, 12.0, color),
+        label(text).text_size(11.5).color(color),
+        FlexSpacer::Flex(1.0),
+        label("EPUB").text_size(11.5).color(UI_MUTED),
+    ))
+    .gap(5.px())
+    .cross_axis_alignment(CrossAxisAlignment::Center)
+}
+
+fn import_card() -> impl WidgetView<DesktopApp> {
+    sized_box(
+        flex_col((
+            sized_box(
+                button(
+                    icon_label_for_app(Icon::Plus, 46.0, UI_MUTED),
+                    import_with_dialog,
+                )
+                .background_color(UI_SURFACE_MUTED)
+                .active_background_color(UI_ACCENT_SOFT)
+                .border_color(UI_BORDER)
+                .hovered_border_color(UI_ACCENT_BORDER)
+                .corner_radius(4.0)
+                .padding(0.0),
+            )
+            .width(SHELF_CARD_WIDTH.px())
+            .height(SHELF_COVER_HEIGHT.px()),
+            label("导入本地书籍")
+                .text_size(13.5)
+                .weight(FontWeight::BOLD)
+                .color(UI_MUTED),
+            label("保存在此设备").text_size(11.5).color(UI_MUTED),
+        ))
+        .gap(7.px())
+        .cross_axis_alignment(CrossAxisAlignment::Start),
+    )
+    .width(SHELF_CARD_WIDTH.px())
+}
+
+fn shelf_icon_button(
+    icon: Icon,
+    callback: impl Fn(&mut DesktopApp) + Send + Sync + 'static,
+) -> impl WidgetView<DesktopApp> {
+    sized_box(
+        button(icon_label_for_app(icon, 17.0, UI_TEXT_SOFT), callback)
+            .background_color(UI_SURFACE)
+            .active_background_color(UI_SURFACE_MUTED)
+            .border_color(Color::TRANSPARENT)
+            .hovered_border_color(UI_BORDER)
+            .corner_radius(8.0)
+            .padding(0.0),
+    )
+    .width(36.px())
+    .height(36.px())
+}
+
+fn icon_label_for_app(icon: Icon, size: f32, color: Color) -> impl WidgetView<DesktopApp> {
+    label(char::from(icon).to_string())
+        .font("lucide")
+        .text_size(size)
+        .color(color)
+}
+
+fn divider_for_app() -> impl WidgetView<DesktopApp> {
+    sized_box(label(""))
+        .height(1.px())
+        .expand_width()
+        .background_color(UI_BORDER)
+}
+
+fn import_with_dialog(state: &mut DesktopApp) {
+    let Some(paths) = rfd::FileDialog::new()
+        .add_filter("EPUB 电子书", &["epub"])
+        .set_title("导入本地书籍")
+        .pick_files()
+    else {
+        return;
+    };
+    state.import_books(&paths);
+}
+
+fn book_matches_query(book: &LibraryBook, query: &str) -> bool {
+    query.is_empty()
+        || book.title.to_lowercase().contains(query)
+        || book.file_name.to_lowercase().contains(query)
+        || book
+            .authors
+            .iter()
+            .any(|author| author.to_lowercase().contains(query))
+}
+
+fn ellipsize_shelf_title(title: &str) -> String {
+    ellipsize_display_text(title, SHELF_TITLE_MAX_DISPLAY_UNITS)
+}
+
+fn ellipsize_display_text(text: &str, max_units: usize) -> String {
+    let display_units = text.chars().map(shelf_title_character_units).sum::<usize>();
+    if display_units <= max_units {
+        return text.to_owned();
+    }
+
+    let mut used_units = 0;
+    let mut end = 0;
+    for (index, character) in text.char_indices() {
+        let character_units = shelf_title_character_units(character);
+        if used_units + character_units > max_units.saturating_sub(2) {
+            break;
+        }
+        used_units += character_units;
+        end = index + character.len_utf8();
+    }
+    format!("{}…", &text[..end])
+}
+
+fn shelf_title_character_units(character: char) -> usize {
+    if character.is_ascii() { 1 } else { 2 }
+}
+
+fn cover_color(id: &str) -> Color {
+    const PALETTES: [Color; 6] = [
+        Color::from_rgb8(0x20, 0x63, 0x9b),
+        Color::from_rgb8(0x9b, 0x4b, 0x5f),
+        Color::from_rgb8(0x4f, 0x77, 0x5a),
+        Color::from_rgb8(0x8a, 0x69, 0x43),
+        Color::from_rgb8(0x75, 0x67, 0xa8),
+        Color::from_rgb8(0x5c, 0x7c, 0x81),
+    ];
+    let index = id
+        .bytes()
+        .fold(0_usize, |sum, byte| sum + usize::from(byte))
+        % PALETTES.len();
+    PALETTES[index]
 }
 
 fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
@@ -524,7 +1231,7 @@ fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopReader> + use<>
     } else {
         sized_box(label("")).width(0.px()).height(0.px()).boxed()
     };
-    let animations_running = state.ui.is_animating();
+    let animations_running = state.ui.needs_motion_tick();
     let app = sized_box(zstack((workspace, settings_layer)))
         .expand()
         .background_color(UI_BACKGROUND);
@@ -563,7 +1270,12 @@ fn reader_workspace(
     let menu_open = state.ui.overlay == ReaderOverlay::Menu;
     let menu_progress = state.ui.menu_motion.value.clamp(0.0, 1.0);
     let menu_visible = state.ui.menu_motion.is_visible();
-    let toolbar_visible = state.ui.toolbar_visible || menu_visible;
+    let toolbar_progress = if menu_visible {
+        1.0
+    } else {
+        state.ui.toolbar_motion.value.clamp(0.0, 1.0)
+    };
+    let toolbar_visible = toolbar_progress > MOTION_EPSILON || menu_visible;
     let toolbar_content: Box<AnyWidgetView<DesktopReader>> = if toolbar_visible {
         sized_box(reader_toolbar(
             title,
@@ -577,7 +1289,12 @@ fn reader_workspace(
     } else {
         sized_box(label("")).width(0.px()).height(0.px()).boxed()
     };
-    let toolbar_layer = toolbar_content.alignment(UnitPoint::TOP);
+    let toolbar_layer = toolbar_content
+        .transform(Affine::translate((
+            0.0,
+            -TOOLBAR_HEIGHT * f64::from(1.0 - toolbar_progress),
+        )))
+        .alignment(UnitPoint::TOP);
     let menu_scrim: Box<AnyWidgetView<DesktopReader>> = if menu_visible {
         transparent_catcher(DesktopReader::close_overlay).boxed()
     } else {
@@ -617,7 +1334,7 @@ fn reader_view(scene_revision: u64, reader_background: Color) -> impl WidgetView
         },
         |state: &mut DesktopReader, action| match action {
             ReaderCanvasAction::ToolbarVisibility(visible) => {
-                state.ui.toolbar_visible = visible;
+                state.set_toolbar_hovered(visible);
             }
             ReaderCanvasAction::PreviousPage if !state.ui.overlay_visible() => {
                 state.turn_page(PageDirection::Previous);
@@ -635,11 +1352,21 @@ fn reader_view(scene_revision: u64, reader_background: Color) -> impl WidgetView
 fn toc_view(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     let (title, author) = sidebar_book_metadata(state);
     let cover = state.cover.clone();
+    let active_row_id = state.ui.active_toc_row.clone();
     let toc_rows = state
         .toc_rows
         .iter()
+        .filter(|row| {
+            row.ancestors
+                .iter()
+                .all(|ancestor| state.ui.expanded_toc.contains(ancestor))
+        })
         .cloned()
-        .map(|row| toc_row_view(state, row))
+        .map(|row| {
+            let selected = active_row_id.as_ref() == Some(&row.id);
+            let expanded = state.ui.expanded_toc.contains(&row.id);
+            toc_row_view(row, selected, expanded)
+        })
         .collect::<Vec<_>>();
     sized_box(
         flex_col((
@@ -662,7 +1389,7 @@ fn toc_view(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
                     .alignment(UnitPoint::TOP_RIGHT),
             )))
             .background_color(UI_SIDEBAR)
-            .padding(Padding::from_vh(6.0, 8.0))
+            .padding(Padding::from_vh(6.0, 0.0))
             .flex(1.0),
         ))
         .gap(4.px()),
@@ -670,7 +1397,7 @@ fn toc_view(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     .width(TOC_WIDTH.px())
     .expand_height()
     .background_color(UI_SIDEBAR)
-    .padding(Padding::from_vh(6.0, 10.0))
+    .padding(Padding::from_vh(6.0, 4.0))
 }
 
 fn sidebar_toolbar(pinned: bool) -> impl WidgetView<DesktopReader> {
@@ -755,53 +1482,98 @@ fn sidebar_book_cover(cover: Option<ImageData>) -> Box<AnyWidgetView<DesktopRead
     }
 }
 
-fn toc_row_view(state: &DesktopReader, row: TocRow) -> impl WidgetView<DesktopReader> + use<> {
+fn toc_row_view(
+    row: TocRow,
+    selected: bool,
+    expanded: bool,
+) -> impl WidgetView<DesktopReader> + use<> {
     let target = row.target;
-    let reader = state.reader();
-    let selected = target
-        .as_ref()
-        .and_then(|target| reader.section_index_for_href(target))
-        == Some(reader.location().section_index);
-    drop(reader);
-    let row_label = format!("{}{}", "    ".repeat(row.depth), row.label);
+    let row_id = row.id;
+    let disclosure_row_id = row_id.clone();
+    let label_units = 22_usize.saturating_sub(row.depth.saturating_mul(2)).max(10);
+    let row_label = ellipsize_display_text(&row.label, label_units);
     let (background, foreground) = if selected {
         (UI_ACCENT_SOFT, UI_ACCENT)
     } else {
         (UI_SIDEBAR, UI_TEXT_SOFT)
     };
-    sized_box(
-        button(
-            flex_row((
-                label(row_label)
-                    .text_size(13.0)
-                    .weight(if selected {
-                        FontWeight::BOLD
+    let disclosure: Box<AnyWidgetView<DesktopReader>> = if row.has_children {
+        sized_box(
+            button(
+                icon_label(
+                    if expanded {
+                        Icon::ChevronDown
                     } else {
-                        FontWeight::NORMAL
-                    })
-                    .color(foreground),
-                FlexSpacer::Flex(1.0),
-            ))
-            .cross_axis_alignment(CrossAxisAlignment::Center),
-            move |state: &mut DesktopReader| {
-                if let Some(target) = &target {
-                    state.go_to(target);
-                }
-            },
+                        Icon::ChevronRight
+                    },
+                    13.0,
+                    foreground,
+                ),
+                move |state: &mut DesktopReader| state.toggle_toc(&disclosure_row_id),
+            )
+            .background_color(Color::TRANSPARENT)
+            .active_background_color(Color::TRANSPARENT)
+            .border_color(Color::TRANSPARENT)
+            .hovered_border_color(Color::TRANSPARENT)
+            .border_width(0.0)
+            .corner_radius(6.0)
+            .padding(0.0),
         )
-        .background_color(background)
-        .active_background_color(UI_SURFACE_MUTED)
-        .border_color(background)
-        .hovered_border_color(if selected {
+        .width(14.px())
+        .height(30.px())
+        .boxed()
+    } else {
+        sized_box(label("")).width(14.px()).height(30.px()).boxed()
+    };
+    sized_box(
+        flex_row((
+            FlexSpacer::Fixed(
+                (f64::from(u32::try_from(row.depth).unwrap_or(u32::MAX)) * 14.0).px(),
+            ),
+            disclosure,
+            button(
+                flex_row((
+                    label(row_label)
+                        .font(UI_FONT_STACK)
+                        .text_size(13.0)
+                        .weight(if selected {
+                            FontWeight::BOLD
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .line_break_mode(LineBreaking::Clip)
+                        .color(foreground),
+                    FlexSpacer::Flex(1.0),
+                ))
+                .cross_axis_alignment(CrossAxisAlignment::Center),
+                move |state: &mut DesktopReader| {
+                    if let Some(target) = &target {
+                        state.go_to(&row_id, target);
+                    }
+                },
+            )
+            .background_color(Color::TRANSPARENT)
+            .active_background_color(Color::TRANSPARENT)
+            .border_color(Color::TRANSPARENT)
+            .hovered_border_color(Color::TRANSPARENT)
+            .border_width(0.0)
+            .padding(0.0)
+            .flex(1.0),
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(38.px())
+    .expand_width()
+    .background_color(background)
+    .border(
+        if selected {
             UI_ACCENT_BORDER
         } else {
-            UI_BORDER
-        })
-        .corner_radius(10.0)
-        .padding(Padding::from_vh(8.0, 12.0)),
+            background
+        },
+        1.0,
     )
-    .height(40.px())
-    .expand_width()
+    .corner_radius(9.0)
 }
 
 fn reader_toolbar(
@@ -819,6 +1591,7 @@ fn reader_toolbar(
         .boxed()
     };
     flex_row((
+        icon_button(Icon::ArrowLeft, false, DesktopReader::request_exit),
         left,
         FlexSpacer::Flex(1.0),
         label(title)
@@ -869,11 +1642,11 @@ fn icon_label(icon: Icon, size: f32, color: Color) -> impl WidgetView<DesktopRea
 }
 
 fn reader_menu() -> impl WidgetView<DesktopReader> {
-    sized_box(menu_row(
-        Icon::Settings,
-        "设置",
-        DesktopReader::open_settings,
-    ))
+    sized_box(flex_col((
+        menu_row(Icon::Library, "返回书架", DesktopReader::request_exit),
+        divider(),
+        menu_row(Icon::Settings, "设置", DesktopReader::open_settings),
+    )))
     .width(180.px())
     .background_color(UI_SURFACE)
     .border(UI_BORDER, 1.0)
@@ -959,55 +1732,204 @@ fn settings_dialog(state: &DesktopReader) -> impl WidgetView<DesktopReader> + us
 
 fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     let spread = state.ui.draft_spread;
-    flex_col((
-        flex_row((
+    let font_family = state.ui.draft_font_family;
+    let font_size = state.ui.draft_font_size;
+    let tab = state.ui.settings_tab;
+    let title = match tab {
+        SettingsTab::Reading => "阅读",
+        SettingsTab::Font => "字体",
+    };
+    let body: Box<AnyWidgetView<DesktopReader>> = match tab {
+        SettingsTab::Reading => reading_settings_content(spread).boxed(),
+        SettingsTab::Font => font_settings_content(font_family, font_size).boxed(),
+    };
+
+    flex_row((
+        sized_box(
+            flex_col((
+                flex_row((
+                    icon_label(Icon::Settings, 17.0, UI_MUTED),
+                    label("设置")
+                        .font(UI_FONT_STACK)
+                        .text_size(15.0)
+                        .weight(FontWeight::BOLD)
+                        .color(UI_TEXT),
+                ))
+                .gap(9.px())
+                .cross_axis_alignment(CrossAxisAlignment::Center)
+                .padding(Padding::from_vh(12.0, 10.0)),
+                settings_tab_button("阅读", SettingsTab::Reading, tab),
+                settings_tab_button("字体", SettingsTab::Font, tab),
+                FlexSpacer::Flex(1.0),
+            ))
+            .gap(4.px())
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .padding(10.0),
+        )
+        .width(146.px())
+        .expand_height()
+        .background_color(UI_SURFACE_MUTED),
+        flex_col((
             flex_row((
-                icon_label(Icon::Settings, 18.0, UI_MUTED),
-                label("设置")
+                label(title)
+                    .font(UI_FONT_STACK)
                     .text_size(16.0)
                     .weight(FontWeight::BOLD)
                     .color(UI_TEXT),
-            ))
-            .gap(10.px())
-            .cross_axis_alignment(CrossAxisAlignment::Center),
-            FlexSpacer::Flex(1.0),
-            icon_button(Icon::X, false, DesktopReader::close_overlay),
-        ))
-        .cross_axis_alignment(CrossAxisAlignment::Center)
-        .padding(Padding::from_vh(10.0, 16.0)),
-        divider(),
-        flex_col((
-            label("排版")
-                .text_size(12.0)
-                .weight(FontWeight::BOLD)
-                .color(UI_MUTED),
-            sized_box(flex_col((
-                settings_value_row("阅读模式", "分页"),
-                divider(),
-                spread_settings_row(spread),
-            )))
-            .background_color(UI_SURFACE)
-            .border(UI_BORDER, 1.0)
-            .corner_radius(12.0),
-        ))
-        .gap(10.px())
-        .cross_axis_alignment(CrossAxisAlignment::Fill)
-        .padding(Padding::from_vh(18.0, 20.0))
-        .flex(1.0),
-        divider(),
-        sized_box(
-            flex_row((
                 FlexSpacer::Flex(1.0),
-                secondary_action_button("取消", DesktopReader::close_overlay),
-                primary_action_button("应用", DesktopReader::apply_settings),
+                icon_button(Icon::X, false, DesktopReader::close_overlay),
             ))
-            .gap(8.px())
-            .cross_axis_alignment(CrossAxisAlignment::Center),
-        )
-        .height(56.px())
-        .expand_width()
-        .padding(Padding::horizontal(16.0)),
+            .cross_axis_alignment(CrossAxisAlignment::Center)
+            .padding(Padding::from_vh(10.0, 16.0)),
+            divider(),
+            body.flex(1.0),
+            divider(),
+            sized_box(
+                flex_row((
+                    FlexSpacer::Flex(1.0),
+                    secondary_action_button("取消", DesktopReader::close_overlay),
+                    primary_action_button("应用", DesktopReader::apply_settings),
+                ))
+                .gap(8.px())
+                .cross_axis_alignment(CrossAxisAlignment::Center),
+            )
+            .height(56.px())
+            .expand_width()
+            .padding(Padding::horizontal(16.0)),
+        ))
+        .flex(1.0),
     ))
+}
+
+fn settings_tab_button(
+    text: &'static str,
+    value: SettingsTab,
+    selected: SettingsTab,
+) -> impl WidgetView<DesktopReader> {
+    let active = value == selected;
+    sized_box(
+        button(
+            flex_row((
+                label(text)
+                    .font(UI_FONT_STACK)
+                    .text_size(13.0)
+                    .weight(if active {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .color(if active { UI_TEXT } else { UI_TEXT_SOFT }),
+                FlexSpacer::Flex(1.0),
+            )),
+            move |state: &mut DesktopReader| state.ui.settings_tab = value,
+        )
+        .background_color(if active {
+            UI_SURFACE
+        } else {
+            Color::TRANSPARENT
+        })
+        .active_background_color(UI_ACCENT_SOFT)
+        .border_color(if active {
+            UI_BORDER
+        } else {
+            Color::TRANSPARENT
+        })
+        .hovered_border_color(UI_BORDER)
+        .corner_radius(8.0)
+        .padding(Padding::horizontal(12.0)),
+    )
+    .height(38.px())
+    .expand_width()
+}
+
+fn reading_settings_content(spread: SpreadMode) -> impl WidgetView<DesktopReader> {
+    flex_col((
+        label("页面布局")
+            .font(UI_FONT_STACK)
+            .text_size(12.0)
+            .weight(FontWeight::BOLD)
+            .color(UI_MUTED),
+        sized_box(flex_col((
+            settings_value_row("阅读模式", "分页"),
+            divider(),
+            spread_settings_row(spread),
+        )))
+        .background_color(UI_SURFACE)
+        .border(UI_BORDER, 1.0)
+        .corner_radius(12.0),
+    ))
+    .gap(10.px())
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+    .padding(Padding::from_vh(18.0, 20.0))
+}
+
+fn font_settings_content(
+    font_family: ReaderFontFamily,
+    font_size: f32,
+) -> impl WidgetView<DesktopReader> {
+    flex_col((
+        label("字体类型")
+            .font(UI_FONT_STACK)
+            .text_size(12.0)
+            .weight(FontWeight::BOLD)
+            .color(UI_MUTED),
+        sized_box(
+            flex_col((
+                flex_row((
+                    font_choice("衬线", ReaderFontFamily::Serif, font_family),
+                    font_choice("无衬线", ReaderFontFamily::SansSerif, font_family),
+                    font_choice("等宽", ReaderFontFamily::Monospace, font_family),
+                ))
+                .gap(8.px()),
+                flex_row((
+                    font_choice("微软雅黑", ReaderFontFamily::MicrosoftYaHei, font_family),
+                    font_choice("宋体", ReaderFontFamily::SimSun, font_family),
+                    font_choice("楷体", ReaderFontFamily::KaiTi, font_family),
+                ))
+                .gap(8.px()),
+            ))
+            .gap(8.px()),
+        )
+        .background_color(UI_SURFACE)
+        .border(UI_BORDER, 1.0)
+        .corner_radius(12.0)
+        .padding(12.0),
+        flex_row((
+            label("字号")
+                .font(UI_FONT_STACK)
+                .text_size(13.0)
+                .color(UI_TEXT_SOFT),
+            FlexSpacer::Flex(1.0),
+            font_size_choice(14.0, font_size),
+            font_size_choice(16.0, font_size),
+            font_size_choice(18.0, font_size),
+            font_size_choice(20.0, font_size),
+            font_size_choice(22.0, font_size),
+        ))
+        .gap(6.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+        sized_box(
+            flex_col((
+                label("字体预览")
+                    .font(UI_FONT_STACK)
+                    .text_size(11.0)
+                    .color(UI_MUTED),
+                label("阅读让思想抵达更远的地方  Reading 0123")
+                    .font(font_family.css_stack())
+                    .text_size(font_size.min(20.0))
+                    .color(UI_TEXT),
+            ))
+            .gap(6.px())
+            .cross_axis_alignment(CrossAxisAlignment::Start),
+        )
+        .background_color(UI_SURFACE_MUTED)
+        .border(UI_BORDER, 1.0)
+        .corner_radius(12.0)
+        .padding(Padding::from_vh(12.0, 14.0)),
+    ))
+    .gap(10.px())
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+    .padding(Padding::from_vh(14.0, 20.0))
 }
 
 fn settings_value_row(name: &'static str, value: &'static str) -> impl WidgetView<DesktopReader> {
@@ -1022,6 +1944,63 @@ fn settings_value_row(name: &'static str, value: &'static str) -> impl WidgetVie
     .height(64.px())
     .expand_width()
     .padding(Padding::horizontal(16.0))
+}
+
+fn font_choice(
+    text: &'static str,
+    value: ReaderFontFamily,
+    selected: ReaderFontFamily,
+) -> impl WidgetView<DesktopReader> {
+    let active = value == selected;
+    sized_box(
+        button(
+            label(text)
+                .font(UI_FONT_STACK)
+                .text_size(12.0)
+                .weight(if active {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
+            move |state: &mut DesktopReader| state.ui.draft_font_family = value,
+        )
+        .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
+        .active_background_color(UI_ACCENT_SOFT)
+        .border_color(if active { UI_ACCENT_BORDER } else { UI_BORDER })
+        .hovered_border_color(UI_ACCENT_BORDER)
+        .corner_radius(8.0)
+        .padding(Padding::from_vh(6.0, 8.0)),
+    )
+    .width(104.px())
+    .height(34.px())
+}
+
+fn font_size_choice(value: f32, selected: f32) -> impl WidgetView<DesktopReader> {
+    let active = (value - selected).abs() < f32::EPSILON;
+    let text = format!("{value:.0}");
+    sized_box(
+        button(
+            label(text)
+                .font(UI_FONT_STACK)
+                .text_size(12.0)
+                .weight(if active {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
+            move |state: &mut DesktopReader| state.ui.draft_font_size = value,
+        )
+        .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
+        .active_background_color(UI_ACCENT_SOFT)
+        .border_color(if active { UI_ACCENT_BORDER } else { UI_BORDER })
+        .hovered_border_color(UI_ACCENT_BORDER)
+        .corner_radius(8.0)
+        .padding(0.0),
+    )
+    .width(42.px())
+    .height(32.px())
 }
 
 fn spread_settings_row(spread: SpreadMode) -> impl WidgetView<DesktopReader> {
@@ -1166,14 +2145,24 @@ fn ui_color(color: Rgba) -> Color {
     Color::from_rgba8(color.red, color.green, color.blue, color.alpha)
 }
 
-fn flatten_toc(entries: &[TocEntry], depth: usize, rows: &mut Vec<TocRow>) {
-    for entry in entries {
+fn flatten_toc(entries: &[TocEntry], depth: usize, ancestors: &[String], rows: &mut Vec<TocRow>) {
+    for (index, entry) in entries.iter().enumerate() {
+        let id = if let Some(parent) = ancestors.last() {
+            format!("{parent}/{index}")
+        } else {
+            index.to_string()
+        };
         rows.push(TocRow {
+            id: id.clone(),
             label: entry.label.clone(),
             target: entry.href.clone(),
             depth,
+            ancestors: ancestors.to_vec(),
+            has_children: !entry.children.is_empty(),
         });
-        flatten_toc(&entry.children, depth + 1, rows);
+        let mut child_ancestors = ancestors.to_vec();
+        child_ancestors.push(id);
+        flatten_toc(&entry.children, depth + 1, &child_ancestors, rows);
     }
 }
 
@@ -1259,7 +2248,7 @@ fn diagnose_reader(
 }
 
 fn usage(executable: &str) -> String {
-    format!("usage: {executable} [--diagnose] <book.epub>")
+    format!("usage: {executable} [book.epub] | {executable} --diagnose <book.epub>")
 }
 
 fn decode_cover(bytes: &[u8]) -> Result<ImageData, ::image::ImageError> {
@@ -1313,13 +2302,16 @@ mod tests {
         ];
 
         let mut rows = Vec::new();
-        flatten_toc(&entries, 0, &mut rows);
+        flatten_toc(&entries, 0, &[], &mut rows);
 
         assert_eq!(rows.len(), 3);
         assert_eq!((rows[0].label.as_str(), rows[0].depth), ("第一章", 0));
         assert_eq!(rows[0].target.as_ref(), Some(&first_target));
+        assert!(rows[0].has_children);
+        assert!(rows[0].ancestors.is_empty());
         assert_eq!((rows[1].label.as_str(), rows[1].depth), ("第一节", 1));
         assert_eq!(rows[1].target.as_ref(), Some(&child_target));
+        assert_eq!(rows[1].ancestors, ["0"]);
         assert_eq!((rows[2].label.as_str(), rows[2].depth), ("第二章", 0));
         assert!(rows[2].target.is_none());
     }
@@ -1360,5 +2352,68 @@ mod tests {
         motion.advance(MOTION_DURATION);
         assert!(motion.value.abs() <= f32::EPSILON);
         assert!(!motion.is_visible());
+    }
+
+    #[test]
+    fn toolbar_hide_delay_is_cancelled_when_pointer_returns() {
+        let now = Instant::now();
+        let mut ui = ReaderUiState {
+            sidebar_open: false,
+            sidebar_pinned: false,
+            toolbar_hovered: false,
+            toolbar_hide_at: None,
+            overlay: ReaderOverlay::None,
+            settings_tab: SettingsTab::Reading,
+            draft_spread: SpreadMode::Single,
+            draft_font_family: ReaderFontFamily::Serif,
+            draft_font_size: 16.0,
+            toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
+            sidebar_motion: Motion::settled(0.0),
+            menu_motion: Motion::settled(0.0),
+            settings_motion: Motion::settled(0.0),
+            last_motion_tick: None,
+            expanded_toc: HashSet::new(),
+            active_toc_row: None,
+        };
+
+        ui.reveal_toolbar(now);
+        ui.toolbar_motion.advance(TOOLBAR_MOTION_DURATION);
+        ui.schedule_toolbar_hide(now);
+        assert_eq!(ui.toolbar_hide_at, Some(now + TOOLBAR_HIDE_DELAY));
+
+        ui.reveal_toolbar(now + TOOLBAR_HIDE_DELAY / 2);
+        assert!(ui.toolbar_hide_at.is_none());
+        assert!((ui.toolbar_motion.target - 1.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn shelf_search_matches_title_author_and_source_file() {
+        let book = LibraryBook {
+            id: "book-id".into(),
+            title: "系统之美".into(),
+            authors: vec!["Donella Meadows".into()],
+            file_name: "thinking-in-systems.epub".into(),
+            path: PathBuf::from("book.epub"),
+            cover_bytes: None,
+            added_at: 0,
+        };
+
+        assert!(book_matches_query(&book, "系统"));
+        assert!(book_matches_query(&book, "meadows"));
+        assert!(book_matches_query(&book, "thinking-in"));
+        assert!(!book_matches_query(&book, "不存在"));
+    }
+
+    #[test]
+    fn shelf_titles_are_ellipsized_by_approximate_display_width() {
+        assert_eq!(ellipsize_shelf_title("短书名"), "短书名");
+        assert_eq!(
+            ellipsize_shelf_title("这是一本书名非常非常长的电子书"),
+            "这是一本书名非常…"
+        );
+        assert_eq!(
+            ellipsize_shelf_title("A very long English book title"),
+            "A very long Engl…"
+        );
     }
 }
