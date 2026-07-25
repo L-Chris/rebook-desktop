@@ -1,6 +1,8 @@
 //! Native e-book reader: parser -> reading IR -> page layout -> display list -> Xilem/Vello.
 
+mod highlights;
 mod library;
+mod plugins;
 mod pointer_button;
 mod reader_canvas;
 mod vello_bridge;
@@ -13,14 +15,23 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use highlights::{HighlightColor, HighlightStore, StoredHighlight};
 use library::{LibraryBook, LocalLibrary};
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
+use plugins::{
+    BUILTIN_PLUGINS, BookSearchResult, ChatCommand, ChatCommandResolution, ChatResponse, ChatRole,
+    ChatTurn, PluginSettings, RewriteBookSource, chat_command_suggestions, chat_with_book,
+    resolve_chat_command, search_book, translate_text,
+};
 use pointer_button::button;
 use reader_canvas::{ReaderCanvasAction, reader_canvas};
 use rebook_formats::{BookFormat, open_file as open_publication_file};
 use rebook_layout::{LayoutViewport, ReaderFontFamily, ReaderStyle, SpreadMode};
-use rebook_publication::{PublicationUrl, Rgba};
-use rebook_reader::{NavigationOutcome, PageDirection, ReaderSession, ReaderSnapshot, TocViewItem};
+use rebook_publication::{BookSource, PublicationUrl, Rgba, SourceRange};
+use rebook_reader::{
+    NavigationOutcome, PageDirection, ReaderSelection, ReaderSession, ReaderSnapshot,
+    ReaderTextHit, TocViewItem,
+};
 use vello_bridge::XilemVelloScene;
 use xilem::core::{fork, map_state};
 use xilem::masonry::kurbo::Size;
@@ -31,7 +42,7 @@ use xilem::masonry::vello::Scene;
 use xilem::style::{Padding, Style};
 use xilem::view::{
     CrossAxisAlignment, FlexExt, FlexSpacer, MainAxisAlignment, ObjectFit, ZStackExt, flex_col,
-    flex_row, image, label, portal, prose, sized_box, task, text_input, zstack,
+    flex_row, image, label, portal, prose, sized_box, task, task_raw, text_input, zstack,
 };
 use xilem::{
     Affine, AnyWidgetView, Color, EventLoop, FontWeight, WidgetView, WindowOptions, Xilem,
@@ -42,6 +53,7 @@ const INITIAL_HEIGHT: u32 = 800;
 const TOOLBAR_HEIGHT: f64 = 44.0;
 const PROGRESS_HEIGHT: f64 = 4.0;
 const TOC_WIDTH: f64 = 240.0;
+const ASSISTANT_PANEL_WIDTH: f64 = 340.0;
 const SETTINGS_WIDTH: f64 = 640.0;
 const SETTINGS_HEIGHT: f64 = 460.0;
 const SHELF_CARD_WIDTH: f64 = 144.0;
@@ -56,6 +68,9 @@ const MOTION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const SIDEBAR_SCRIM_ALPHA: f32 = 0.28;
 const MODAL_SCRIM_ALPHA: f32 = 0.35;
 const MOTION_EPSILON: f32 = 0.001;
+const SELECTION_TOOLBAR_WIDTH: f64 = 276.0;
+const SELECTION_TOOLBAR_HEIGHT: f64 = 46.0;
+const SELECTION_TOOLBAR_GAP: f64 = 10.0;
 
 // Keep these in sync with rebook-web's light reader tokens.
 const UI_BACKGROUND: Color = Color::from_rgb8(0xff, 0xff, 0xff);
@@ -109,14 +124,35 @@ fn open_reader(path: &Path) -> Result<DesktopReader, Box<dyn std::error::Error>>
     let cover = publication
         .cover_bytes()
         .and_then(|bytes| decode_cover(bytes).ok());
-    let source = publication.source();
+    let canonical_source = publication.source();
+    let book_id = canonical_source.book().id.to_string();
+    let rewrite_source = Arc::new(RewriteBookSource::new(canonical_source));
+    let source: Arc<dyn BookSource> = rewrite_source.clone();
+    let highlight_store = HighlightStore::load_default()?;
+    let highlights = highlight_store.for_book(&book_id);
+    let plugin_settings = PluginSettings::load_default().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to load plugin settings; using defaults");
+        PluginSettings::default()
+    });
     let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
-    let reader = ReaderSession::open(source, viewport, ReaderStyle::default())?;
+    let reader = ReaderSession::open(Arc::clone(&source), viewport, ReaderStyle::default())?;
     tracing::debug!(
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         "opened book"
     );
-    Ok(DesktopReader::new(reader, cover, format))
+    Ok(DesktopReader::new(
+        reader,
+        DesktopReaderResources {
+            source,
+            rewrite_source,
+            cover,
+            format,
+            book_id,
+            highlight_store,
+            highlights,
+            plugin_settings,
+        },
+    ))
 }
 
 enum LaunchMode {
@@ -234,9 +270,22 @@ impl ShelfState {
 
 struct DesktopReader {
     reader: ReaderSession,
+    source: Arc<dyn BookSource>,
+    rewrite_source: Arc<RewriteBookSource>,
     snapshot: ReaderSnapshot,
     cover: Option<ImageData>,
     format: BookFormat,
+    book_id: String,
+    highlight_store: HighlightStore,
+    highlights: Vec<StoredHighlight>,
+    selection_anchor: Option<ReaderTextHit>,
+    selection: Option<ReaderSelection>,
+    selected_highlight_id: Option<String>,
+    focused_range: Option<SourceRange>,
+    plugin_settings: PluginSettings,
+    search: SearchUiState,
+    chat: ChatUiState,
+    translation: TranslationUiState,
     ui: ReaderUiState,
     canvas_size: Option<(u32, u32)>,
     scene_revision: u64,
@@ -244,6 +293,87 @@ struct DesktopReader {
     page_scene_lru: VecDeque<PageSceneKey>,
     error: Option<String>,
     exit_requested: bool,
+}
+
+struct DesktopReaderResources {
+    source: Arc<dyn BookSource>,
+    rewrite_source: Arc<RewriteBookSource>,
+    cover: Option<ImageData>,
+    format: BookFormat,
+    book_id: String,
+    highlight_store: HighlightStore,
+    highlights: Vec<StoredHighlight>,
+    plugin_settings: PluginSettings,
+}
+
+#[derive(Clone)]
+struct SearchTaskRequest {
+    id: u64,
+    source: Arc<dyn BookSource>,
+    query: String,
+}
+
+#[derive(Debug)]
+struct SearchTaskMessage {
+    id: u64,
+    result: Result<Vec<BookSearchResult>, String>,
+}
+
+#[derive(Default)]
+struct SearchUiState {
+    query: String,
+    results: Vec<BookSearchResult>,
+    status: String,
+    pending: Option<SearchTaskRequest>,
+    next_request_id: u64,
+}
+
+#[derive(Clone)]
+struct ChatTaskRequest {
+    id: u64,
+    source: Arc<dyn BookSource>,
+    settings: PluginSettings,
+    history: Vec<ChatTurn>,
+    question: String,
+    current_section: usize,
+}
+
+#[derive(Debug)]
+struct ChatTaskMessage {
+    id: u64,
+    result: Result<ChatResponse, String>,
+}
+
+#[derive(Default)]
+struct ChatUiState {
+    input: String,
+    messages: Vec<ChatTurn>,
+    error: Option<String>,
+    pending: Option<ChatTaskRequest>,
+    next_request_id: u64,
+}
+
+#[derive(Clone)]
+struct TranslationTaskRequest {
+    id: u64,
+    settings: PluginSettings,
+    text: String,
+}
+
+#[derive(Debug)]
+struct TranslationTaskMessage {
+    id: u64,
+    result: Result<String, String>,
+}
+
+#[derive(Default)]
+struct TranslationUiState {
+    source_text: String,
+    translated_text: String,
+    source_range: Option<SourceRange>,
+    error: Option<String>,
+    pending: Option<TranslationTaskRequest>,
+    next_request_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -265,6 +395,21 @@ enum SettingsTab {
     #[default]
     Reading,
     Font,
+    Plugins,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SidebarTab {
+    #[default]
+    Toc,
+    Highlights,
+    Search,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssistantPanel {
+    Chat,
+    Translation,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -332,6 +477,7 @@ impl Motion {
 struct ReaderUiState {
     sidebar_open: bool,
     sidebar_pinned: bool,
+    sidebar_tab: SidebarTab,
     toolbar_hovered: bool,
     toolbar_hide_at: Option<Instant>,
     overlay: ReaderOverlay,
@@ -339,6 +485,8 @@ struct ReaderUiState {
     draft_spread: SpreadMode,
     draft_font_family: ReaderFontFamily,
     draft_font_size: f32,
+    draft_plugin_settings: PluginSettings,
+    assistant_panel: Option<AssistantPanel>,
     toolbar_motion: Motion,
     sidebar_motion: Motion,
     menu_motion: Motion,
@@ -386,7 +534,17 @@ impl ReaderUiState {
 }
 
 impl DesktopReader {
-    fn new(mut reader: ReaderSession, cover: Option<ImageData>, format: BookFormat) -> Self {
+    fn new(mut reader: ReaderSession, resources: DesktopReaderResources) -> Self {
+        let DesktopReaderResources {
+            source,
+            rewrite_source,
+            cover,
+            format,
+            book_id,
+            highlight_store,
+            highlights,
+            plugin_settings,
+        } = resources;
         let draft_style = reader.style();
         let error = reader
             .prefetch_adjacent()
@@ -396,12 +554,25 @@ impl DesktopReader {
         let expanded_toc = snapshot.active_toc_path.iter().cloned().collect();
         Self {
             reader,
+            source,
+            rewrite_source,
             snapshot,
             cover,
             format,
+            book_id,
+            highlight_store,
+            highlights,
+            selection_anchor: None,
+            selection: None,
+            selected_highlight_id: None,
+            focused_range: None,
+            search: SearchUiState::default(),
+            chat: ChatUiState::default(),
+            translation: TranslationUiState::default(),
             ui: ReaderUiState {
                 sidebar_open: true,
                 sidebar_pinned: true,
+                sidebar_tab: SidebarTab::Toc,
                 toolbar_hovered: false,
                 toolbar_hide_at: None,
                 overlay: ReaderOverlay::None,
@@ -409,6 +580,8 @@ impl DesktopReader {
                 draft_spread: draft_style.spread,
                 draft_font_family: draft_style.font_family,
                 draft_font_size: draft_style.font_size,
+                draft_plugin_settings: plugin_settings.clone(),
+                assistant_panel: None,
                 toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
                 sidebar_motion: Motion::settled(1.0),
                 menu_motion: Motion::settled(0.0),
@@ -416,6 +589,7 @@ impl DesktopReader {
                 last_motion_tick: None,
                 expanded_toc,
             },
+            plugin_settings,
             canvas_size: None,
             scene_revision: 0,
             page_scenes: HashMap::new(),
@@ -429,6 +603,433 @@ impl DesktopReader {
         self.exit_requested = true;
     }
 
+    fn begin_text_selection(&mut self, x: f32, y: f32) {
+        match self.reader.hit_test_current_spread(x, y, true) {
+            Ok(anchor) => {
+                self.selection_anchor = anchor;
+                self.selection = None;
+                self.selected_highlight_id = None;
+                self.invalidate_page_scenes();
+            }
+            Err(error) => self.error = Some(format!("选择文字失败：{error}")),
+        }
+    }
+
+    fn update_text_selection(&mut self, x: f32, y: f32) {
+        let Some(anchor) = self.selection_anchor.clone() else {
+            return;
+        };
+        let result = self
+            .reader
+            .hit_test_current_spread(x, y, false)
+            .and_then(|focus| {
+                focus.map_or(Ok(None), |focus| {
+                    self.reader.selection_between(&anchor, &focus)
+                })
+            });
+        match result {
+            Ok(selection) if self.selection != selection => {
+                self.selection = selection;
+                self.invalidate_page_scenes();
+            }
+            Ok(_) => {}
+            Err(error) => self.error = Some(format!("选择文字失败：{error}")),
+        }
+    }
+
+    fn finish_text_selection(&mut self, x: f32, y: f32, moved: bool) {
+        if moved {
+            self.update_text_selection(x, y);
+            if self.selection.is_none() {
+                self.selection_anchor = None;
+            }
+            return;
+        }
+
+        self.selection_anchor = None;
+        self.selection = None;
+        self.invalidate_page_scenes();
+        let candidates = self
+            .highlights
+            .iter()
+            .map(|highlight| (highlight.id.clone(), highlight.ranges.clone()))
+            .collect::<Vec<_>>();
+        let activated = candidates.into_iter().find_map(|(id, ranges)| {
+            self.reader
+                .source_ranges_contain_point(&ranges, x, y)
+                .ok()
+                .filter(|contains| *contains)
+                .map(|_| id)
+        });
+        if let Some(id) = activated {
+            self.selected_highlight_id = Some(id);
+            self.ui.sidebar_tab = SidebarTab::Highlights;
+            self.set_sidebar_open(true);
+        } else {
+            self.selected_highlight_id = None;
+        }
+    }
+
+    fn cancel_text_selection(&mut self) {
+        self.selection_anchor = None;
+        if self.selection.take().is_some() {
+            self.invalidate_page_scenes();
+        }
+    }
+
+    fn create_highlight(&mut self, color: HighlightColor) {
+        let Some(selection) = self.selection.clone() else {
+            return;
+        };
+        let highlight = StoredHighlight::new(
+            self.book_id.clone(),
+            selection.ranges,
+            selection.text,
+            color,
+        );
+        match self.highlight_store.insert(highlight.clone()) {
+            Ok(()) => {
+                self.highlights.insert(0, highlight);
+                self.selection_anchor = None;
+                self.selection = None;
+                self.selected_highlight_id = None;
+                self.invalidate_page_scenes();
+                self.error = None;
+            }
+            Err(error) => self.error = Some(format!("保存高亮失败：{error}")),
+        }
+    }
+
+    fn remove_highlight(&mut self, id: &str) {
+        match self.highlight_store.remove(id) {
+            Ok(true) => {
+                self.highlights.retain(|highlight| highlight.id != id);
+                if self.selected_highlight_id.as_deref() == Some(id) {
+                    self.selected_highlight_id = None;
+                }
+                self.invalidate_page_scenes();
+                self.error = None;
+            }
+            Ok(false) => {}
+            Err(error) => self.error = Some(format!("删除高亮失败：{error}")),
+        }
+    }
+
+    fn go_to_highlight(&mut self, id: &str) {
+        let Some(anchor) = self
+            .highlights
+            .iter()
+            .find(|highlight| highlight.id == id)
+            .and_then(|highlight| highlight.ranges.first())
+            .map(|range| range.start.clone())
+        else {
+            return;
+        };
+        match self.reader.go_to_source(&anchor) {
+            Ok(result) => {
+                self.install_snapshot(result.snapshot);
+                self.selected_highlight_id = Some(id.to_owned());
+                self.selection_anchor = None;
+                self.selection = None;
+                self.invalidate_page_scenes();
+                self.prefetch();
+                self.error = None;
+            }
+            Err(error) => self.error = Some(format!("高亮跳转失败：{error}")),
+        }
+    }
+
+    fn set_sidebar_tab(&mut self, tab: SidebarTab) {
+        self.ui.sidebar_tab = tab;
+    }
+
+    fn open_search(&mut self) {
+        self.ui.sidebar_tab = SidebarTab::Search;
+        self.set_sidebar_open(true);
+    }
+
+    fn start_search(&mut self) {
+        if self.search.pending.is_some() {
+            return;
+        }
+        let query = self.search.query.trim().to_owned();
+        if query.is_empty() {
+            self.search.status = "请输入搜索内容".into();
+            return;
+        }
+        let id = self.search.next_request_id;
+        self.search.next_request_id = self.search.next_request_id.wrapping_add(1);
+        self.search.status = "正在搜索…".into();
+        self.search.results.clear();
+        self.focused_range = None;
+        self.search.pending = Some(SearchTaskRequest {
+            id,
+            source: Arc::clone(&self.source),
+            query,
+        });
+        self.invalidate_page_scenes();
+    }
+
+    fn complete_search(&mut self, message: SearchTaskMessage) {
+        if self.search.pending.as_ref().map(|request| request.id) != Some(message.id) {
+            return;
+        }
+        self.search.pending = None;
+        match message.result {
+            Ok(results) => {
+                self.search.status = if results.is_empty() {
+                    "没有找到匹配内容".into()
+                } else {
+                    format!("找到 {} 处结果", results.len())
+                };
+                self.search.results = results;
+            }
+            Err(error) => {
+                self.search.results.clear();
+                self.search.status = error;
+            }
+        }
+    }
+
+    fn go_to_search_result(&mut self, result: &BookSearchResult) {
+        match self.reader.go_to_source(&result.range.start) {
+            Ok(navigation) => {
+                self.install_snapshot(navigation.snapshot);
+                self.focused_range = Some(result.range.clone());
+                self.selection_anchor = None;
+                self.selection = None;
+                self.selected_highlight_id = None;
+                self.invalidate_page_scenes();
+                self.prefetch();
+                self.error = None;
+            }
+            Err(error) => self.search.status = format!("搜索结果跳转失败：{error}"),
+        }
+    }
+
+    fn toggle_assistant_panel(&mut self, panel: AssistantPanel) {
+        self.cancel_text_selection();
+        self.ui.assistant_panel = if self.ui.assistant_panel == Some(panel) {
+            None
+        } else {
+            Some(panel)
+        };
+    }
+
+    fn close_assistant_panel(&mut self) {
+        self.ui.assistant_panel = None;
+    }
+
+    fn send_chat(&mut self) {
+        let raw = self.chat.input.trim().to_owned();
+        if raw.is_empty() || self.chat.pending.is_some() {
+            return;
+        }
+        match resolve_chat_command(&raw) {
+            ChatCommandResolution::MissingArguments {
+                message,
+                insert_text,
+            } => {
+                self.chat.messages.push(ChatTurn {
+                    role: ChatRole::User,
+                    content: raw.clone(),
+                    display_content: Some(raw),
+                });
+                self.chat.messages.push(ChatTurn {
+                    role: ChatRole::Assistant,
+                    content: message,
+                    display_content: None,
+                });
+                self.chat.input = insert_text.into();
+                self.chat.error = None;
+            }
+            ChatCommandResolution::Resolved { display, prompt } => {
+                self.chat.input.clear();
+                self.queue_chat(prompt, Some(display));
+            }
+            ChatCommandResolution::NotCommand | ChatCommandResolution::Unknown => {
+                self.chat.input.clear();
+                self.queue_chat(raw, None);
+            }
+        }
+    }
+
+    fn select_chat_command(&mut self, command: ChatCommand) {
+        if self.chat.pending.is_none() {
+            self.chat.input = command.insert_text.into();
+            self.chat.error = None;
+        }
+    }
+
+    fn explain_selection(&mut self) {
+        let Some(selection) = self.selection.clone() else {
+            return;
+        };
+        let question = format!(
+            "请结合当前段落和章节语境解释选中的内容。说明它的直接含义、在本段中的作用，以及理解它所需的背景；不要脱离原文进行无依据推测。\n\n选中文字：\n{}",
+            selection.text.trim()
+        );
+        self.cancel_text_selection();
+        self.ui.assistant_panel = Some(AssistantPanel::Chat);
+        self.queue_chat(question, None);
+    }
+
+    fn queue_chat(&mut self, question: String, display_content: Option<String>) {
+        if let Err(error) = self.plugin_settings.validate_ai() {
+            self.chat.error = Some(error);
+            self.ui.assistant_panel = Some(AssistantPanel::Chat);
+            return;
+        }
+        let id = self.chat.next_request_id;
+        self.chat.next_request_id = self.chat.next_request_id.wrapping_add(1);
+        let history = self.chat.messages.clone();
+        self.chat.messages.push(ChatTurn {
+            role: ChatRole::User,
+            content: question.clone(),
+            display_content,
+        });
+        self.chat.error = None;
+        self.chat.pending = Some(ChatTaskRequest {
+            id,
+            source: Arc::clone(&self.source),
+            settings: self.plugin_settings.clone(),
+            history,
+            question,
+            current_section: self.snapshot.location.section_index,
+        });
+    }
+
+    fn complete_chat(&mut self, message: ChatTaskMessage) {
+        if self.chat.pending.as_ref().map(|request| request.id) != Some(message.id) {
+            return;
+        }
+        self.chat.pending = None;
+        match message.result {
+            Ok(response) => {
+                if !response.rewrites.is_empty() {
+                    let transaction = match self.rewrite_source.apply_rewrites(&response.rewrites) {
+                        Ok(transaction) => transaction,
+                        Err(error) => {
+                            self.chat.error = Some(format!("应用正文改写失败：{error}"));
+                            return;
+                        }
+                    };
+                    match self.reader.refresh_source() {
+                        Ok(snapshot) => {
+                            self.install_snapshot(snapshot);
+                            self.selection_anchor = None;
+                            self.selection = None;
+                            self.selected_highlight_id = None;
+                            self.focused_range = None;
+                            self.invalidate_page_scenes();
+                            self.prefetch();
+                        }
+                        Err(error) => {
+                            let rollback_error = self.rewrite_source.rollback(transaction).err();
+                            self.chat.error = Some(match rollback_error {
+                                Some(rollback_error) => format!(
+                                    "应用正文改写失败：{error}；回滚也失败：{rollback_error}"
+                                ),
+                                None => format!("应用正文改写失败：{error}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+                self.chat.messages.push(ChatTurn {
+                    role: ChatRole::Assistant,
+                    content: response.content,
+                    display_content: None,
+                });
+                self.chat.error = None;
+            }
+            Err(error) => self.chat.error = Some(error),
+        }
+    }
+
+    fn clear_chat(&mut self) {
+        if self.chat.pending.is_none() {
+            self.chat.messages.clear();
+            self.chat.error = None;
+        }
+    }
+
+    fn translate_selection(&mut self) {
+        let Some(selection) = self.selection.clone() else {
+            return;
+        };
+        if let Err(error) = self.plugin_settings.validate_ai() {
+            self.translation.error = Some(error);
+            self.ui.assistant_panel = Some(AssistantPanel::Translation);
+            return;
+        }
+        if self.translation.pending.is_some() {
+            return;
+        }
+        let text = selection.text.trim().to_owned();
+        let id = self.translation.next_request_id;
+        self.translation.next_request_id = self.translation.next_request_id.wrapping_add(1);
+        self.translation.source_text.clone_from(&text);
+        self.translation.translated_text.clear();
+        self.translation.source_range = selection.ranges.first().cloned();
+        self.translation.error = None;
+        self.translation.pending = Some(TranslationTaskRequest {
+            id,
+            settings: self.plugin_settings.clone(),
+            text,
+        });
+        self.cancel_text_selection();
+        self.ui.assistant_panel = Some(AssistantPanel::Translation);
+    }
+
+    fn retry_translation(&mut self) {
+        if self.translation.pending.is_some() || self.translation.source_text.trim().is_empty() {
+            return;
+        }
+        if let Err(error) = self.plugin_settings.validate_ai() {
+            self.translation.error = Some(error);
+            return;
+        }
+        let id = self.translation.next_request_id;
+        self.translation.next_request_id = self.translation.next_request_id.wrapping_add(1);
+        self.translation.error = None;
+        self.translation.pending = Some(TranslationTaskRequest {
+            id,
+            settings: self.plugin_settings.clone(),
+            text: self.translation.source_text.clone(),
+        });
+    }
+
+    fn go_to_translation_source(&mut self) {
+        let Some(range) = self.translation.source_range.clone() else {
+            return;
+        };
+        match self.reader.go_to_source(&range.start) {
+            Ok(navigation) => {
+                self.install_snapshot(navigation.snapshot);
+                self.focused_range = Some(range);
+                self.invalidate_page_scenes();
+                self.prefetch();
+                self.error = None;
+            }
+            Err(error) => self.translation.error = Some(format!("原文定位失败：{error}")),
+        }
+    }
+
+    fn complete_translation(&mut self, message: TranslationTaskMessage) {
+        if self.translation.pending.as_ref().map(|request| request.id) != Some(message.id) {
+            return;
+        }
+        self.translation.pending = None;
+        match message.result {
+            Ok(content) => {
+                self.translation.translated_text = content;
+                self.translation.error = None;
+            }
+            Err(error) => self.translation.error = Some(error),
+        }
+    }
+
     fn turn_page(&mut self, direction: PageDirection) {
         let previous_section = self.snapshot.location.section_index;
         let previous_segment = self.snapshot.location.segment_index;
@@ -439,6 +1040,9 @@ impl DesktopReader {
                 let section_changed = result.snapshot.location.section_index != previous_section;
                 let segment_changed = result.snapshot.location.segment_index != previous_segment;
                 self.install_snapshot(result.snapshot);
+                self.selection_anchor = None;
+                self.selection = None;
+                self.selected_highlight_id = None;
                 self.error = None;
                 if moved {
                     self.bump_scene_revision();
@@ -452,14 +1056,23 @@ impl DesktopReader {
     }
 
     fn open_settings(&mut self) {
+        self.cancel_text_selection();
         let style = self.reader.style();
         self.ui.draft_spread = style.spread;
         self.ui.draft_font_family = style.font_family;
         self.ui.draft_font_size = style.font_size;
+        self.ui
+            .draft_plugin_settings
+            .clone_from(&self.plugin_settings);
         self.set_overlay(ReaderOverlay::Settings);
     }
 
     fn apply_settings(&mut self) {
+        let plugin_settings = self.ui.draft_plugin_settings.clone();
+        if let Err(error) = plugin_settings.save_default() {
+            self.error = Some(format!("保存插件设置失败：{error}"));
+            return;
+        }
         let mut style = self.reader.style();
         style.spread = self.ui.draft_spread;
         style.font_family = self.ui.draft_font_family;
@@ -467,7 +1080,10 @@ impl DesktopReader {
         let result = self.reader.set_style(style);
         match result {
             Ok(snapshot) => {
+                self.plugin_settings = plugin_settings;
                 self.install_snapshot(snapshot);
+                self.selection_anchor = None;
+                self.selection = None;
                 self.close_overlay();
                 self.invalidate_page_scenes();
                 self.prefetch();
@@ -481,6 +1097,9 @@ impl DesktopReader {
         match result {
             Ok(result) => {
                 self.install_snapshot(result.snapshot);
+                self.selection_anchor = None;
+                self.selection = None;
+                self.selected_highlight_id = None;
                 self.bump_scene_revision();
                 self.error = None;
                 self.prefetch();
@@ -505,6 +1124,8 @@ impl DesktopReader {
         match result {
             Ok(snapshot) => {
                 self.install_snapshot(snapshot);
+                self.selection_anchor = None;
+                self.selection = None;
                 self.canvas_size = Some((width, height));
                 self.invalidate_page_scenes();
                 self.prefetch();
@@ -552,8 +1173,56 @@ impl DesktopReader {
             match self.reader.current_spread() {
                 Ok(spread) => {
                     spread.primary.paint_background(&mut bridge);
+                    for highlight in &self.highlights {
+                        spread.primary.paint_source_ranges(
+                            &mut bridge,
+                            &highlight.ranges,
+                            ui_color(highlight.color.rgba()),
+                            0.0,
+                        );
+                    }
+                    if let Some(range) = &self.focused_range {
+                        spread.primary.paint_source_ranges(
+                            &mut bridge,
+                            std::slice::from_ref(range),
+                            Color::from_rgba8(59, 130, 246, 96),
+                            0.0,
+                        );
+                    }
+                    if let Some(selection) = &self.selection {
+                        spread.primary.paint_source_ranges(
+                            &mut bridge,
+                            &selection.ranges,
+                            Color::from_rgba8(96, 165, 250, 88),
+                            0.0,
+                        );
+                    }
                     spread.primary.paint_content_at(&mut bridge, 0.0);
                     if let Some(secondary) = spread.secondary {
+                        for highlight in &self.highlights {
+                            secondary.paint_source_ranges(
+                                &mut bridge,
+                                &highlight.ranges,
+                                ui_color(highlight.color.rgba()),
+                                spread.secondary_offset_x,
+                            );
+                        }
+                        if let Some(range) = &self.focused_range {
+                            secondary.paint_source_ranges(
+                                &mut bridge,
+                                std::slice::from_ref(range),
+                                Color::from_rgba8(59, 130, 246, 96),
+                                spread.secondary_offset_x,
+                            );
+                        }
+                        if let Some(selection) = &self.selection {
+                            secondary.paint_source_ranges(
+                                &mut bridge,
+                                &selection.ranges,
+                                Color::from_rgba8(96, 165, 250, 88),
+                                spread.secondary_offset_x,
+                            );
+                        }
                         secondary.paint_content_at(&mut bridge, spread.secondary_offset_x);
                     }
                 }
@@ -1129,6 +1798,93 @@ fn cover_color(id: &str) -> Color {
 }
 
 fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
+    let animations_running = state.ui.needs_motion_tick();
+    let search_request = state.search.pending.clone();
+    let chat_request = state.chat.pending.clone();
+    let translation_request = state.translation.pending.clone();
+    let app = reader_shell(state);
+
+    let app = fork(
+        app,
+        animations_running.then(|| {
+            task(
+                |proxy| async move {
+                    let mut interval = xilem::tokio::time::interval(MOTION_FRAME_INTERVAL);
+                    interval.set_missed_tick_behavior(xilem::tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        interval.tick().await;
+                        if proxy.message(Instant::now()).is_err() {
+                            break;
+                        }
+                    }
+                },
+                |state: &mut DesktopReader, now| state.advance_motion(now),
+            )
+        }),
+    );
+    let app = fork(
+        app,
+        search_request.map(|request| {
+            task_raw(
+                move |proxy| {
+                    let request = request.clone();
+                    async move {
+                        let id = request.id;
+                        let result = xilem::tokio::task::spawn_blocking(move || {
+                            search_book(request.source.as_ref(), &request.query, 100)
+                        })
+                        .await
+                        .map_err(|error| format!("搜索任务失败：{error}"))
+                        .and_then(std::convert::identity);
+                        let _ = proxy.message(SearchTaskMessage { id, result });
+                    }
+                },
+                DesktopReader::complete_search,
+            )
+        }),
+    );
+    let app = fork(
+        app,
+        chat_request.map(|request| {
+            task_raw(
+                move |proxy| {
+                    let request = request.clone();
+                    async move {
+                        let id = request.id;
+                        let result = chat_with_book(
+                            request.source,
+                            request.settings,
+                            request.history,
+                            request.question,
+                            request.current_section,
+                        )
+                        .await;
+                        let _ = proxy.message(ChatTaskMessage { id, result });
+                    }
+                },
+                DesktopReader::complete_chat,
+            )
+        }),
+    );
+    fork(
+        app,
+        translation_request.map(|request| {
+            task_raw(
+                move |proxy| {
+                    let request = request.clone();
+                    async move {
+                        let id = request.id;
+                        let result = translate_text(request.settings, request.text).await;
+                        let _ = proxy.message(TranslationTaskMessage { id, result });
+                    }
+                },
+                DesktopReader::complete_translation,
+            )
+        }),
+    )
+}
+
+fn reader_shell(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     let progress = state.progress();
     let sidebar_progress = state.ui.sidebar_motion.value.clamp(0.0, 1.0);
     let sidebar_offset = -TOC_WIDTH * f64::from(1.0 - sidebar_progress);
@@ -1164,6 +1920,13 @@ fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopReader> + use<>
         ))
         .boxed()
     };
+    let workspace: Box<AnyWidgetView<DesktopReader>> = if state.ui.assistant_panel.is_some() {
+        flex_row((workspace.flex(1.0), assistant_panel(state)))
+            .gap(0.px())
+            .boxed()
+    } else {
+        workspace
+    };
     let settings_progress = state.ui.settings_motion.value.clamp(0.0, 1.0);
     let settings_layer: Box<AnyWidgetView<DesktopReader>> = if state.ui.settings_motion.is_visible()
     {
@@ -1171,29 +1934,9 @@ fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopReader> + use<>
     } else {
         sized_box(label("")).width(0.px()).height(0.px()).boxed()
     };
-    let animations_running = state.ui.needs_motion_tick();
-    let app = sized_box(zstack((workspace, settings_layer)))
+    sized_box(zstack((workspace, settings_layer)))
         .expand()
-        .background_color(UI_BACKGROUND);
-
-    fork(
-        app,
-        animations_running.then(|| {
-            task(
-                |proxy| async move {
-                    let mut interval = xilem::tokio::time::interval(MOTION_FRAME_INTERVAL);
-                    interval.set_missed_tick_behavior(xilem::tokio::time::MissedTickBehavior::Skip);
-                    loop {
-                        interval.tick().await;
-                        if proxy.message(Instant::now()).is_err() {
-                            break;
-                        }
-                    }
-                },
-                |state: &mut DesktopReader, now| state.advance_motion(now),
-            )
-        }),
-    )
+        .background_color(UI_BACKGROUND)
 }
 
 fn reader_workspace(
@@ -1220,6 +1963,7 @@ fn reader_workspace(
             title,
             state.ui.sidebar_open,
             menu_open,
+            state.ui.assistant_panel,
             reader_background,
         ))
         .height(TOOLBAR_HEIGHT.px())
@@ -1253,15 +1997,23 @@ fn reader_workspace(
         sized_box(label("")).width(0.px()).height(0.px()).boxed()
     };
     let menu_layer = menu_content.alignment(UnitPoint::TOP_RIGHT);
+    let selection_layer = selection_toolbar(state.selection.as_ref(), state.canvas_size)
+        .alignment(UnitPoint::TOP_LEFT);
     let pages = sized_box(flex_col((
         reader_view(state.scene_revision, reader_background).flex(1.0),
         progress_bar(progress),
     )))
     .expand();
 
-    sized_box(zstack((pages, menu_scrim, toolbar_layer, menu_layer)))
-        .expand()
-        .background_color(reader_background)
+    sized_box(zstack((
+        pages,
+        selection_layer,
+        menu_scrim,
+        toolbar_layer,
+        menu_layer,
+    )))
+    .expand()
+    .background_color(reader_background)
 }
 
 fn reader_view(scene_revision: u64, reader_background: Color) -> impl WidgetView<DesktopReader> {
@@ -1281,11 +2033,128 @@ fn reader_view(scene_revision: u64, reader_background: Color) -> impl WidgetView
             ReaderCanvasAction::NextPage if !state.ui.overlay_visible() => {
                 state.turn_page(PageDirection::Next);
             }
+            ReaderCanvasAction::SelectionStart { x, y } if !state.ui.overlay_visible() => {
+                state.begin_text_selection(x, y);
+            }
+            ReaderCanvasAction::SelectionUpdate { x, y } if !state.ui.overlay_visible() => {
+                state.update_text_selection(x, y);
+            }
+            ReaderCanvasAction::SelectionFinish { x, y, moved } if !state.ui.overlay_visible() => {
+                state.finish_text_selection(x, y, moved);
+            }
+            ReaderCanvasAction::SelectionCancel => state.cancel_text_selection(),
             _ => {}
         },
     ))
     .expand()
     .background_color(reader_background)
+}
+
+fn selection_toolbar(
+    selection: Option<&ReaderSelection>,
+    canvas_size: Option<(u32, u32)>,
+) -> impl WidgetView<DesktopReader> + use<> {
+    let anchor = selection
+        .and_then(|selection| selection.rects.last())
+        .copied()
+        .unwrap_or(rebook_reader::ReaderSelectionRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        });
+    let selection_top = selection
+        .into_iter()
+        .flat_map(|selection| &selection.rects)
+        .map(|rect| f64::from(rect.y))
+        .fold(f64::INFINITY, f64::min);
+    let selection_bottom = selection
+        .into_iter()
+        .flat_map(|selection| &selection.rects)
+        .map(|rect| f64::from(rect.y + rect.height))
+        .fold(0.0_f64, f64::max);
+    let canvas_width = canvas_size.map_or(f64::from(INITIAL_WIDTH), |size| f64::from(size.0));
+    let canvas_height = canvas_size.map_or(f64::from(INITIAL_HEIGHT), |size| f64::from(size.1));
+    let ideal_left = f64::from(anchor.x + anchor.width / 2.0) - SELECTION_TOOLBAR_WIDTH / 2.0;
+    let left = ideal_left.clamp(8.0, (canvas_width - SELECTION_TOOLBAR_WIDTH - 8.0).max(8.0));
+    let top = if selection_top >= SELECTION_TOOLBAR_HEIGHT + SELECTION_TOOLBAR_GAP + 8.0 {
+        selection_top - SELECTION_TOOLBAR_HEIGHT - SELECTION_TOOLBAR_GAP
+    } else {
+        (selection_bottom + SELECTION_TOOLBAR_GAP)
+            .min((canvas_height - SELECTION_TOOLBAR_HEIGHT - 8.0).max(8.0))
+    };
+    let color_buttons = HighlightColor::ALL
+        .into_iter()
+        .map(|color| highlight_color_button(color).boxed())
+        .collect::<Vec<_>>();
+
+    let toolbar = sized_box(
+        flex_row((
+            icon_label(Icon::Highlighter, 16.0, UI_MUTED),
+            flex_row(color_buttons)
+                .gap(6.px())
+                .cross_axis_alignment(CrossAxisAlignment::Center),
+            sized_box(label(""))
+                .width(1.px())
+                .height(22.px())
+                .background_color(UI_BORDER),
+            icon_button(Icon::Languages, false, DesktopReader::translate_selection),
+            icon_button(
+                Icon::MessageCircleQuestion,
+                false,
+                DesktopReader::explain_selection,
+            ),
+            sized_box(label(""))
+                .width(1.px())
+                .height(22.px())
+                .background_color(UI_BORDER),
+            icon_button(Icon::X, false, DesktopReader::cancel_text_selection),
+        ))
+        .gap(8.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center)
+        .padding(Padding::from_vh(7.0, 9.0)),
+    )
+    .width(SELECTION_TOOLBAR_WIDTH.px())
+    .height(SELECTION_TOOLBAR_HEIGHT.px())
+    .background_color(UI_SURFACE)
+    .border(UI_BORDER, 1.0)
+    .corner_radius(12.0);
+    let visible = selection.is_some();
+    sized_box(if visible {
+        toolbar.boxed()
+    } else {
+        sized_box(label("")).width(0.px()).height(0.px()).boxed()
+    })
+    .width(if visible {
+        SELECTION_TOOLBAR_WIDTH.px()
+    } else {
+        0.px()
+    })
+    .height(if visible {
+        SELECTION_TOOLBAR_HEIGHT.px()
+    } else {
+        0.px()
+    })
+    .transform(Affine::translate((left, top)))
+}
+
+fn highlight_color_button(color: HighlightColor) -> impl WidgetView<DesktopReader> {
+    let rgba = color.rgba();
+    let swatch = Color::from_rgb8(rgba.red, rgba.green, rgba.blue);
+    sized_box(
+        button(label(""), move |state: &mut DesktopReader| {
+            state.create_highlight(color);
+        })
+        .background_color(swatch)
+        .active_background_color(swatch.with_alpha(0.72))
+        .border_color(Color::from_rgba8(31, 45, 61, 36))
+        .hovered_border_color(UI_TEXT_SOFT)
+        .border_width(1.0)
+        .corner_radius(8.0)
+        .padding(0.0),
+    )
+    .width(26.px())
+    .height(26.px())
 }
 
 fn toc_view(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
@@ -1309,29 +2178,34 @@ fn toc_view(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
             toc_row_view(row, selected, expanded)
         })
         .collect::<Vec<_>>();
+    let panel: Box<AnyWidgetView<DesktopReader>> = match state.ui.sidebar_tab {
+        SidebarTab::Toc => sized_box(zstack((
+            portal(
+                flex_col(toc_rows)
+                    .gap(2.px())
+                    .cross_axis_alignment(CrossAxisAlignment::Fill),
+            ),
+            // Masonry 0.4 clips the rounded scrollbar thumb at y=0, which leaves
+            // a jagged cap under the CPU renderer. Keep the draggable scrollbar,
+            // but mask only that defective top edge.
+            sized_box(label(""))
+                .width(12.px())
+                .height(8.px())
+                .background_color(UI_SIDEBAR)
+                .alignment(UnitPoint::TOP_RIGHT),
+        )))
+        .background_color(UI_SIDEBAR)
+        .padding(Padding::from_vh(6.0, 0.0))
+        .boxed(),
+        SidebarTab::Highlights => highlights_panel(state).boxed(),
+        SidebarTab::Search => search_panel(state).boxed(),
+    };
     sized_box(
         flex_col((
-            sidebar_toolbar(state.ui.sidebar_pinned),
+            sidebar_toolbar(state.ui.sidebar_pinned, state.ui.sidebar_tab),
             sidebar_book_summary(cover, title, author, format),
             divider(),
-            sized_box(zstack((
-                portal(
-                    flex_col(toc_rows)
-                        .gap(2.px())
-                        .cross_axis_alignment(CrossAxisAlignment::Fill),
-                ),
-                // Masonry 0.4 clips the rounded scrollbar thumb at y=0, which leaves
-                // a jagged cap under the CPU renderer. Keep the draggable scrollbar,
-                // but mask only that defective top edge.
-                sized_box(label(""))
-                    .width(12.px())
-                    .height(8.px())
-                    .background_color(UI_SIDEBAR)
-                    .alignment(UnitPoint::TOP_RIGHT),
-            )))
-            .background_color(UI_SIDEBAR)
-            .padding(Padding::from_vh(6.0, 0.0))
-            .flex(1.0),
+            panel.flex(1.0),
         ))
         .gap(4.px()),
     )
@@ -1341,12 +2215,21 @@ fn toc_view(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     .padding(Padding::from_vh(6.0, 4.0))
 }
 
-fn sidebar_toolbar(pinned: bool) -> impl WidgetView<DesktopReader> {
+fn sidebar_toolbar(pinned: bool, tab: SidebarTab) -> impl WidgetView<DesktopReader> {
     flex_row((
         icon_button(Icon::PanelLeft, false, |state: &mut DesktopReader| {
             state.set_sidebar_open(false);
         }),
         FlexSpacer::Flex(1.0),
+        icon_button(Icon::Search, tab == SidebarTab::Search, |state| {
+            state.set_sidebar_tab(SidebarTab::Search);
+        }),
+        icon_button(Icon::Highlighter, tab == SidebarTab::Highlights, |state| {
+            state.set_sidebar_tab(SidebarTab::Highlights);
+        }),
+        icon_button(Icon::ListTree, tab == SidebarTab::Toc, |state| {
+            state.set_sidebar_tab(SidebarTab::Toc);
+        }),
         icon_button(
             if pinned { Icon::Pin } else { Icon::PinOff },
             pinned,
@@ -1356,6 +2239,266 @@ fn sidebar_toolbar(pinned: bool) -> impl WidgetView<DesktopReader> {
         ),
     ))
     .cross_axis_alignment(CrossAxisAlignment::Center)
+}
+
+fn search_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
+    let query = state.search.query.clone();
+    let busy = state.search.pending.is_some();
+    let status = state.search.status.clone();
+    let active_range = state.focused_range.clone();
+    let rows = state
+        .search
+        .results
+        .iter()
+        .cloned()
+        .map(|result| {
+            let selected = active_range.as_ref() == Some(&result.range);
+            search_result_row(result, selected)
+        })
+        .collect::<Vec<_>>();
+    let results: Box<AnyWidgetView<DesktopReader>> = if rows.is_empty() {
+        flex_col((
+            icon_label(Icon::Search, 24.0, UI_MUTED),
+            label(if busy {
+                "正在扫描正文…"
+            } else {
+                "搜索书中内容"
+            })
+            .font(UI_FONT_STACK)
+            .text_size(12.5)
+            .color(UI_MUTED),
+        ))
+        .gap(8.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center)
+        .main_axis_alignment(MainAxisAlignment::Center)
+        .boxed()
+    } else {
+        portal(
+            flex_col(rows)
+                .gap(7.px())
+                .cross_axis_alignment(CrossAxisAlignment::Fill),
+        )
+        .boxed()
+    };
+    let input = sized_box(
+        flex_row((
+            icon_label(Icon::Search, 15.0, UI_MUTED),
+            text_input(query, |state: &mut DesktopReader, value| {
+                state.search.query = value;
+            })
+            .on_enter(|state: &mut DesktopReader, value| {
+                state.search.query = value;
+                state.start_search();
+            })
+            .placeholder("搜索全文…")
+            .text_color(UI_TEXT)
+            .background_color(Color::TRANSPARENT)
+            .border_color(Color::TRANSPARENT)
+            .border_width(0.0)
+            .padding(0.0)
+            .flex(1.0),
+            icon_button(Icon::ArrowRight, busy, DesktopReader::start_search),
+        ))
+        .gap(5.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(40.px())
+    .background_color(UI_SURFACE)
+    .border(UI_BORDER, 1.0)
+    .corner_radius(9.0)
+    .padding(Padding::horizontal(8.0));
+
+    flex_col((
+        input,
+        label(status)
+            .font(UI_FONT_STACK)
+            .text_size(11.0)
+            .color(UI_MUTED),
+        results.flex(1.0),
+    ))
+    .gap(8.px())
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+    .padding(Padding::from_vh(8.0, 4.0))
+}
+
+fn search_result_row(
+    result: BookSearchResult,
+    selected: bool,
+) -> impl WidgetView<DesktopReader> + use<> {
+    let target = result.clone();
+    let section = ellipsize_display_text(&result.section_title, 24);
+    let excerpt = result.excerpt;
+    sized_box(
+        button(
+            flex_col((
+                label(section)
+                    .font(UI_FONT_STACK)
+                    .text_size(11.0)
+                    .weight(FontWeight::BOLD)
+                    .color(if selected { UI_ACCENT } else { UI_MUTED }),
+                prose(excerpt).text_size(12.0).text_color(UI_TEXT_SOFT),
+            ))
+            .gap(4.px())
+            .cross_axis_alignment(CrossAxisAlignment::Start),
+            move |state: &mut DesktopReader| state.go_to_search_result(&target),
+        )
+        .background_color(if selected { UI_ACCENT_SOFT } else { UI_SURFACE })
+        .active_background_color(UI_ACCENT_SOFT)
+        .border_color(if selected {
+            UI_ACCENT_BORDER
+        } else {
+            UI_BORDER
+        })
+        .hovered_border_color(UI_ACCENT_BORDER)
+        .corner_radius(9.0)
+        .padding(Padding::from_vh(9.0, 10.0)),
+    )
+    .expand_width()
+}
+
+fn highlights_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
+    let selected_id = state.selected_highlight_id.clone();
+    let rows = state
+        .highlights
+        .iter()
+        .cloned()
+        .map(|highlight| {
+            let section_index = highlight
+                .ranges
+                .first()
+                .and_then(|range| {
+                    state
+                        .reader
+                        .book()
+                        .sections
+                        .iter()
+                        .position(|section| section.id == range.start.spine)
+                })
+                .unwrap_or(0);
+            let selected = selected_id.as_deref() == Some(&highlight.id);
+            highlight_row_view(highlight, section_index, selected)
+        })
+        .collect::<Vec<_>>();
+    let count = state.highlights.len();
+    let content: Box<AnyWidgetView<DesktopReader>> = if rows.is_empty() {
+        flex_col((
+            icon_label(Icon::Highlighter, 24.0, UI_MUTED),
+            label("还没有高亮")
+                .font(UI_FONT_STACK)
+                .text_size(13.0)
+                .color(UI_MUTED),
+            label("拖选正文后即可添加")
+                .font(UI_FONT_STACK)
+                .text_size(11.5)
+                .color(UI_MUTED),
+        ))
+        .gap(8.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center)
+        .main_axis_alignment(MainAxisAlignment::Center)
+        .boxed()
+    } else {
+        portal(
+            flex_col(rows)
+                .gap(7.px())
+                .cross_axis_alignment(CrossAxisAlignment::Fill),
+        )
+        .boxed()
+    };
+
+    flex_col((
+        flex_row((
+            label("高亮")
+                .font(UI_FONT_STACK)
+                .text_size(13.0)
+                .weight(FontWeight::BOLD)
+                .color(UI_TEXT),
+            FlexSpacer::Flex(1.0),
+            label(format!("{count} 条"))
+                .font(UI_FONT_STACK)
+                .text_size(11.5)
+                .color(UI_MUTED),
+        ))
+        .padding(Padding::from_vh(8.0, 8.0)),
+        content.flex(1.0),
+    ))
+    .gap(2.px())
+    .padding(Padding::from_vh(4.0, 2.0))
+}
+
+fn highlight_row_view(
+    highlight: StoredHighlight,
+    section_index: usize,
+    selected: bool,
+) -> impl WidgetView<DesktopReader> + use<> {
+    let navigate_id = highlight.id.clone();
+    let remove_id = highlight.id;
+    let color = highlight.color;
+    let quote = ellipsize_display_text(&highlight.quote.replace(['\r', '\n'], " "), 76);
+    let background = if selected { UI_ACCENT_SOFT } else { UI_SURFACE };
+    let border = if selected {
+        UI_ACCENT_BORDER
+    } else {
+        UI_BORDER
+    };
+    sized_box(
+        flex_row((
+            sized_box(label(""))
+                .width(4.px())
+                .expand_height()
+                .background_color(highlight_swatch_color(color))
+                .corner_radius(3.0),
+            button(
+                flex_col((
+                    label(format!("第 {} 章", section_index + 1))
+                        .font(UI_FONT_STACK)
+                        .text_size(11.0)
+                        .color(UI_MUTED),
+                    label(quote)
+                        .font(UI_FONT_STACK)
+                        .text_size(12.5)
+                        .line_break_mode(LineBreaking::Clip)
+                        .color(UI_TEXT_SOFT),
+                ))
+                .gap(5.px())
+                .cross_axis_alignment(CrossAxisAlignment::Start),
+                move |state: &mut DesktopReader| state.go_to_highlight(&navigate_id),
+            )
+            .background_color(Color::TRANSPARENT)
+            .active_background_color(UI_SURFACE_MUTED)
+            .border_color(Color::TRANSPARENT)
+            .hovered_border_color(Color::TRANSPARENT)
+            .border_width(0.0)
+            .padding(Padding::from_vh(8.0, 8.0))
+            .flex(1.0),
+            sized_box(
+                button(
+                    icon_label(Icon::Trash2, 14.0, UI_MUTED),
+                    move |state: &mut DesktopReader| state.remove_highlight(&remove_id),
+                )
+                .background_color(Color::TRANSPARENT)
+                .active_background_color(UI_SURFACE_MUTED)
+                .border_color(Color::TRANSPARENT)
+                .hovered_border_color(UI_BORDER)
+                .corner_radius(7.0)
+                .padding(0.0),
+            )
+            .width(28.px())
+            .height(28.px()),
+        ))
+        .gap(5.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center)
+        .padding(Padding::from_vh(5.0, 6.0)),
+    )
+    .height(78.px())
+    .expand_width()
+    .background_color(background)
+    .border(border, 1.0)
+    .corner_radius(10.0)
+}
+
+fn highlight_swatch_color(color: HighlightColor) -> Color {
+    let rgba = color.rgba();
+    Color::from_rgb8(rgba.red, rgba.green, rgba.blue)
 }
 
 fn sidebar_book_metadata(state: &DesktopReader) -> (String, String) {
@@ -1519,10 +2662,337 @@ fn toc_row_view(
     .corner_radius(9.0)
 }
 
+fn assistant_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
+    let content: Box<AnyWidgetView<DesktopReader>> = match state.ui.assistant_panel {
+        Some(AssistantPanel::Chat) => chat_panel(state).boxed(),
+        Some(AssistantPanel::Translation) => translation_panel(state).boxed(),
+        None => sized_box(label("")).width(0.px()).height(0.px()).boxed(),
+    };
+    sized_box(content)
+        .width(ASSISTANT_PANEL_WIDTH.px())
+        .expand_height()
+        .background_color(UI_SIDEBAR)
+        .border(UI_BORDER, 1.0)
+}
+
+fn chat_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
+    let input = state.chat.input.clone();
+    let busy = state.chat.pending.is_some();
+    let mut rows = state
+        .chat
+        .messages
+        .iter()
+        .cloned()
+        .map(|turn| chat_message_row(turn).boxed())
+        .collect::<Vec<_>>();
+    if busy {
+        rows.push(
+            chat_message_row(ChatTurn {
+                role: ChatRole::Assistant,
+                content: "正在阅读和检索书籍…".into(),
+                display_content: None,
+            })
+            .boxed(),
+        );
+    }
+    let conversation: Box<AnyWidgetView<DesktopReader>> = if rows.is_empty() {
+        flex_col((
+            icon_label(Icon::MessageCircle, 28.0, UI_MUTED),
+            label("围绕当前书籍提问")
+                .font(UI_FONT_STACK)
+                .text_size(13.0)
+                .weight(FontWeight::BOLD)
+                .color(UI_TEXT_SOFT),
+            prose("可以总结章节、解释选中的段落，或让 AI 搜索书中的概念。")
+                .text_size(12.0)
+                .text_color(UI_MUTED),
+        ))
+        .gap(8.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center)
+        .main_axis_alignment(MainAxisAlignment::Center)
+        .padding(24.0)
+        .boxed()
+    } else {
+        portal(
+            flex_col(rows)
+                .gap(10.px())
+                .cross_axis_alignment(CrossAxisAlignment::Fill)
+                .padding(12.0),
+        )
+        .boxed()
+    };
+    let error: Box<AnyWidgetView<DesktopReader>> = state.chat.error.as_ref().map_or_else(
+        || sized_box(label("")).width(0.px()).height(0.px()).boxed(),
+        |error| {
+            sized_box(
+                prose(error.clone())
+                    .text_size(11.5)
+                    .text_color(Color::from_rgb8(0xb9, 0x1c, 0x1c)),
+            )
+            .background_color(Color::from_rgb8(0xfe, 0xf2, 0xf2))
+            .border(Color::from_rgb8(0xfe, 0xca, 0xca), 1.0)
+            .corner_radius(8.0)
+            .padding(Padding::from_vh(7.0, 9.0))
+            .boxed()
+        },
+    );
+    let command_menu = chat_command_menu(&input, busy);
+    let composer = chat_composer(input, busy);
+
+    flex_col((
+        assistant_panel_header(Icon::MessageCircle, "AI 对话", true),
+        divider(),
+        conversation.flex(1.0),
+        error,
+        command_menu,
+        composer,
+    ))
+    .gap(8.px())
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+    .padding(Padding::from_vh(6.0, 10.0))
+}
+
+fn chat_command_menu(input: &str, busy: bool) -> Box<AnyWidgetView<DesktopReader>> {
+    let command_suggestions = chat_command_suggestions(input);
+    if command_suggestions.is_empty() || busy {
+        return sized_box(label("")).width(0.px()).height(0.px()).boxed();
+    }
+    let rows = command_suggestions
+        .into_iter()
+        .map(|command| chat_command_suggestion_row(command).boxed())
+        .collect::<Vec<_>>();
+    flex_col(rows)
+        .cross_axis_alignment(CrossAxisAlignment::Fill)
+        .background_color(UI_SURFACE)
+        .border(UI_BORDER, 1.0)
+        .corner_radius(10.0)
+        .padding(4.0)
+        .boxed()
+}
+
+fn chat_composer(input: String, busy: bool) -> impl WidgetView<DesktopReader> + use<> {
+    sized_box(
+        flex_row((
+            text_input(input, |state: &mut DesktopReader, value| {
+                state.chat.input = value;
+            })
+            .on_enter(|state: &mut DesktopReader, value| {
+                state.chat.input = value;
+                state.send_chat();
+            })
+            .placeholder("询问这本书，或输入 / 使用技能…")
+            .text_color(UI_TEXT)
+            .background_color(Color::TRANSPARENT)
+            .border_color(Color::TRANSPARENT)
+            .border_width(0.0)
+            .padding(0.0)
+            .flex(1.0),
+            icon_button(Icon::Send, busy, DesktopReader::send_chat),
+        ))
+        .gap(6.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(44.px())
+    .background_color(UI_SURFACE)
+    .border(UI_BORDER, 1.0)
+    .corner_radius(12.0)
+    .padding(Padding::horizontal(8.0))
+}
+
+fn chat_message_row(turn: ChatTurn) -> impl WidgetView<DesktopReader> + use<> {
+    let (role, background, border, label_color) = match turn.role {
+        ChatRole::User => ("你", UI_ACCENT_SOFT, UI_ACCENT_BORDER, UI_ACCENT),
+        ChatRole::Assistant => ("Rebook AI", UI_SURFACE, UI_BORDER, UI_MUTED),
+    };
+    let content = turn.display_content.unwrap_or(turn.content);
+    sized_box(
+        flex_col((
+            label(role)
+                .font(UI_FONT_STACK)
+                .text_size(10.5)
+                .weight(FontWeight::BOLD)
+                .color(label_color),
+            prose(content).text_size(12.5).text_color(UI_TEXT_SOFT),
+        ))
+        .gap(5.px())
+        .cross_axis_alignment(CrossAxisAlignment::Start),
+    )
+    .expand_width()
+    .background_color(background)
+    .border(border, 1.0)
+    .corner_radius(10.0)
+    .padding(Padding::from_vh(9.0, 10.0))
+}
+
+fn chat_command_suggestion_row(command: ChatCommand) -> impl WidgetView<DesktopReader> + use<> {
+    sized_box(
+        button(
+            flex_row((
+                label(command.name)
+                    .font(UI_FONT_STACK)
+                    .text_size(12.0)
+                    .weight(FontWeight::BOLD)
+                    .color(UI_ACCENT),
+                label(command.description)
+                    .font(UI_FONT_STACK)
+                    .text_size(11.0)
+                    .color(UI_MUTED)
+                    .flex(1.0),
+            ))
+            .gap(9.px())
+            .cross_axis_alignment(CrossAxisAlignment::Center),
+            move |state: &mut DesktopReader| state.select_chat_command(command),
+        )
+        .background_color(Color::TRANSPARENT)
+        .active_background_color(UI_ACCENT_SOFT)
+        .border_color(Color::TRANSPARENT)
+        .hovered_border_color(UI_ACCENT_BORDER)
+        .border_width(1.0)
+        .corner_radius(7.0)
+        .padding(Padding::horizontal(8.0)),
+    )
+    .height(34.px())
+    .expand_width()
+}
+
+fn translation_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
+    let busy = state.translation.pending.is_some();
+    let source_text = state.translation.source_text.clone();
+    let has_source = !source_text.is_empty();
+    let translated_text = state.translation.translated_text.clone();
+    let target_language = state.plugin_settings.target_language.clone();
+    let content: Box<AnyWidgetView<DesktopReader>> = if has_source {
+        portal(
+            flex_col((
+                translation_text_card("原文", source_text, UI_SURFACE_MUTED),
+                translation_text_card(
+                    &format!("译文 · {target_language}"),
+                    if busy {
+                        "正在翻译…".into()
+                    } else if translated_text.is_empty() {
+                        "尚无译文".into()
+                    } else {
+                        translated_text
+                    },
+                    UI_SURFACE,
+                ),
+            ))
+            .gap(10.px())
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .padding(12.0),
+        )
+        .boxed()
+    } else {
+        flex_col((
+            icon_label(Icon::Languages, 28.0, UI_MUTED),
+            label("选择正文后开始翻译")
+                .font(UI_FONT_STACK)
+                .text_size(13.0)
+                .weight(FontWeight::BOLD)
+                .color(UI_TEXT_SOFT),
+            prose("拖选一段文字，然后点击浮动工具栏中的翻译按钮。原文不会被修改。")
+                .text_size(12.0)
+                .text_color(UI_MUTED),
+        ))
+        .gap(8.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center)
+        .main_axis_alignment(MainAxisAlignment::Center)
+        .padding(24.0)
+        .boxed()
+    };
+    let error: Box<AnyWidgetView<DesktopReader>> = state.translation.error.as_ref().map_or_else(
+        || sized_box(label("")).width(0.px()).height(0.px()).boxed(),
+        |error| {
+            sized_box(
+                prose(error.clone())
+                    .text_size(11.5)
+                    .text_color(Color::from_rgb8(0xb9, 0x1c, 0x1c)),
+            )
+            .background_color(Color::from_rgb8(0xfe, 0xf2, 0xf2))
+            .border(Color::from_rgb8(0xfe, 0xca, 0xca), 1.0)
+            .corner_radius(8.0)
+            .padding(Padding::from_vh(7.0, 9.0))
+            .boxed()
+        },
+    );
+    let actions: Box<AnyWidgetView<DesktopReader>> = if has_source {
+        flex_row((
+            secondary_action_button("定位原文", DesktopReader::go_to_translation_source),
+            FlexSpacer::Flex(1.0),
+            secondary_action_button(
+                if busy { "翻译中…" } else { "重新翻译" },
+                DesktopReader::retry_translation,
+            ),
+        ))
+        .gap(8.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center)
+        .boxed()
+    } else {
+        sized_box(label("")).width(0.px()).height(0.px()).boxed()
+    };
+    flex_col((
+        assistant_panel_header(Icon::Languages, "翻译", false),
+        divider(),
+        content.flex(1.0),
+        error,
+        actions,
+    ))
+    .gap(8.px())
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+    .padding(Padding::from_vh(6.0, 10.0))
+}
+
+fn translation_text_card(
+    title: &str,
+    text: String,
+    background: Color,
+) -> impl WidgetView<DesktopReader> + use<> {
+    flex_col((
+        label(title.to_owned())
+            .font(UI_FONT_STACK)
+            .text_size(11.0)
+            .weight(FontWeight::BOLD)
+            .color(UI_MUTED),
+        prose(text).text_size(12.5).text_color(UI_TEXT_SOFT),
+    ))
+    .gap(6.px())
+    .cross_axis_alignment(CrossAxisAlignment::Start)
+    .background_color(background)
+    .border(UI_BORDER, 1.0)
+    .corner_radius(10.0)
+    .padding(Padding::from_vh(10.0, 11.0))
+}
+
+fn assistant_panel_header(
+    icon: Icon,
+    title: &'static str,
+    clearable: bool,
+) -> impl WidgetView<DesktopReader> {
+    let clear: Box<AnyWidgetView<DesktopReader>> = if clearable {
+        icon_button(Icon::Trash2, false, DesktopReader::clear_chat).boxed()
+    } else {
+        sized_box(label("")).width(0.px()).height(0.px()).boxed()
+    };
+    flex_row((
+        icon_label(icon, 16.0, UI_MUTED),
+        label(title)
+            .font(UI_FONT_STACK)
+            .text_size(13.5)
+            .weight(FontWeight::BOLD)
+            .color(UI_TEXT),
+        FlexSpacer::Flex(1.0),
+        clear,
+        icon_button(Icon::X, false, DesktopReader::close_assistant_panel),
+    ))
+    .gap(6.px())
+    .cross_axis_alignment(CrossAxisAlignment::Center)
+}
+
 fn reader_toolbar(
     title: String,
     toc_open: bool,
     menu_open: bool,
+    assistant_panel: Option<AssistantPanel>,
     reader_background: Color,
 ) -> impl WidgetView<DesktopReader> {
     let left: Box<AnyWidgetView<DesktopReader>> = if toc_open {
@@ -1541,6 +3011,21 @@ fn reader_toolbar(
             .weight(FontWeight::BOLD)
             .color(UI_TEXT),
         FlexSpacer::Flex(1.0),
+        icon_button(Icon::Search, false, DesktopReader::open_search),
+        icon_button(
+            Icon::Languages,
+            assistant_panel == Some(AssistantPanel::Translation),
+            |state: &mut DesktopReader| {
+                state.toggle_assistant_panel(AssistantPanel::Translation);
+            },
+        ),
+        icon_button(
+            Icon::MessageCircle,
+            assistant_panel == Some(AssistantPanel::Chat),
+            |state: &mut DesktopReader| {
+                state.toggle_assistant_panel(AssistantPanel::Chat);
+            },
+        ),
         icon_button(Icon::Menu, menu_open, DesktopReader::toggle_menu),
     ))
     .gap(8.px())
@@ -1680,10 +3165,14 @@ fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + u
     let title = match tab {
         SettingsTab::Reading => "阅读",
         SettingsTab::Font => "字体",
+        SettingsTab::Plugins => "插件",
     };
     let body: Box<AnyWidgetView<DesktopReader>> = match tab {
         SettingsTab::Reading => reading_settings_content(spread).boxed(),
         SettingsTab::Font => font_settings_content(font_family, font_size).boxed(),
+        SettingsTab::Plugins => {
+            plugin_settings_content(state.ui.draft_plugin_settings.clone()).boxed()
+        }
     };
 
     flex_row((
@@ -1702,6 +3191,7 @@ fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + u
                 .padding(Padding::from_vh(12.0, 10.0)),
                 settings_tab_button("阅读", SettingsTab::Reading, tab),
                 settings_tab_button("字体", SettingsTab::Font, tab),
+                settings_tab_button("插件", SettingsTab::Plugins, tab),
                 FlexSpacer::Flex(1.0),
             ))
             .gap(4.px())
@@ -1872,6 +3362,159 @@ fn font_settings_content(
     .gap(10.px())
     .cross_axis_alignment(CrossAxisAlignment::Fill)
     .padding(Padding::from_vh(14.0, 20.0))
+}
+
+#[derive(Clone, Copy)]
+enum PluginSettingField {
+    BaseUrl,
+    ApiKey,
+    ChatModel,
+    TranslationModel,
+    TargetLanguage,
+}
+
+fn plugin_settings_content(settings: PluginSettings) -> impl WidgetView<DesktopReader> + use<> {
+    let plugin_cards = BUILTIN_PLUGINS
+        .into_iter()
+        .map(|plugin| {
+            flex_row((
+                icon_label(Icon::Blocks, 15.0, UI_ACCENT),
+                flex_col((
+                    label(plugin.name)
+                        .font(UI_FONT_STACK)
+                        .text_size(12.0)
+                        .weight(FontWeight::BOLD)
+                        .color(UI_TEXT_SOFT),
+                    label(plugin.description)
+                        .font(UI_FONT_STACK)
+                        .text_size(10.5)
+                        .color(UI_MUTED),
+                ))
+                .gap(2.px())
+                .cross_axis_alignment(CrossAxisAlignment::Start)
+                .flex(1.0),
+                value_badge("已启用"),
+            ))
+            .gap(9.px())
+            .cross_axis_alignment(CrossAxisAlignment::Center)
+            .padding(Padding::from_vh(7.0, 10.0))
+        })
+        .collect::<Vec<_>>();
+    portal(
+        flex_col((
+            label("内置插件")
+                .font(UI_FONT_STACK)
+                .text_size(12.0)
+                .weight(FontWeight::BOLD)
+                .color(UI_MUTED),
+            flex_col(plugin_cards)
+                .cross_axis_alignment(CrossAxisAlignment::Fill)
+                .background_color(UI_SURFACE)
+                .border(UI_BORDER, 1.0)
+                .corner_radius(12.0),
+            label("OpenAI 兼容服务")
+                .font(UI_FONT_STACK)
+                .text_size(12.0)
+                .weight(FontWeight::BOLD)
+                .color(UI_MUTED),
+            flex_col((
+                plugin_settings_input_row(
+                    "API 地址",
+                    settings.base_url,
+                    "https://api.openai.com/v1",
+                    PluginSettingField::BaseUrl,
+                ),
+                divider(),
+                plugin_settings_input_row(
+                    "API Key（仅本次会话）",
+                    settings.api_key,
+                    "sk-… 或 REBOOK_AI_API_KEY",
+                    PluginSettingField::ApiKey,
+                ),
+                divider(),
+                plugin_settings_input_row(
+                    "对话模型",
+                    settings.chat_model,
+                    "gpt-4o-mini",
+                    PluginSettingField::ChatModel,
+                ),
+                divider(),
+                plugin_settings_input_row(
+                    "翻译模型",
+                    settings.translation_model,
+                    "gpt-4o-mini",
+                    PluginSettingField::TranslationModel,
+                ),
+                divider(),
+                plugin_settings_input_row(
+                    "目标语言",
+                    settings.target_language,
+                    "简体中文",
+                    PluginSettingField::TargetLanguage,
+                ),
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .background_color(UI_SURFACE)
+            .border(UI_BORDER, 1.0)
+            .corner_radius(12.0),
+            prose("API Key 只保存在当前运行内存中，不会写入 plugins.json；也可以通过 REBOOK_AI_API_KEY 环境变量提供。")
+                .text_size(10.5)
+                .text_color(UI_MUTED),
+        ))
+        .gap(10.px())
+        .cross_axis_alignment(CrossAxisAlignment::Fill)
+        .padding(Padding::from_vh(14.0, 20.0)),
+    )
+}
+
+fn plugin_settings_input_row(
+    label_text: &'static str,
+    value: String,
+    placeholder: &'static str,
+    field: PluginSettingField,
+) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        flex_row((
+            label(label_text)
+                .font(UI_FONT_STACK)
+                .text_size(12.0)
+                .color(UI_TEXT_SOFT),
+            FlexSpacer::Flex(1.0),
+            sized_box(
+                text_input(value, move |state: &mut DesktopReader, value| match field {
+                    PluginSettingField::BaseUrl => {
+                        state.ui.draft_plugin_settings.base_url = value;
+                    }
+                    PluginSettingField::ApiKey => {
+                        state.ui.draft_plugin_settings.api_key = value;
+                    }
+                    PluginSettingField::ChatModel => {
+                        state.ui.draft_plugin_settings.chat_model = value;
+                    }
+                    PluginSettingField::TranslationModel => {
+                        state.ui.draft_plugin_settings.translation_model = value;
+                    }
+                    PluginSettingField::TargetLanguage => {
+                        state.ui.draft_plugin_settings.target_language = value;
+                    }
+                })
+                .placeholder(placeholder)
+                .text_color(UI_TEXT)
+                .background_color(UI_SURFACE_MUTED)
+                .border_color(UI_BORDER)
+                .border_width(1.0)
+                .corner_radius(7.0)
+                .padding(Padding::horizontal(8.0)),
+            )
+            .width(250.px())
+            .height(34.px()),
+        ))
+        .gap(10.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(48.px())
+    .expand_width()
+    .padding(Padding::horizontal(12.0))
 }
 
 fn settings_value_row(name: &'static str, value: &'static str) -> impl WidgetView<DesktopReader> {
@@ -2160,6 +3803,7 @@ mod tests {
         let mut ui = ReaderUiState {
             sidebar_open: false,
             sidebar_pinned: false,
+            sidebar_tab: SidebarTab::Toc,
             toolbar_hovered: false,
             toolbar_hide_at: None,
             overlay: ReaderOverlay::None,
@@ -2167,6 +3811,8 @@ mod tests {
             draft_spread: SpreadMode::Single,
             draft_font_family: ReaderFontFamily::Serif,
             draft_font_size: 16.0,
+            draft_plugin_settings: PluginSettings::default(),
+            assistant_panel: None,
             toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
             sidebar_motion: Motion::settled(0.0),
             menu_motion: Motion::settled(0.0),

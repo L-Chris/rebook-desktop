@@ -13,11 +13,13 @@ image.workspace = true
 kurbo.workspace = true
 lucide-icons.workspace = true
 peniko.workspace = true
+regex.workspace = true
 rebook-formats = { path = "../../crates/formats" }
 rebook-layout = { path = "../../crates/layout" }
 rebook-publication = { path = "../../crates/publication" }
 rebook-reader = { path = "../../crates/reader" }
 rebook-renderer = { path = "../../crates/renderer" }
+reqwest.workspace = true
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true

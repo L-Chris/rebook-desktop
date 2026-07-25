@@ -147,6 +147,12 @@ pub enum PageItem {
 /// A line slice from a shaped paragraph.
 pub struct TextPlacement {
     pub layout: Arc<Layout<TextBrush>>,
+    /// UTF-8 text shaped by Parley. Kept alongside the layout so retained
+    /// renderers can map pointer hit tests back to durable source offsets.
+    pub text: Arc<str>,
+    /// Byte length of synthetic display text (for example a list marker) that
+    /// precedes the authored source text.
+    pub source_text_start: usize,
     pub lines: Range<usize>,
     pub origin_x: f32,
     pub origin_y: f32,
@@ -279,8 +285,8 @@ impl LayoutEngine {
         block: &TextBlock,
         reader_style: ReaderStyle,
         content_width: f32,
-    ) -> Arc<Layout<TextBrush>> {
-        let (text, spans) = flatten_text(block, reader_style.foreground);
+    ) -> PreparedText {
+        let (text, spans, source_text_start) = flatten_text(block, reader_style.foreground);
         let available_width = (content_width - block.style.indent).max(40.0);
         let mut builder =
             self.layout_context
@@ -333,7 +339,11 @@ impl LayoutEngine {
             TextAlignment::Justify => Alignment::Justify,
         };
         layout.align(alignment, AlignmentOptions::default());
-        Arc::new(layout)
+        PreparedText {
+            layout: Arc::new(layout),
+            text: text.into(),
+            source_text_start,
+        }
     }
 }
 
@@ -379,7 +389,13 @@ struct StyledRange {
     style: TextStyle,
 }
 
-fn flatten_text(block: &TextBlock, fallback_color: Rgba) -> (String, Vec<StyledRange>) {
+struct PreparedText {
+    layout: Arc<Layout<TextBrush>>,
+    text: Arc<str>,
+    source_text_start: usize,
+}
+
+fn flatten_text(block: &TextBlock, fallback_color: Rgba) -> (String, Vec<StyledRange>, usize) {
     let mut text = String::new();
     let mut spans = Vec::new();
     let prefix = match block.kind {
@@ -401,6 +417,7 @@ fn flatten_text(block: &TextBlock, fallback_color: Rgba) -> (String, Vec<StyledR
             },
         });
     }
+    let source_text_start = text.len();
 
     for inline in &block.content {
         match inline {
@@ -419,7 +436,7 @@ fn flatten_text(block: &TextBlock, fallback_color: Rgba) -> (String, Vec<StyledR
             Inline::Break => text.push('\n'),
         }
     }
-    (text, spans)
+    (text, spans, source_text_start)
 }
 
 struct Paginator {
@@ -461,20 +478,22 @@ impl Paginator {
         }
     }
 
-    fn push_text(
-        &mut self,
-        prepared: &Arc<Layout<TextBrush>>,
-        block: &TextBlock,
-    ) -> Result<(), LayoutError> {
+    fn push_text(&mut self, prepared: &PreparedText, block: &TextBlock) -> Result<(), LayoutError> {
         self.add_spacing(block.style.margin_before);
         let mut line_start = 0;
-        while line_start < prepared.len() {
-            let first = prepared.get(line_start).ok_or(LayoutError::InvalidLayout)?;
+        while line_start < prepared.layout.len() {
+            let first = prepared
+                .layout
+                .get(line_start)
+                .ok_or(LayoutError::InvalidLayout)?;
             let first_top = first.metrics().block_min_coord;
             let mut line_end = line_start;
             let mut slice_height = 0.0;
-            while line_end < prepared.len() {
-                let line = prepared.get(line_end).ok_or(LayoutError::InvalidLayout)?;
+            while line_end < prepared.layout.len() {
+                let line = prepared
+                    .layout
+                    .get(line_end)
+                    .ok_or(LayoutError::InvalidLayout)?;
                 let candidate_height = line.metrics().block_max_coord - first_top;
                 let remaining = self.bottom - self.cursor_y;
                 if candidate_height > remaining && line_end > line_start {
@@ -491,7 +510,9 @@ impl Paginator {
                 continue;
             }
             self.items.push(PageItem::Text(TextPlacement {
-                layout: Arc::clone(prepared),
+                layout: Arc::clone(&prepared.layout),
+                text: Arc::clone(&prepared.text),
+                source_text_start: prepared.source_text_start,
                 lines: line_start..line_end,
                 origin_x: self.column_left() + block.style.indent,
                 origin_y: self.cursor_y - first_top,
@@ -500,7 +521,7 @@ impl Paginator {
             self.column_has_content = true;
             self.cursor_y += slice_height;
             line_start = line_end;
-            if line_start < prepared.len() {
+            if line_start < prepared.layout.len() {
                 self.advance_column();
             }
         }

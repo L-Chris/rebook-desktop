@@ -8,15 +8,25 @@ use xilem::core::{MessageContext, MessageResult, Mut, View, ViewMarker};
 use xilem::masonry::accesskit::{Node, Role};
 use xilem::masonry::core::keyboard::{Key, KeyState, NamedKey};
 use xilem::masonry::core::{
-    AccessCtx, AccessEvent, BoxConstraints, ChildrenIds, EventCtx, LayoutCtx, PaintCtx,
-    PointerEvent, PointerScrollEvent, PropertiesMut, PropertiesRef, RegisterCtx, ScrollDelta,
-    TextEvent, Widget, WidgetId, WidgetMut,
+    AccessCtx, AccessEvent, BoxConstraints, ChildrenIds, CursorIcon, EventCtx, LayoutCtx, PaintCtx,
+    PointerButton, PointerButtonEvent, PointerEvent, PointerScrollEvent, PointerUpdate,
+    PropertiesMut, PropertiesRef, QueryCtx, RegisterCtx, ScrollDelta, TextEvent, Widget, WidgetId,
+    WidgetMut,
 };
-use xilem::masonry::kurbo::Size;
+use xilem::masonry::kurbo::{Point, Size};
 use xilem::masonry::vello::Scene;
 use xilem::{Pod, ViewCtx};
 
 const TOOLBAR_REVEAL_HEIGHT: f64 = 56.0;
+
+// Masonry exposes pointer positions as f64, while reader hit testing uses f32
+// logical pixels. Window-local coordinates are finite and viewport-bounded.
+#[allow(clippy::cast_possible_truncation)]
+fn pointer_coordinate(value: f64) -> f32 {
+    debug_assert!(value.is_finite());
+    debug_assert!((f64::from(f32::MIN)..=f64::from(f32::MAX)).contains(&value));
+    value as f32
+}
 
 pub fn reader_canvas<State, F, G>(
     scene_revision: u64,
@@ -112,6 +122,9 @@ pub struct ReaderCanvas {
     scene: Arc<Scene>,
     size: Size,
     toolbar_visible: bool,
+    selection_active: bool,
+    selection_start: Point,
+    selection_moved: bool,
 }
 
 impl Default for ReaderCanvas {
@@ -120,6 +133,9 @@ impl Default for ReaderCanvas {
             scene: Arc::new(Scene::new()),
             size: Size::ZERO,
             toolbar_visible: false,
+            selection_active: false,
+            selection_start: Point::ZERO,
+            selection_moved: false,
         }
     }
 }
@@ -144,12 +160,16 @@ impl ReaderCanvas {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ReaderCanvasAction {
     SizeChanged,
     ToolbarVisibility(bool),
     PreviousPage,
     NextPage,
+    SelectionStart { x: f32, y: f32 },
+    SelectionUpdate { x: f32, y: f32 },
+    SelectionFinish { x: f32, y: f32, moved: bool },
+    SelectionCancel,
 }
 
 impl Widget for ReaderCanvas {
@@ -166,18 +186,67 @@ impl Widget for ReaderCanvas {
         event: &PointerEvent,
     ) {
         match event {
-            PointerEvent::Down(_) => ctx.request_focus(),
-            PointerEvent::Move(update) => {
+            PointerEvent::Down(PointerButtonEvent {
+                button: None | Some(PointerButton::Primary),
+                state,
+                ..
+            }) => {
+                ctx.request_focus();
+                ctx.capture_pointer();
+                let position = ctx.local_position(state.position);
+                self.selection_active = true;
+                self.selection_start = position;
+                self.selection_moved = false;
+                ctx.submit_action::<Self::Action>(ReaderCanvasAction::SelectionStart {
+                    x: pointer_coordinate(position.x),
+                    y: pointer_coordinate(position.y),
+                });
+            }
+            PointerEvent::Move(PointerUpdate { current, .. }) => {
                 if !ctx.is_focus_target() {
                     ctx.request_focus();
                 }
-                let position = ctx.local_position(update.current.position);
+                let position = ctx.local_position(current.position);
                 let visible = toolbar_visible_at_y(position.y);
                 if self.toolbar_visible != visible {
                     self.toolbar_visible = visible;
                     ctx.submit_action::<Self::Action>(ReaderCanvasAction::ToolbarVisibility(
                         visible,
                     ));
+                }
+                if self.selection_active && ctx.is_active() {
+                    let distance = position - self.selection_start;
+                    self.selection_moved |= distance.hypot() >= 3.0;
+                    if self.selection_moved {
+                        ctx.submit_action::<Self::Action>(ReaderCanvasAction::SelectionUpdate {
+                            x: pointer_coordinate(position.x),
+                            y: pointer_coordinate(position.y),
+                        });
+                    }
+                }
+            }
+            PointerEvent::Up(PointerButtonEvent {
+                button: None | Some(PointerButton::Primary),
+                state,
+                ..
+            }) => {
+                if self.selection_active {
+                    let position = ctx.local_position(state.position);
+                    ctx.submit_action::<Self::Action>(ReaderCanvasAction::SelectionFinish {
+                        x: pointer_coordinate(position.x),
+                        y: pointer_coordinate(position.y),
+                        moved: self.selection_moved,
+                    });
+                    self.selection_active = false;
+                    self.selection_moved = false;
+                    ctx.release_pointer();
+                }
+            }
+            PointerEvent::Cancel(_) => {
+                if self.selection_active {
+                    self.selection_active = false;
+                    self.selection_moved = false;
+                    ctx.submit_action::<Self::Action>(ReaderCanvasAction::SelectionCancel);
                 }
             }
             PointerEvent::Scroll(PointerScrollEvent { delta, .. }) => {
@@ -242,7 +311,11 @@ impl Widget for ReaderCanvas {
     }
 
     fn accessibility_role(&self) -> Role {
-        Role::Image
+        Role::Document
+    }
+
+    fn get_cursor(&self, _ctx: &QueryCtx<'_>, _pos: Point) -> CursorIcon {
+        CursorIcon::Text
     }
 
     fn accessibility(

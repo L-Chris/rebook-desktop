@@ -12,7 +12,7 @@ use rebook_publication::{
     Block, Book, BookSource, Inline, PublicationError, PublicationUrl, Section, SourceAnchor,
     SourceRange, TextBlock, TextRun, TocEntry,
 };
-use rebook_renderer::{DisplayListCompiler, PageDisplayList};
+use rebook_renderer::{DisplayListCompiler, PageDisplayList, PageTextHit};
 use thiserror::Error;
 
 const PREFETCH_DISTANCE: usize = 2;
@@ -43,6 +43,33 @@ pub struct ReaderPosition {
     pub section_index: usize,
     pub segment_index: usize,
     pub page_index: usize,
+}
+
+/// A pointer-resolved text position tied to the current pagination generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReaderTextHit {
+    position: ReaderPosition,
+    region_index: usize,
+    byte_index: usize,
+}
+
+/// Page-coordinate rectangle used to paint a native selection and anchor its
+/// floating action toolbar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReaderSelectionRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Durable source ranges plus transient geometry for the active native text
+/// selection. Each range belongs to one source-backed text block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReaderSelection {
+    pub ranges: Vec<SourceRange>,
+    pub text: String,
+    pub rects: Vec<ReaderSelectionRect>,
 }
 
 /// One visual reader surface assembled from adjacent logical pages. In double
@@ -502,6 +529,177 @@ impl ReaderSession {
         })
     }
 
+    /// Resolves a canvas point against the currently visible logical pages.
+    /// Exact hits start a selection; nearest hits extend an active drag through
+    /// whitespace in the same page or across a two-page spread.
+    pub fn hit_test_current_spread(
+        &mut self,
+        x: f32,
+        y: f32,
+        exact: bool,
+    ) -> Result<Option<ReaderTextHit>, ReaderError> {
+        let pages = self.current_spread_pages()?;
+        if pages.is_empty() {
+            return Ok(None);
+        }
+        if exact {
+            return Ok(pages.iter().find_map(|(position, page, offset_x)| {
+                page.hit_test_text(x - *offset_x, y, true)
+                    .map(|hit| reader_text_hit(*position, hit))
+            }));
+        }
+        let page_index = usize::from(pages.len() > 1 && x >= pages[1].2);
+        let (position, page, offset_x) = &pages[page_index];
+        Ok(page
+            .hit_test_text(x - *offset_x, y, false)
+            .map(|hit| reader_text_hit(*position, hit)))
+    }
+
+    /// Builds a source-backed selection between two pointer hits. Native
+    /// selections are intentionally bounded to the currently visible spread;
+    /// the returned per-block ranges remain stable after repagination.
+    pub fn selection_between(
+        &mut self,
+        anchor: &ReaderTextHit,
+        focus: &ReaderTextHit,
+    ) -> Result<Option<ReaderSelection>, ReaderError> {
+        let pages = self.current_spread_pages()?;
+        let Some(anchor_page) = pages
+            .iter()
+            .position(|(position, _, _)| *position == anchor.position)
+        else {
+            return Ok(None);
+        };
+        let Some(focus_page) = pages
+            .iter()
+            .position(|(position, _, _)| *position == focus.position)
+        else {
+            return Ok(None);
+        };
+        let anchor_order = (anchor_page, anchor.region_index, anchor.byte_index);
+        let focus_order = (focus_page, focus.region_index, focus.byte_index);
+        let (start, end, start_page, end_page) = if anchor_order <= focus_order {
+            (anchor, focus, anchor_page, focus_page)
+        } else {
+            (focus, anchor, focus_page, anchor_page)
+        };
+
+        let mut ranges = Vec::new();
+        let mut quote = String::new();
+        let mut rects = Vec::new();
+        for (page_index, (_, page, offset_x)) in
+            pages.iter().enumerate().take(end_page + 1).skip(start_page)
+        {
+            let first_region = if page_index == start_page {
+                start.region_index
+            } else {
+                0
+            };
+            let last_region = if page_index == end_page {
+                end.region_index
+            } else {
+                page.text_region_count().saturating_sub(1)
+            };
+            for region_index in first_region..=last_region {
+                let Some(visible) = page.text_region_visible_range(region_index) else {
+                    continue;
+                };
+                let byte_start = if page_index == start_page && region_index == start.region_index {
+                    start.byte_index
+                } else {
+                    visible.start
+                };
+                let byte_end = if page_index == end_page && region_index == end.region_index {
+                    end.byte_index
+                } else {
+                    visible.end
+                };
+                let Some(fragment) = page.selection_fragment(region_index, byte_start..byte_end)
+                else {
+                    continue;
+                };
+                append_selection_quote(&mut quote, &fragment.quote);
+                push_source_range(&mut ranges, fragment.range);
+                rects.extend(fragment.rects.into_iter().map(|rect| ReaderSelectionRect {
+                    x: logical_coordinate(rect.x0) + *offset_x,
+                    y: logical_coordinate(rect.y0),
+                    width: logical_coordinate(rect.width()),
+                    height: logical_coordinate(rect.height()),
+                }));
+            }
+        }
+        if ranges.is_empty() || quote.trim().is_empty() || rects.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ReaderSelection {
+            ranges,
+            text: quote,
+            rects,
+        }))
+    }
+
+    /// Returns whether a canvas point falls inside the resolved geometry for a
+    /// set of durable source ranges on the current spread.
+    pub fn source_ranges_contain_point(
+        &mut self,
+        ranges: &[SourceRange],
+        x: f32,
+        y: f32,
+    ) -> Result<bool, ReaderError> {
+        Ok(self
+            .current_spread_pages()?
+            .iter()
+            .any(|(_, page, offset_x)| page.source_ranges_contain_point(ranges, x - *offset_x, y)))
+    }
+
+    /// Navigates to a durable source anchor, resolving its page again under
+    /// the current viewport and reader style.
+    pub fn go_to_source(&mut self, anchor: &SourceAnchor) -> Result<NavigationResult, ReaderError> {
+        let section_index = self
+            .source
+            .book()
+            .sections
+            .iter()
+            .position(|section| section.id == anchor.spine)
+            .ok_or_else(|| ReaderError::NavigationTargetNotFound(anchor.node.clone()))?;
+        let section = self.repository.load(section_index)?;
+        let fragment_index = section
+            .fragments
+            .iter()
+            .position(|fragment| {
+                fragment.blocks.iter().any(|block| {
+                    block_source(block).is_some_and(|range| source_range_contains(range, anchor))
+                })
+            })
+            .unwrap_or(0);
+        let segment_index = section
+            .segments
+            .iter()
+            .position(|segment| segment.fragment_range.contains(&fragment_index))
+            .unwrap_or(0);
+        let key = SegmentKey {
+            section_index,
+            segment_index,
+        };
+        self.ensure_segment(key)?;
+        let page_index = self
+            .cache
+            .get(&key)
+            .and_then(|segment| {
+                segment
+                    .pages
+                    .iter()
+                    .position(|page| page.contains_source_anchor(anchor))
+            })
+            .unwrap_or(0);
+        self.install_position(ReaderPosition {
+            section_index,
+            segment_index,
+            page_index,
+        });
+        Ok(self.moved())
+    }
+
     /// Resolves a publication URL to its containing spine section.
     pub fn section_index_for_href(&self, href: &PublicationUrl) -> Option<usize> {
         let resource = href.resource_url();
@@ -691,8 +889,75 @@ impl ReaderSession {
         Ok(self.snapshot())
     }
 
+    /// Reparses the publication through its current source layer, invalidates
+    /// every parsed/layout cache, and preserves approximate progress inside the
+    /// active section. This is used by non-persistent document overlays such as
+    /// AI-assisted block rewrites.
+    pub fn refresh_source(&mut self) -> Result<ReaderSnapshot, ReaderError> {
+        let fraction = page_fraction(self.current_page, self.current_page_count());
+        let repository = Arc::new(SectionRepository::new(Arc::clone(&self.source)));
+        let section = repository.load(self.current_section)?;
+        let segment_index = self
+            .current_segment
+            .min(section.segments.len().saturating_sub(1));
+        let key = SegmentKey {
+            section_index: self.current_section,
+            segment_index,
+        };
+        let segment = compile_segment(
+            self.source.as_ref(),
+            section,
+            key,
+            self.viewport,
+            self.style,
+            &mut self.layout_engine,
+            &self.display_compiler,
+        )?;
+        let prefetch_worker =
+            PrefetchWorker::spawn(Arc::clone(&self.source), Arc::clone(&repository))?;
+
+        self.repository = repository;
+        self.prefetch_worker = prefetch_worker;
+        self.prefetch_inflight.clear();
+        self.prefetch_failures.clear();
+        self.cache.clear();
+        self.lru.clear();
+        self.current_segment = segment_index;
+        self.cache.insert(key, Arc::new(segment));
+        self.touch(key);
+        self.current_page = page_for_fraction(fraction, self.current_page_count());
+        Ok(self.snapshot())
+    }
+
     pub fn cached_segment_count(&self) -> usize {
         self.cache.len()
+    }
+
+    fn current_spread_pages(
+        &mut self,
+    ) -> Result<Vec<(ReaderPosition, Arc<PageDisplayList>, f32)>, ReaderError> {
+        self.poll_prefetch()?;
+        let position = self.current_position();
+        let (primary, visible_pages, secondary_offset_x) = self
+            .cache
+            .get(&self.current_key())
+            .and_then(|segment| {
+                segment.pages.get(self.current_page).map(|page| {
+                    (
+                        Arc::clone(page),
+                        segment.visible_pages,
+                        segment.continuation_offset_x,
+                    )
+                })
+            })
+            .ok_or(ReaderError::PageOutOfBounds(position))?;
+        let mut pages = vec![(position, primary, 0.0)];
+        if visible_pages > 1
+            && let Some(position) = self.next_position(position)?
+        {
+            pages.push((position, self.page_at(position)?, secondary_offset_x));
+        }
+        Ok(pages)
     }
 
     fn next_page(&mut self) -> Result<NavigationResult, ReaderError> {
@@ -1326,6 +1591,44 @@ fn source_range_contains(range: &SourceRange, anchor: &SourceAnchor) -> bool {
                 && anchor.text_offset == range.start.text_offset))
 }
 
+fn reader_text_hit(position: ReaderPosition, hit: PageTextHit) -> ReaderTextHit {
+    ReaderTextHit {
+        position,
+        region_index: hit.region_index,
+        byte_index: hit.byte_index,
+    }
+}
+
+fn append_selection_quote(output: &mut String, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    if !output.is_empty()
+        && output
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+        && value.chars().next().is_some_and(char::is_alphanumeric)
+    {
+        output.push(' ');
+    }
+    output.push_str(value);
+}
+
+fn push_source_range(ranges: &mut Vec<SourceRange>, range: SourceRange) {
+    if let Some(previous) = ranges.last_mut()
+        && previous.end.spine == range.start.spine
+        && previous.end.node == range.start.node
+        && previous.end.text_offset >= range.start.text_offset
+    {
+        if range.end.text_offset > previous.end.text_offset {
+            previous.end = range.end;
+        }
+        return;
+    }
+    ranges.push(range);
+}
+
 fn flatten_toc(entries: &[TocEntry]) -> Vec<TocViewItem> {
     fn append(
         entries: &[TocEntry],
@@ -1402,6 +1705,16 @@ fn total_progression(location: ReaderLocation, section_count: usize) -> f64 {
         + to_f64(location.page_index + 1) / page_count)
         / segment_count;
     ((to_f64(location.section_index) + segment_progress) / section_count).clamp(0.0, 1.0)
+}
+
+// Renderer geometry uses f64 (kurbo), while pointer events and the reader's
+// public logical-pixel geometry use f32. Page coordinates are viewport-bounded,
+// so the conversion cannot overflow and only discards unused sub-pixel precision.
+#[allow(clippy::cast_possible_truncation)]
+fn logical_coordinate(value: f64) -> f32 {
+    debug_assert!(value.is_finite());
+    debug_assert!((f64::from(f32::MIN)..=f64::from(f32::MAX)).contains(&value));
+    value as f32
 }
 
 // Page counts are bounded by the pages that fit in memory, so they remain far
@@ -1485,6 +1798,7 @@ mod tests {
             for (index, text) in texts.iter().enumerate() {
                 let id = SpineItemId::new(format!("section-{index}")).unwrap();
                 let href = PublicationUrl::parse(&format!("section-{index}.xhtml")).unwrap();
+                let text_len = u64::try_from(text.chars().count()).unwrap();
                 descriptors.push(SpineItem {
                     id: id.clone(),
                     href: href.clone(),
@@ -1493,7 +1807,7 @@ mod tests {
                     properties: Vec::new(),
                 });
                 sections.push(Section {
-                    id,
+                    id: id.clone(),
                     href,
                     blocks: vec![Block::Text(TextBlock {
                         kind: TextBlockKind::Paragraph,
@@ -1503,7 +1817,18 @@ mod tests {
                             link: None,
                         })],
                         style: BlockStyle::default(),
-                        source: None,
+                        source: Some(SourceRange {
+                            start: SourceAnchor {
+                                spine: id.clone(),
+                                node: "paragraph-0".into(),
+                                text_offset: 0,
+                            },
+                            end: SourceAnchor {
+                                spine: id.clone(),
+                                node: "paragraph-0".into(),
+                                text_offset: text_len,
+                            },
+                        }),
                     })],
                     anchors: Vec::new(),
                 });
@@ -1578,6 +1903,67 @@ mod tests {
         }
         assert!(moved > 2);
         assert_eq!(source.parse_count(0), 1);
+    }
+
+    #[test]
+    fn native_selection_round_trips_to_source_ranges_and_geometry() {
+        let source = CountingSource::new(&["selectable native reader text".into()]);
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        let selected_source = SourceRange {
+            start: SourceAnchor {
+                spine: SpineItemId::new("section-0").unwrap(),
+                node: "paragraph-0".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: SpineItemId::new("section-0").unwrap(),
+                node: "paragraph-0".into(),
+                text_offset: 10,
+            },
+        };
+        let rect = reader
+            .current_page()
+            .source_rects(std::slice::from_ref(&selected_source))[0];
+        let y = logical_coordinate(rect.center().y);
+        let anchor = reader
+            .hit_test_current_spread(logical_coordinate(rect.x0) + 0.1, y, true)
+            .unwrap()
+            .unwrap();
+        let focus = reader
+            .hit_test_current_spread(logical_coordinate(rect.x1) - 0.1, y, true)
+            .unwrap()
+            .unwrap();
+        let selection = reader.selection_between(&anchor, &focus).unwrap().unwrap();
+
+        assert!(!selection.text.trim().is_empty());
+        assert!(!selection.ranges.is_empty());
+        assert!(!selection.rects.is_empty());
+        assert!(
+            reader
+                .source_ranges_contain_point(
+                    &selection.ranges,
+                    selection.rects[0].x + selection.rects[0].width / 2.0,
+                    selection.rects[0].y + selection.rects[0].height / 2.0,
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn durable_source_navigation_resolves_the_page_after_pagination() {
+        let source = CountingSource::new(&["navigation target ".repeat(900)]);
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        let anchor = SourceAnchor {
+            spine: SpineItemId::new("section-0").unwrap(),
+            node: "paragraph-0".into(),
+            text_offset: 8_000,
+        };
+
+        reader.go_to_source(&anchor).unwrap();
+        assert!(reader.location().page_index > 0);
+        assert!(reader.current_page().contains_source_anchor(&anchor));
     }
 
     #[test]
@@ -2145,6 +2531,28 @@ mod tests {
         assert!((new_fraction - old_fraction).abs() <= one_page);
         assert_eq!(reader.style().font_family, ReaderFontFamily::SansSerif);
         assert_eq!(source.parse_count(0), 1);
+        assert_eq!(reader.cached_segment_count(), 1);
+    }
+
+    #[test]
+    fn source_refresh_reparses_and_preserves_approximate_progress() {
+        let source = CountingSource::new(&["派生正文刷新后保持阅读进度。".repeat(600)]);
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+        let old_count = reader.location().page_count;
+        for _ in 0..old_count / 2 {
+            reader.turn_page(PageDirection::Next).unwrap();
+        }
+        let old_fraction = page_fraction(reader.location().page_index, old_count);
+
+        reader.refresh_source().unwrap();
+
+        let location = reader.location();
+        let new_fraction = page_fraction(location.page_index, location.page_count);
+        let one_page = page_fraction(1, location.page_count);
+        assert!((new_fraction - old_fraction).abs() <= one_page);
+        assert_eq!(source.parse_count(0), 2);
         assert_eq!(reader.cached_segment_count(), 1);
     }
 
