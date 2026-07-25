@@ -3035,7 +3035,9 @@ name = "rebook-formats"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "crc32fast",
  "encoding_rs",
+ "flate2",
  "iepub",
  "quick-xml 0.41.0",
  "rebook-html",

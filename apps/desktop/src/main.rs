@@ -549,7 +549,19 @@ impl DesktopReader {
         let mut scene = Scene::new();
         {
             let mut bridge = XilemVelloScene::new(&mut scene);
-            self.reader.current_page().paint(&mut bridge);
+            match self.reader.current_spread() {
+                Ok(spread) => {
+                    spread.primary.paint_background(&mut bridge);
+                    spread.primary.paint_content_at(&mut bridge, 0.0);
+                    if let Some(secondary) = spread.secondary {
+                        secondary.paint_content_at(&mut bridge, spread.secondary_offset_x);
+                    }
+                }
+                Err(error) => {
+                    self.error = Some(format!("组合双页失败：{error}"));
+                    self.reader.current_page().paint(&mut bridge);
+                }
+            }
         }
         let scene = Arc::new(scene);
         self.page_scenes.insert(key, Arc::clone(&scene));

@@ -21,8 +21,10 @@ repository = "https://github.com/L-Chris/rebook-desktop"
 [workspace.dependencies]
 anyrender = "0.11.1"
 base64 = "0.22.1"
+crc32fast = "1.5.0"
 directories = "6.0.0"
 encoding_rs = "0.8.35"
+flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 iepub = { version = "1.3.6", features = ["no_nav"] }
 image = { version = "=0.25.6", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 kurbo = "0.13.1"

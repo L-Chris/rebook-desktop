@@ -55,15 +55,35 @@ impl PageDisplayList {
     ) {
         let scale = Affine::scale(f64::from(scale_factor.max(0.1)))
             * Affine::translate((f64::from(offset_x), f64::from(offset_y)));
+        self.paint_background_with_transform(scene, scale);
+        self.paint_content_with_transform(scene, scale);
+    }
+
+    /// Paints only the page background. Spread composition paints this once,
+    /// then overlays one or two logical page display lists.
+    pub fn paint_background(&self, scene: &mut impl PaintScene) {
+        self.paint_background_with_transform(scene, Affine::IDENTITY);
+    }
+
+    /// Paints retained page content without covering content already composed
+    /// into the same spread.
+    pub fn paint_content_at(&self, scene: &mut impl PaintScene, offset_x: f32) {
+        self.paint_content_with_transform(scene, Affine::translate((f64::from(offset_x), 0.0)));
+    }
+
+    fn paint_background_with_transform(&self, scene: &mut impl PaintScene, transform: Affine) {
         scene.fill(
             Fill::NonZero,
-            scale,
+            transform,
             self.background,
             None,
             &Rect::new(0.0, 0.0, f64::from(self.width), f64::from(self.height)),
         );
+    }
+
+    fn paint_content_with_transform(&self, scene: &mut impl PaintScene, transform: Affine) {
         for command in &self.commands {
-            command.paint(scene, scale);
+            command.paint(scene, transform);
         }
     }
 }

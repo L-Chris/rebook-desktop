@@ -19,7 +19,6 @@ const PREFETCH_DISTANCE: usize = 2;
 const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = PREFETCH_DISTANCE * 2 + 3;
 const FRAGMENT_TEXT_BUDGET: usize = 4_096;
 const FRAGMENT_BLOCK_BUDGET: usize = 64;
-const SEGMENT_FRAGMENT_CAPACITY: usize = 3;
 
 /// Direction requested by keyboard, pointer, or command navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +43,15 @@ pub struct ReaderPosition {
     pub section_index: usize,
     pub segment_index: usize,
     pub page_index: usize,
+}
+
+/// One visual reader surface assembled from adjacent logical pages. In double
+/// mode the secondary page may come from the next layout segment or authored
+/// spine section.
+pub struct ReaderSpread {
+    pub primary: Arc<PageDisplayList>,
+    pub secondary: Option<Arc<PageDisplayList>>,
+    pub secondary_offset_x: f32,
 }
 
 /// Flattened, presentation-ready table-of-contents item.
@@ -81,8 +89,10 @@ pub struct NavigationResult {
 
 struct CachedSegment {
     section: Arc<PreparedSection>,
-    pages: Vec<PageDisplayList>,
+    pages: Vec<Arc<PageDisplayList>>,
     anchor_pages: HashMap<String, usize>,
+    visible_pages: usize,
+    continuation_offset_x: f32,
 }
 
 struct PreparedSection {
@@ -451,11 +461,45 @@ impl ReaderSession {
     /// Panics if the reader's internal invariant is broken and the current
     /// section or page is missing from the cache.
     pub fn current_page(&self) -> &PageDisplayList {
-        &self
-            .cache
+        self.cache
             .get(&self.current_key())
             .expect("current layout segment must remain cached")
             .pages[self.current_page]
+            .as_ref()
+    }
+
+    /// Returns the logical pages visible in the current reader viewport.
+    /// Adjacent content is resolved across layout-segment and spine-section
+    /// boundaries so those implementation boundaries never create a blank
+    /// right page.
+    pub fn current_spread(&mut self) -> Result<ReaderSpread, ReaderError> {
+        self.poll_prefetch()?;
+        let position = self.current_position();
+        let (primary, visible_pages, secondary_offset_x) = self
+            .cache
+            .get(&self.current_key())
+            .and_then(|segment| {
+                segment.pages.get(self.current_page).map(|page| {
+                    (
+                        Arc::clone(page),
+                        segment.visible_pages,
+                        segment.continuation_offset_x,
+                    )
+                })
+            })
+            .ok_or(ReaderError::PageOutOfBounds(position))?;
+        let secondary = if visible_pages > 1 {
+            self.next_position(position)?
+                .map(|position| self.page_at(position))
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(ReaderSpread {
+            primary,
+            secondary,
+            secondary_offset_x,
+        })
     }
 
     /// Resolves a publication URL to its containing spine section.
@@ -652,47 +696,93 @@ impl ReaderSession {
     }
 
     fn next_page(&mut self) -> Result<NavigationResult, ReaderError> {
-        if self.current_page + 1 < self.current_page_count() {
-            self.current_page += 1;
-            return Ok(self.moved());
+        let mut destination = self.current_position();
+        for _ in 0..self.current_visible_pages() {
+            let Some(next) = self.next_position(destination)? else {
+                return Ok(self.boundary());
+            };
+            destination = next;
         }
-        let current_segment_count = self.current_section_data().segments.len();
-        let next = if self.current_segment + 1 < current_segment_count {
+        self.install_position(destination);
+        Ok(self.moved())
+    }
+
+    fn previous_page(&mut self) -> Result<NavigationResult, ReaderError> {
+        let original = self.current_position();
+        let mut destination = original;
+        for _ in 0..self.current_visible_pages() {
+            let Some(previous) = self.previous_position(destination)? else {
+                break;
+            };
+            destination = previous;
+        }
+        if destination == original {
+            return Ok(self.boundary());
+        }
+        self.install_position(destination);
+        Ok(self.moved())
+    }
+
+    fn next_position(
+        &mut self,
+        position: ReaderPosition,
+    ) -> Result<Option<ReaderPosition>, ReaderError> {
+        let key = SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        };
+        self.ensure_segment(key)?;
+        let segment = self
+            .cache
+            .get(&key)
+            .expect("ensured layout segment must remain cached");
+        if position.page_index + 1 < segment.pages.len() {
+            return Ok(Some(ReaderPosition {
+                page_index: position.page_index + 1,
+                ..position
+            }));
+        }
+        let next_key = if position.segment_index + 1 < segment.section.segments.len() {
             SegmentKey {
-                section_index: self.current_section,
-                segment_index: self.current_segment + 1,
+                section_index: position.section_index,
+                segment_index: position.segment_index + 1,
             }
         } else {
-            let section_index = self.current_section + 1;
+            let section_index = position.section_index + 1;
             if section_index >= self.source.book().sections.len() {
-                return Ok(self.boundary());
+                return Ok(None);
             }
             SegmentKey {
                 section_index,
                 segment_index: 0,
             }
         };
-        self.ensure_segment(next)?;
-        self.current_section = next.section_index;
-        self.current_segment = next.segment_index;
-        self.current_page = 0;
-        self.touch(next);
-        Ok(self.moved())
+        self.ensure_segment(next_key)?;
+        Ok(Some(ReaderPosition {
+            section_index: next_key.section_index,
+            segment_index: next_key.segment_index,
+            page_index: 0,
+        }))
     }
 
-    fn previous_page(&mut self) -> Result<NavigationResult, ReaderError> {
-        if self.current_page > 0 {
-            self.current_page -= 1;
-            return Ok(self.moved());
+    fn previous_position(
+        &mut self,
+        position: ReaderPosition,
+    ) -> Result<Option<ReaderPosition>, ReaderError> {
+        if position.page_index > 0 {
+            return Ok(Some(ReaderPosition {
+                page_index: position.page_index - 1,
+                ..position
+            }));
         }
-        let previous = if let Some(segment_index) = self.current_segment.checked_sub(1) {
+        let previous_key = if let Some(segment_index) = position.segment_index.checked_sub(1) {
             SegmentKey {
-                section_index: self.current_section,
+                section_index: position.section_index,
                 segment_index,
             }
         } else {
-            let Some(section_index) = self.current_section.checked_sub(1) else {
-                return Ok(self.boundary());
+            let Some(section_index) = position.section_index.checked_sub(1) else {
+                return Ok(None);
             };
             let section = self.repository.load(section_index)?;
             SegmentKey {
@@ -700,12 +790,51 @@ impl ReaderSession {
                 segment_index: section.segments.len().saturating_sub(1),
             }
         };
-        self.ensure_segment(previous)?;
-        self.current_section = previous.section_index;
-        self.current_segment = previous.segment_index;
-        self.current_page = self.current_page_count().saturating_sub(1);
-        self.touch(previous);
-        Ok(self.moved())
+        self.ensure_segment(previous_key)?;
+        let page_index = self
+            .cache
+            .get(&previous_key)
+            .expect("ensured layout segment must remain cached")
+            .pages
+            .len()
+            .saturating_sub(1);
+        Ok(Some(ReaderPosition {
+            section_index: previous_key.section_index,
+            segment_index: previous_key.segment_index,
+            page_index,
+        }))
+    }
+
+    fn page_at(&self, position: ReaderPosition) -> Result<Arc<PageDisplayList>, ReaderError> {
+        self.cache
+            .get(&SegmentKey {
+                section_index: position.section_index,
+                segment_index: position.segment_index,
+            })
+            .and_then(|segment| segment.pages.get(position.page_index))
+            .cloned()
+            .ok_or(ReaderError::PageOutOfBounds(position))
+    }
+
+    fn current_position(&self) -> ReaderPosition {
+        ReaderPosition {
+            section_index: self.current_section,
+            segment_index: self.current_segment,
+            page_index: self.current_page,
+        }
+    }
+
+    fn current_visible_pages(&self) -> usize {
+        self.cache
+            .get(&self.current_key())
+            .map_or(1, |segment| segment.visible_pages.max(1))
+    }
+
+    fn install_position(&mut self, position: ReaderPosition) {
+        self.current_section = position.section_index;
+        self.current_segment = position.segment_index;
+        self.current_page = position.page_index;
+        self.touch(self.current_key());
     }
 
     fn ensure_segment(&mut self, key: SegmentKey) -> Result<(), ReaderError> {
@@ -914,6 +1043,8 @@ fn compile_segment(
         .map(|fragment| fragment.blocks.as_slice())
         .collect::<Vec<_>>();
     let layout = layout_engine.layout_fragments(source, &fragments, viewport, style)?;
+    let visible_pages = layout.visible_pages;
+    let continuation_offset_x = layout.continuation_offset_x;
     let anchor_pages = section.fragments[segment.fragment_range.clone()]
         .iter()
         .flat_map(|fragment| &fragment.anchors)
@@ -937,12 +1068,14 @@ fn compile_segment(
     let pages = layout
         .pages
         .iter()
-        .map(|page| display_compiler.compile(page))
+        .map(|page| Arc::new(display_compiler.compile(page)))
         .collect();
     Ok(CachedSegment {
         section,
         pages,
         anchor_pages,
+        visible_pages,
+        continuation_offset_x,
     })
 }
 
@@ -997,7 +1130,7 @@ fn prepare_section(section: Section) -> PreparedSection {
             anchors: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let mut anchor_fragments = HashMap::new();
+    let mut anchor_segments = HashMap::new();
     for anchor in anchors {
         let fragment_index = fragments
             .iter()
@@ -1008,20 +1141,17 @@ fn prepare_section(section: Section) -> PreparedSection {
                 })
             })
             .unwrap_or(0);
-        anchor_fragments.insert(anchor.fragment.clone(), fragment_index);
+        anchor_segments.insert(anchor.fragment.clone(), 0);
         fragments[fragment_index].anchors.push(anchor);
     }
 
-    let segments = (0..fragments.len())
-        .step_by(SEGMENT_FRAGMENT_CAPACITY)
-        .map(|start| LayoutSegment {
-            fragment_range: start..(start + SEGMENT_FRAGMENT_CAPACITY).min(fragments.len()),
-        })
-        .collect::<Vec<_>>();
-    let anchor_segments = anchor_fragments
-        .into_iter()
-        .map(|(fragment, fragment_index)| (fragment, fragment_index / SEGMENT_FRAGMENT_CAPACITY))
-        .collect();
+    // An authored spine section must be paginated as one continuous flow.
+    // Splitting its fragments into independently paginated layout segments
+    // turns every internal cache boundary into an implicit page break and can
+    // leave a large unused area at the bottom of the preceding page.
+    let segments = vec![LayoutSegment {
+        fragment_range: 0..fragments.len(),
+    }];
 
     PreparedSection {
         fragments,
@@ -1307,6 +1437,8 @@ pub enum ReaderError {
     SectionOutOfBounds(usize),
     #[error("layout segment {segment} is outside section {section}")]
     SegmentOutOfBounds { section: usize, segment: usize },
+    #[error("logical page is outside the compiled reader cache: {0:?}")]
+    PageOutOfBounds(ReaderPosition),
     #[error("navigation target is not in the reading order: {0}")]
     NavigationTargetNotFound(String),
     #[error(transparent)]
@@ -1496,8 +1628,8 @@ mod tests {
     }
 
     #[test]
-    fn content_fragment_boundaries_do_not_commit_partial_pages_inside_a_segment() {
-        let text_len = FRAGMENT_TEXT_BUDGET + 100;
+    fn content_fragment_boundaries_never_commit_partial_pages() {
+        let text_len = FRAGMENT_TEXT_BUDGET * 3 + 100;
         let source = CountingSource::new(&["a".repeat(text_len)]);
         let mut section = source.sections[0].clone();
         let spine = section.id.clone();
@@ -1527,12 +1659,13 @@ mod tests {
             .layout_fragments(
                 source.as_ref(),
                 &fragments,
-                viewport(600, 20_000),
+                viewport(600, 50_000),
                 ReaderStyle::default(),
             )
             .unwrap();
 
-        assert_eq!(prepared.fragments.len(), 2);
+        assert_eq!(prepared.fragments.len(), 4);
+        assert_eq!(prepared.segments.len(), 1);
         assert_eq!(layout.pages.len(), 1);
         let ranges = layout.pages[0]
             .items
@@ -1551,6 +1684,11 @@ mod tests {
         assert!(ranges.iter().any(|range| {
             range.start.text_offset == u64::try_from(FRAGMENT_TEXT_BUDGET).unwrap()
         }));
+        assert!(
+            ranges
+                .iter()
+                .any(|range| { range.end.text_offset == u64::try_from(text_len).unwrap() })
+        );
     }
 
     #[test]
@@ -1589,21 +1727,22 @@ mod tests {
     }
 
     #[test]
-    fn page_turns_cross_layout_segments_without_reparsing_the_authored_section() {
+    fn page_turns_across_content_fragments_do_not_reparse_the_authored_section() {
         let source = CountingSource::new(&["long text ".repeat(FRAGMENT_TEXT_BUDGET)]);
         let mut reader =
             ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
                 .unwrap();
-        assert!(reader.location().segment_count > 2);
+        assert_eq!(reader.location().segment_count, 1);
+        assert!(reader.location().page_count > 10);
 
-        while reader.location().segment_index == 0 {
+        for _ in 0..10 {
             assert_eq!(
                 reader.turn_page(PageDirection::Next).unwrap().outcome,
                 NavigationOutcome::Moved
             );
         }
-        assert_eq!(reader.location().segment_index, 1);
-        assert_eq!(reader.location().page_index, 0);
+        assert_eq!(reader.location().segment_index, 0);
+        assert_eq!(reader.location().page_index, 10);
         assert_eq!(source.parse_count(0), 1);
 
         assert_eq!(
@@ -1611,11 +1750,34 @@ mod tests {
             NavigationOutcome::Moved
         );
         assert_eq!(reader.location().segment_index, 0);
-        assert_eq!(
-            reader.location().page_index,
-            reader.location().page_count - 1
-        );
+        assert_eq!(reader.location().page_index, 9);
         assert_eq!(source.parse_count(0), 1);
+    }
+
+    #[test]
+    fn double_spread_composes_adjacent_pages_from_one_continuous_section() {
+        let source = CountingSource::new(&["long text ".repeat(FRAGMENT_TEXT_BUDGET)]);
+        let mut reader = ReaderSession::open(
+            source,
+            viewport(1_200, 700),
+            ReaderStyle {
+                spread: rebook_layout::SpreadMode::Double,
+                ..ReaderStyle::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reader.location().segment_count, 1);
+        assert!(reader.current_page_count() > 2);
+        reader.current_page = reader.current_page_count() - 2;
+
+        let next = reader
+            .next_position(reader.current_position())
+            .unwrap()
+            .expect("another logical page should follow");
+        assert_eq!(next.section_index, 0);
+        assert_eq!(next.segment_index, 0);
+        let spread = reader.current_spread().unwrap();
+        assert!(spread.secondary.is_some());
     }
 
     #[test]
@@ -1641,6 +1803,45 @@ mod tests {
         reader.turn_page(PageDirection::Next).unwrap();
         assert_eq!(reader.location().section_index, 2);
         assert_eq!(source.parse_count(2), 1);
+    }
+
+    #[test]
+    fn double_spread_composes_across_section_boundaries_without_repeating_pages() {
+        let source = CountingSource::new(&[
+            "left page".into(),
+            "right page".into(),
+            "next spread".into(),
+        ]);
+        let mut reader = ReaderSession::open(
+            source.clone(),
+            viewport(1_200, 700),
+            ReaderStyle {
+                spread: rebook_layout::SpreadMode::Double,
+                ..ReaderStyle::default()
+            },
+        )
+        .unwrap();
+
+        let spread = reader.current_spread().unwrap();
+        assert!(spread.primary.command_count() > 0);
+        assert!(
+            spread
+                .secondary
+                .as_ref()
+                .is_some_and(|page| page.command_count() > 0)
+        );
+        assert_eq!(source.parse_count(1), 1);
+
+        assert_eq!(
+            reader.turn_page(PageDirection::Next).unwrap().outcome,
+            NavigationOutcome::Moved
+        );
+        assert_eq!(reader.location().section_index, 2);
+        assert_eq!(
+            reader.turn_page(PageDirection::Previous).unwrap().outcome,
+            NavigationOutcome::Moved
+        );
+        assert_eq!(reader.location().section_index, 0);
     }
 
     #[test]
@@ -1700,7 +1901,7 @@ mod tests {
         assert_eq!(reader.section_index_for_href(&target), Some(1));
         let target_location = reader.position_for_href(&target).unwrap();
         assert_eq!(target_location.section_index, 1);
-        assert!(target_location.segment_index > 0);
+        assert_eq!(target_location.segment_index, 0);
         reader.go_to_href(&target).unwrap();
         let resolved_location = reader.position_for_href(&target).unwrap();
 
@@ -1715,11 +1916,11 @@ mod tests {
     }
 
     #[test]
-    fn distant_anchor_navigation_compiles_only_its_bounded_layout_segment() {
+    fn distant_anchor_navigation_resolves_within_continuous_section_layout() {
         let mut source = CountingSource::new(&["placeholder".into()]);
         let source_mut = Arc::get_mut(&mut source).unwrap();
         let spine = source_mut.sections[0].id.clone();
-        let preceding_text_len = FRAGMENT_TEXT_BUDGET * SEGMENT_FRAGMENT_CAPACITY * 2 + 100;
+        let preceding_text_len = FRAGMENT_TEXT_BUDGET * 6 + 100;
         let source_range = |node: &str, length: usize| SourceRange {
             start: SourceAnchor {
                 spine: spine.clone(),
@@ -1736,7 +1937,7 @@ mod tests {
             Block::Text(TextBlock {
                 kind: TextBlockKind::Paragraph,
                 content: vec![Inline::Text(TextRun {
-                    text: "a".repeat(preceding_text_len),
+                    text: "a ".repeat(preceding_text_len / 2),
                     style: TextStyle::default(),
                     link: None,
                 })],
@@ -1762,31 +1963,28 @@ mod tests {
             ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
                 .unwrap();
         let target = PublicationUrl::parse("section-0.xhtml#target").unwrap();
-        assert_eq!(reader.position_for_href(&target).unwrap().segment_index, 2);
+        let target_position = reader.position_for_href(&target).unwrap();
+        assert_eq!(target_position.segment_index, 0);
+        assert!(target_position.page_index > 0);
 
         reader.go_to_href(&target).unwrap();
 
-        assert_eq!(reader.location().segment_index, 2);
+        assert_eq!(reader.location().segment_index, 0);
+        assert_eq!(reader.location().page_index, target_position.page_index);
         assert!(reader.cache.contains_key(&SegmentKey {
             section_index: 0,
             segment_index: 0,
         }));
-        assert!(!reader.cache.contains_key(&SegmentKey {
-            section_index: 0,
-            segment_index: 1,
-        }));
-        assert!(reader.cache.contains_key(&SegmentKey {
-            section_index: 0,
-            segment_index: 2,
-        }));
+        assert_eq!(reader.cache.len(), 1);
         assert_eq!(source.parse_count(0), 1);
     }
 
     #[test]
-    fn toc_and_total_progression_advance_across_segment_boundaries() {
+    fn toc_and_total_progression_advance_across_page_boundaries() {
         let mut source = CountingSource::new(&["placeholder".into()]);
         let source_mut = Arc::get_mut(&mut source).unwrap();
         let spine = source_mut.sections[0].id.clone();
+        let preceding_text_len = FRAGMENT_TEXT_BUDGET * 4 + 100;
         let source_range = |node: &str, length: u64| SourceRange {
             start: SourceAnchor {
                 spine: spine.clone(),
@@ -1803,14 +2001,14 @@ mod tests {
             Block::Text(TextBlock {
                 kind: TextBlockKind::Paragraph,
                 content: vec![Inline::Text(TextRun {
-                    text: "a".repeat(FRAGMENT_TEXT_BUDGET * SEGMENT_FRAGMENT_CAPACITY + 100),
+                    text: "a ".repeat(preceding_text_len / 2),
                     style: TextStyle::default(),
                     link: None,
                 })],
                 style: BlockStyle::default(),
                 source: Some(source_range(
                     "n0",
-                    u64::try_from(FRAGMENT_TEXT_BUDGET * SEGMENT_FRAGMENT_CAPACITY + 100).unwrap(),
+                    u64::try_from(preceding_text_len).unwrap(),
                 )),
             }),
             Block::Text(TextBlock {
@@ -1851,7 +2049,8 @@ mod tests {
             assert!(result.snapshot.total_progression > previous_progress);
             previous_progress = result.snapshot.total_progression;
             if result.snapshot.active_toc_id.as_deref() == Some("1") {
-                assert!(result.snapshot.location.segment_index > 0);
+                assert_eq!(result.snapshot.location.segment_index, 0);
+                assert!(result.snapshot.location.page_index > 0);
                 assert_eq!(source.parse_count(0), 1);
                 return;
             }
@@ -2098,6 +2297,8 @@ mod tests {
                 section,
                 pages: Vec::new(),
                 anchor_pages: HashMap::new(),
+                visible_pages: 1,
+                continuation_offset_x: 0.0,
             })),
         });
 

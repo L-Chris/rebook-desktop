@@ -126,6 +126,8 @@ pub struct TextBrush {
 /// One immutable paginated section.
 pub struct SectionLayout {
     pub pages: Vec<PageLayout>,
+    pub visible_pages: usize,
+    pub continuation_offset_x: f32,
 }
 
 /// Renderer-independent display data for one page.
@@ -237,6 +239,8 @@ impl LayoutEngine {
         let page_height = viewport.height as f32;
         let geometry = resolve_page_geometry(page_width, page_height, reader_style);
         let content_width = geometry.width;
+        let visible_pages = geometry.visible_pages;
+        let continuation_offset_x = geometry.continuation_offset_x;
 
         let mut paginator = Paginator::new(viewport, reader_style.background, geometry);
 
@@ -265,6 +269,8 @@ impl LayoutEngine {
 
         Ok(SectionLayout {
             pages: paginator.finish(),
+            visible_pages,
+            continuation_offset_x,
         })
     }
 
@@ -363,8 +369,8 @@ fn resolve_page_geometry(
         top: vertical_margin,
         width: content_width,
         bottom: content_bottom,
-        column_count,
-        column_gap,
+        visible_pages: column_count,
+        continuation_offset_x: content_width + column_gap,
     }
 }
 
@@ -423,9 +429,6 @@ struct Paginator {
     top: f32,
     width: f32,
     bottom: f32,
-    column_count: usize,
-    column_gap: f32,
-    column_index: usize,
     column_has_content: bool,
     cursor_y: f32,
     pages: Vec<PageLayout>,
@@ -438,8 +441,8 @@ struct PageGeometry {
     top: f32,
     width: f32,
     bottom: f32,
-    column_count: usize,
-    column_gap: f32,
+    visible_pages: usize,
+    continuation_offset_x: f32,
 }
 
 impl Paginator {
@@ -451,9 +454,6 @@ impl Paginator {
             top: geometry.top,
             width: geometry.width,
             bottom: geometry.bottom,
-            column_count: geometry.column_count,
-            column_gap: geometry.column_gap,
-            column_index: 0,
             column_has_content: false,
             cursor_y: geometry.top,
             pages: Vec::new(),
@@ -586,22 +586,11 @@ impl Paginator {
     }
 
     fn column_left(&self) -> f32 {
-        let offset = if self.column_index == 0 {
-            0.0
-        } else {
-            self.width + self.column_gap
-        };
-        self.left + offset
+        self.left
     }
 
     fn advance_column(&mut self) {
-        if self.column_index + 1 < self.column_count {
-            self.column_index += 1;
-            self.column_has_content = false;
-            self.cursor_y = self.top;
-        } else {
-            self.commit_page();
-        }
+        self.commit_page();
     }
 
     fn commit_page(&mut self) {
@@ -614,7 +603,6 @@ impl Paginator {
             background: self.background,
             items: std::mem::take(&mut self.items),
         });
-        self.column_index = 0;
         self.column_has_content = false;
         self.cursor_y = self.top;
     }
@@ -676,7 +664,7 @@ mod tests {
                 ..ReaderStyle::default()
             },
         );
-        assert_eq!(single.column_count, 1);
+        assert_eq!(single.visible_pages, 1);
         assert!((single.width - MAX_COLUMN_WIDTH).abs() < f32::EPSILON);
         assert!((single.left - (viewport_width - MAX_COLUMN_WIDTH) / 2.0).abs() < f32::EPSILON);
 
@@ -689,7 +677,7 @@ mod tests {
             },
         );
         let spread_width = MAX_COLUMN_WIDTH * 2.0 + COLUMN_GAP;
-        assert_eq!(double.column_count, 2);
+        assert_eq!(double.visible_pages, 2);
         assert!((double.width - MAX_COLUMN_WIDTH).abs() < f32::EPSILON);
         assert!((double.left - (viewport_width - spread_width) / 2.0).abs() < f32::EPSILON);
     }
@@ -753,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn double_spread_places_two_columns_in_one_viewport() {
+    fn double_spread_emits_independent_logical_pages_for_composition() {
         let source = EmptySource {
             book: Book {
                 id: PublicationId::new("test").unwrap(),
@@ -780,7 +768,15 @@ mod tests {
         };
         let viewport = LayoutViewport::new(900, 700).unwrap();
         let single = LayoutEngine::new()
-            .layout_section(&source, &section, viewport, ReaderStyle::default())
+            .layout_section(
+                &source,
+                &section,
+                viewport,
+                ReaderStyle {
+                    spread: SpreadMode::Single,
+                    ..ReaderStyle::default()
+                },
+            )
             .unwrap();
         let double = LayoutEngine::new()
             .layout_section(
@@ -794,17 +790,27 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!single.pages.is_empty());
-        let text_origins = double.pages[0]
+        assert_eq!(single.visible_pages, 1);
+        assert_eq!(double.visible_pages, 2);
+        assert!(double.pages.len() >= 2);
+        let first_origin = double.pages[0]
             .items
             .iter()
-            .filter_map(|item| match item {
+            .find_map(|item| match item {
                 PageItem::Text(text) => Some(text.origin_x),
                 _ => None,
             })
-            .collect::<Vec<_>>();
-        assert!(text_origins.iter().any(|origin| *origin < 450.0));
-        assert!(text_origins.iter().any(|origin| *origin > 450.0));
+            .expect("first logical page should contain text");
+        let second_origin = double.pages[1]
+            .items
+            .iter()
+            .find_map(|item| match item {
+                PageItem::Text(text) => Some(text.origin_x),
+                _ => None,
+            })
+            .expect("second logical page should contain text");
+        assert!((first_origin - second_origin).abs() < f32::EPSILON);
+        assert!(double.continuation_offset_x > 0.0);
     }
 
     #[test]
@@ -818,8 +824,8 @@ mod tests {
                 top: 0.0,
                 width: 400.0,
                 bottom: 500.0,
-                column_count: 1,
-                column_gap: 0.0,
+                visible_pages: 1,
+                continuation_offset_x: 0.0,
             },
         );
         paginator.push_image(

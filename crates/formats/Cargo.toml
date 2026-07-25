@@ -7,7 +7,9 @@ license.workspace = true
 
 [dependencies]
 base64.workspace = true
+crc32fast.workspace = true
 encoding_rs.workspace = true
+flate2.workspace = true
 iepub.workspace = true
 quick-xml.workspace = true
 rebook-html = { path = "../html" }

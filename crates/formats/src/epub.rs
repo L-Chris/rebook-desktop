@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 
+use crc32fast::hash as crc32;
+use flate2::read::DeflateDecoder;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use rebook_html::parse_section;
@@ -177,14 +179,61 @@ struct EpubArchive {
 
 #[derive(Debug, Clone)]
 struct ArchiveEntry {
-    index: usize,
+    location: ArchiveLocation,
     size: u64,
     compressed_size: u64,
     stored: bool,
+    crc32: u32,
+    ordinal: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArchiveLocation {
+    ZipIndex(usize),
+    LocalHeader { data_start: usize, method: u16 },
+}
+
+#[derive(Debug, Clone)]
+struct CentralDirectoryEntry {
+    compressed_size: u64,
+    size: u64,
+    crc32: u32,
+    method: u16,
+    encrypted: bool,
+    symbolic_link: bool,
+}
+
+const ZIP_SIGNATURE_SIZE: usize = 4;
+const ZIP_LOCAL_HEADER_SIZE: usize = 30;
+const ZIP_CENTRAL_HEADER_SIZE: usize = 46;
+const ZIP_EOCD_SIZE: usize = 22;
+const ZIP_MAX_COMMENT_SIZE: usize = u16::MAX as usize;
+const ZIP_LOCAL_HEADER_SIGNATURE: [u8; ZIP_SIGNATURE_SIZE] = [0x50, 0x4b, 0x03, 0x04];
+const ZIP_CENTRAL_HEADER_SIGNATURE: [u8; ZIP_SIGNATURE_SIZE] = [0x50, 0x4b, 0x01, 0x02];
+const ZIP_EOCD_SIGNATURE: [u8; ZIP_SIGNATURE_SIZE] = [0x50, 0x4b, 0x05, 0x06];
+const ZIP_METHOD_STORED: u16 = 0;
+const ZIP_METHOD_DEFLATED: u16 = 8;
+
+struct LocalHeader<'a> {
+    name_bytes: &'a [u8],
+    data_start: usize,
+    compressed_size: u64,
+    size: u64,
+    crc32: u32,
+    method: u16,
+    encrypted: bool,
 }
 
 impl EpubArchive {
     fn new(bytes: Arc<[u8]>, limits: EpubLimits) -> Result<Self, EpubError> {
+        match Self::from_zip_archive(Arc::clone(&bytes), limits) {
+            Ok(archive) => Ok(archive),
+            Err(EpubError::Zip(_)) => Self::from_local_headers(bytes, limits),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn from_zip_archive(bytes: Arc<[u8]>, limits: EpubLimits) -> Result<Self, EpubError> {
         let mut archive = ZipArchive::new(Cursor::new(bytes.clone()))?;
         ensure_limit(
             archive.len() <= limits.entries,
@@ -240,16 +289,77 @@ impl EpubArchive {
             )?;
 
             let entry = ArchiveEntry {
-                index,
+                location: ArchiveLocation::ZipIndex(index),
                 size: file.size(),
                 compressed_size: file.compressed_size(),
                 stored: file.compression() == CompressionMethod::Stored,
+                crc32: file.crc32(),
+                ordinal: index,
             };
             if entries.insert(href.path().to_owned(), entry).is_some() {
                 return Err(EpubError::InvalidArchive(format!(
                     "duplicate canonical ZIP entry: {href}"
                 )));
             }
+        }
+        Ok(Self {
+            bytes,
+            entries,
+            limits,
+        })
+    }
+
+    fn from_local_headers(bytes: Arc<[u8]>, limits: EpubLimits) -> Result<Self, EpubError> {
+        let central_entries = parse_central_directory(&bytes);
+        let mut entries = HashMap::new();
+        let mut total_uncompressed = 0_u64;
+        let mut physical_entry_count = 0_usize;
+        let mut scan_start = 0_usize;
+
+        while scan_start + ZIP_LOCAL_HEADER_SIZE <= bytes.len() {
+            let Some(relative_offset) = bytes[scan_start..]
+                .windows(ZIP_SIGNATURE_SIZE)
+                .position(|window| window == ZIP_LOCAL_HEADER_SIGNATURE)
+            else {
+                break;
+            };
+            let header_offset = scan_start + relative_offset;
+            scan_start = header_offset.saturating_add(ZIP_SIGNATURE_SIZE);
+            let Some((path, recovered)) = recover_local_entry(
+                &bytes,
+                header_offset,
+                &central_entries,
+                limits,
+                physical_entry_count,
+            )?
+            else {
+                continue;
+            };
+            total_uncompressed = total_uncompressed
+                .checked_add(recovered.size)
+                .ok_or_else(|| EpubError::ResourceLimit("uncompressed size overflow".into()))?;
+            ensure_limit(
+                total_uncompressed <= limits.total_uncompressed_bytes,
+                format!(
+                    "archive declares {total_uncompressed} uncompressed bytes; total limit is {}",
+                    limits.total_uncompressed_bytes
+                ),
+            )?;
+            physical_entry_count = physical_entry_count.saturating_add(1);
+            ensure_limit(
+                physical_entry_count <= limits.entries,
+                format!(
+                    "archive contains more than {} recoverable entries",
+                    limits.entries
+                ),
+            )?;
+            entries.insert(path, recovered);
+        }
+
+        if entries.is_empty() {
+            return Err(EpubError::InvalidArchive(
+                "archive has no recoverable local file headers".into(),
+            ));
         }
         Ok(Self {
             bytes,
@@ -269,17 +379,62 @@ impl EpubArchive {
         )?;
         ensure_compression_ratio(entry.size, entry.compressed_size, self.limits, href)?;
 
-        let mut archive = ZipArchive::new(Cursor::new(self.bytes.clone()))?;
-        let mut file = archive.by_index(entry.index)?;
-        let capacity = usize::try_from(entry.size).unwrap_or(0);
-        let mut bytes = Vec::with_capacity(capacity);
-        file.by_ref()
-            .take(self.limits.entry_bytes.saturating_add(1))
-            .read_to_end(&mut bytes)?;
+        let bytes = match entry.location {
+            ArchiveLocation::ZipIndex(index) => {
+                let mut archive = ZipArchive::new(Cursor::new(self.bytes.clone()))?;
+                let mut file = archive.by_index(index)?;
+                read_bounded(&mut file, entry.size, self.limits.entry_bytes, href)?
+            }
+            ArchiveLocation::LocalHeader { data_start, method } => {
+                let compressed_size = usize::try_from(entry.compressed_size).map_err(|_| {
+                    EpubError::ResourceLimit(format!(
+                        "compressed resource size cannot be represented: {href}"
+                    ))
+                })?;
+                let data_end = data_start.checked_add(compressed_size).ok_or_else(|| {
+                    EpubError::InvalidArchive(format!(
+                        "compressed resource range overflowed: {href}"
+                    ))
+                })?;
+                let compressed = self.bytes.get(data_start..data_end).ok_or_else(|| {
+                    EpubError::InvalidArchive(format!(
+                        "compressed resource range is outside archive: {href}"
+                    ))
+                })?;
+                if method == ZIP_METHOD_STORED {
+                    read_bounded(
+                        &mut Cursor::new(compressed),
+                        entry.size,
+                        self.limits.entry_bytes,
+                        href,
+                    )?
+                } else {
+                    read_bounded(
+                        &mut DeflateDecoder::new(compressed),
+                        entry.size,
+                        self.limits.entry_bytes,
+                        href,
+                    )?
+                }
+            }
+        };
         ensure_limit(
             u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= self.limits.entry_bytes,
             format!("resource expanded beyond size budget: {href}"),
         )?;
+        ensure_limit(
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX) == entry.size,
+            format!(
+                "resource size disagrees with ZIP metadata for {href}: expected {}, decoded {}",
+                entry.size,
+                bytes.len()
+            ),
+        )?;
+        if crc32(&bytes) != entry.crc32 {
+            return Err(EpubError::InvalidArchive(format!(
+                "resource CRC32 check failed: {href}"
+            )));
+        }
         Ok(bytes)
     }
 
@@ -316,6 +471,236 @@ impl EpubArchive {
     }
 }
 
+fn recover_local_entry(
+    bytes: &[u8],
+    header_offset: usize,
+    central_entries: &HashMap<String, CentralDirectoryEntry>,
+    limits: EpubLimits,
+    ordinal: usize,
+) -> Result<Option<(String, ArchiveEntry)>, EpubError> {
+    let Some(header) = parse_local_header(bytes, header_offset) else {
+        return Ok(None);
+    };
+    let Some(file_name) = decode_zip_name(header.name_bytes) else {
+        return Ok(None);
+    };
+    let central = central_entries.get(&file_name);
+    if (!central_entries.is_empty() && central.is_none()) || file_name.ends_with('/') {
+        return Ok(None);
+    }
+    if header.encrypted || central.is_some_and(|entry| entry.encrypted) {
+        return Err(EpubError::Unsupported(
+            "encrypted ZIP entries are not supported".into(),
+        ));
+    }
+    if central.is_some_and(|entry| entry.symbolic_link) {
+        return Err(EpubError::InvalidArchive(format!(
+            "symbolic-link ZIP entry is not allowed: {file_name}"
+        )));
+    }
+
+    let method = central.map_or(header.method, |entry| entry.method);
+    if method != header.method {
+        return Err(EpubError::InvalidArchive(format!(
+            "ZIP compression method disagrees between headers: {file_name}"
+        )));
+    }
+    if method != ZIP_METHOD_STORED && method != ZIP_METHOD_DEFLATED {
+        return Err(EpubError::Unsupported(format!(
+            "ZIP compression method {method} is not supported"
+        )));
+    }
+    let compressed_size = central
+        .map_or(header.compressed_size, |entry| entry.compressed_size)
+        .max(header.compressed_size);
+    let size = central
+        .map_or(header.size, |entry| entry.size)
+        .max(header.size);
+    let data_end = header
+        .data_start
+        .checked_add(usize::try_from(compressed_size).unwrap_or(usize::MAX));
+    if data_end.is_none_or(|end| end > bytes.len()) {
+        return Ok(None);
+    }
+
+    let href = PublicationUrl::parse(&file_name)?.resource_url();
+    ensure_limit(
+        size <= limits.entry_bytes,
+        format!(
+            "entry {href} declares {size} uncompressed bytes; per-entry limit is {}",
+            limits.entry_bytes
+        ),
+    )?;
+    ensure_compression_ratio(size, compressed_size, limits, &href)?;
+    Ok(Some((
+        href.path().to_owned(),
+        ArchiveEntry {
+            location: ArchiveLocation::LocalHeader {
+                data_start: header.data_start,
+                method,
+            },
+            size,
+            compressed_size,
+            stored: method == ZIP_METHOD_STORED,
+            crc32: central.map_or(header.crc32, |entry| entry.crc32),
+            ordinal,
+        },
+    )))
+}
+
+fn parse_local_header(bytes: &[u8], offset: usize) -> Option<LocalHeader<'_>> {
+    let header = bytes.get(offset..offset.checked_add(ZIP_LOCAL_HEADER_SIZE)?)?;
+    if header.get(..ZIP_SIGNATURE_SIZE)? != ZIP_LOCAL_HEADER_SIGNATURE {
+        return None;
+    }
+    let flags = read_u16(header, 6)?;
+    let method = read_u16(header, 8)?;
+    let crc32 = read_u32(header, 14)?;
+    let compressed_size = u64::from(read_u32(header, 18)?);
+    let size = u64::from(read_u32(header, 22)?);
+    let name_length = usize::from(read_u16(header, 26)?);
+    let extra_length = usize::from(read_u16(header, 28)?);
+    if name_length == 0 || name_length > 1024 {
+        return None;
+    }
+    let name_start = offset.checked_add(ZIP_LOCAL_HEADER_SIZE)?;
+    let name_end = name_start.checked_add(name_length)?;
+    let data_start = name_end.checked_add(extra_length)?;
+    Some(LocalHeader {
+        name_bytes: bytes.get(name_start..name_end)?,
+        data_start,
+        compressed_size,
+        size,
+        crc32,
+        method,
+        encrypted: flags & 1 != 0,
+    })
+}
+
+fn parse_central_directory(bytes: &[u8]) -> HashMap<String, CentralDirectoryEntry> {
+    if bytes.len() < ZIP_EOCD_SIZE {
+        return HashMap::new();
+    }
+    let search_start = bytes
+        .len()
+        .saturating_sub(ZIP_EOCD_SIZE + ZIP_MAX_COMMENT_SIZE);
+    let Some(relative_eocd) = bytes[search_start..]
+        .windows(ZIP_SIGNATURE_SIZE)
+        .rposition(|window| window == ZIP_EOCD_SIGNATURE)
+    else {
+        return HashMap::new();
+    };
+    let eocd_offset = search_start + relative_eocd;
+    let Some(eocd) = bytes.get(eocd_offset..eocd_offset.saturating_add(ZIP_EOCD_SIZE)) else {
+        return HashMap::new();
+    };
+    if read_u16(eocd, 4) != Some(0) || read_u16(eocd, 6) != Some(0) {
+        return HashMap::new();
+    }
+    let Some(entry_count) = read_u16(eocd, 10).map(usize::from) else {
+        return HashMap::new();
+    };
+    let Some(directory_size) = read_u32(eocd, 12).and_then(|value| usize::try_from(value).ok())
+    else {
+        return HashMap::new();
+    };
+    let Some(mut position) = read_u32(eocd, 16).and_then(|value| usize::try_from(value).ok())
+    else {
+        return HashMap::new();
+    };
+    if position
+        .checked_add(directory_size)
+        .is_none_or(|end| end > bytes.len())
+    {
+        return HashMap::new();
+    }
+
+    let mut entries = HashMap::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let Some(header) = bytes.get(position..position.saturating_add(ZIP_CENTRAL_HEADER_SIZE))
+        else {
+            return HashMap::new();
+        };
+        if header.get(..ZIP_SIGNATURE_SIZE) != Some(ZIP_CENTRAL_HEADER_SIGNATURE.as_slice()) {
+            return HashMap::new();
+        }
+        let Some(name_length) = read_u16(header, 28).map(usize::from) else {
+            return HashMap::new();
+        };
+        let Some(extra_length) = read_u16(header, 30).map(usize::from) else {
+            return HashMap::new();
+        };
+        let Some(comment_length) = read_u16(header, 32).map(usize::from) else {
+            return HashMap::new();
+        };
+        let Some(name_start) = position.checked_add(ZIP_CENTRAL_HEADER_SIZE) else {
+            return HashMap::new();
+        };
+        let Some(name_end) = name_start.checked_add(name_length) else {
+            return HashMap::new();
+        };
+        let Some(entry_end) = name_end
+            .checked_add(extra_length)
+            .and_then(|value| value.checked_add(comment_length))
+        else {
+            return HashMap::new();
+        };
+        let Some(name) = bytes.get(name_start..name_end).and_then(decode_zip_name) else {
+            return HashMap::new();
+        };
+        let flags = read_u16(header, 8).unwrap_or_default();
+        let external_attributes = read_u32(header, 38).unwrap_or_default();
+        let host_system = header.get(5).copied().unwrap_or_default();
+        let unix_mode = external_attributes >> 16;
+        entries.insert(
+            name,
+            CentralDirectoryEntry {
+                compressed_size: u64::from(read_u32(header, 20).unwrap_or_default()),
+                size: u64::from(read_u32(header, 24).unwrap_or_default()),
+                crc32: read_u32(header, 16).unwrap_or_default(),
+                method: read_u16(header, 10).unwrap_or_default(),
+                encrypted: flags & 1 != 0,
+                symbolic_link: host_system == 3 && unix_mode & 0o170_000 == 0o120_000,
+            },
+        );
+        position = entry_end;
+    }
+    entries
+}
+
+fn decode_zip_name(bytes: &[u8]) -> Option<String> {
+    let name = std::str::from_utf8(bytes).ok()?;
+    (!name.contains('\0')).then(|| name.to_owned())
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let value: [u8; 2] = bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?;
+    Some(u16::from_le_bytes(value))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(value))
+}
+
+fn read_bounded(
+    reader: &mut impl Read,
+    expected_size: u64,
+    limit: u64,
+    href: &PublicationUrl,
+) -> Result<Vec<u8>, EpubError> {
+    let capacity = usize::try_from(expected_size).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    ensure_limit(
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= limit,
+        format!("resource expanded beyond size budget: {href}"),
+    )?;
+    Ok(bytes)
+}
+
 #[derive(Debug)]
 struct PackageModel {
     metadata: Metadata,
@@ -348,7 +733,7 @@ fn validate_mimetype(archive: &EpubArchive, strict: bool) -> Result<(), EpubErro
     };
     let bytes = archive.read(&href)?;
     let valid_value = bytes == b"application/epub+zip";
-    if !valid_value || !entry.stored || entry.index != 0 {
+    if !valid_value || !entry.stored || entry.ordinal != 0 {
         return container_issue(
             strict,
             "mimetype must be the first, stored entry and contain application/epub+zip",
@@ -934,7 +1319,10 @@ mod tests {
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
-    use super::{EpubError, EpubLimits, EpubOpenOptions, EpubPublication};
+    use super::{
+        EpubError, EpubLimits, EpubOpenOptions, EpubPublication, ZIP_CENTRAL_HEADER_SIGNATURE,
+        ZIP_CENTRAL_HEADER_SIZE, ZIP_SIGNATURE_SIZE, read_u16,
+    };
 
     #[test]
     fn opens_epub3_navigation_and_lazy_resources() {
@@ -971,6 +1359,28 @@ mod tests {
         let bytes = zip_entries(&[("../evil", b"escape", CompressionMethod::Stored)]);
         let error = EpubPublication::open_bytes(bytes).expect_err("unsafe path must fail");
         assert!(matches!(error, EpubError::Publication(_)));
+    }
+
+    #[test]
+    fn recovers_resources_from_real_local_headers_when_central_offsets_are_wrong() {
+        let mut bytes = minimal_epub();
+        corrupt_central_offset(&mut bytes, "OPS/Text/chapter.xhtml");
+
+        let publication = EpubPublication::open_bytes(bytes)
+            .expect("local-header recovery should open the publication");
+        let chapter = PublicationUrl::parse("OPS/Text/chapter.xhtml").expect("chapter URL");
+        let resource = publication
+            .resource(&chapter)
+            .expect("chapter should be recovered by name");
+
+        assert!(!resource.bytes.is_empty());
+        assert!(
+            !publication
+                .parse_section(0)
+                .expect("recovered chapter should parse")
+                .blocks
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1193,5 +1603,26 @@ mod tests {
             writer.write_all(bytes).expect("write entry");
         }
         writer.finish().expect("finish ZIP").into_inner()
+    }
+
+    fn corrupt_central_offset(bytes: &mut [u8], target: &str) {
+        for position in 0..bytes.len().saturating_sub(ZIP_CENTRAL_HEADER_SIZE) {
+            if bytes[position..position + ZIP_SIGNATURE_SIZE] != ZIP_CENTRAL_HEADER_SIGNATURE {
+                continue;
+            }
+            let Some(name_length) = read_u16(bytes, position + 28).map(usize::from) else {
+                continue;
+            };
+            let name_start = position + ZIP_CENTRAL_HEADER_SIZE;
+            let Some(name_end) = name_start.checked_add(name_length) else {
+                continue;
+            };
+            if bytes.get(name_start..name_end) != Some(target.as_bytes()) {
+                continue;
+            }
+            bytes[position + 42..position + 46].copy_from_slice(&123_u32.to_le_bytes());
+            return;
+        }
+        panic!("central directory entry not found: {target}");
     }
 }
