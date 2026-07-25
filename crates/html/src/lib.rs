@@ -1,20 +1,29 @@
-use std::collections::HashMap;
+//! Shared HTML/CSS to format-neutral reading IR parser.
+
+use std::collections::{HashMap, HashSet};
 
 use rebook_publication::{
     Block, BlockStyle, ImageBlock, ImageLength, ImageStyle, Inline, PublicationUrl, Rgba, Section,
-    SourceAnchor, SourceRange, SpineItem, SpineItemId, TextAlignment, TextBlock, TextBlockKind,
-    TextRun, TextStyle,
+    SectionAnchor, SourceAnchor, SourceRange, SpineItem, SpineItemId, TextAlignment, TextBlock,
+    TextBlockKind, TextRun, TextStyle,
 };
 use roxmltree::{Document, Node};
+use thiserror::Error;
 
-use super::{EpubError, attribute_local};
+#[derive(Debug, Error)]
+pub enum HtmlError {
+    #[error("invalid HTML in {resource}: {message}")]
+    InvalidDocument { resource: String, message: String },
+    #[error(transparent)]
+    Publication(#[from] rebook_publication::PublicationError),
+}
 
-pub(super) fn parse_section(
+pub fn parse_section(
     xml: &str,
     descriptor: &SpineItem,
-    mut load_stylesheet: impl FnMut(&PublicationUrl) -> Result<String, EpubError>,
-) -> Result<Section, EpubError> {
-    let document = Document::parse(xml).map_err(|error| EpubError::InvalidXml {
+    mut load_stylesheet: impl FnMut(&PublicationUrl) -> Option<String>,
+) -> Result<Section, HtmlError> {
+    let document = Document::parse(xml).map_err(|error| HtmlError::InvalidDocument {
         resource: descriptor.href.to_string(),
         message: error.to_string(),
     })?;
@@ -24,6 +33,7 @@ pub(super) fn parse_section(
         .find(|node| node.is_element() && node.tag_name().name() == "body")
         .unwrap_or_else(|| document.root_element());
     let mut parser = ReadingIrParser::new(descriptor.id.clone(), descriptor.href.clone(), styles);
+    parser.queue_node_anchors(root);
     parser.parse_children(root)?;
 
     if parser.blocks.is_empty() {
@@ -35,6 +45,7 @@ pub(super) fn parse_section(
         id: descriptor.id.clone(),
         href: descriptor.href.clone(),
         blocks: parser.blocks,
+        anchors: parser.anchors,
     })
 }
 
@@ -43,6 +54,9 @@ struct ReadingIrParser {
     section_href: PublicationUrl,
     next_node: u64,
     blocks: Vec<Block>,
+    anchors: Vec<SectionAnchor>,
+    pending_anchors: Vec<String>,
+    seen_anchors: HashSet<String>,
     styles: StyleSheet,
 }
 
@@ -53,16 +67,23 @@ impl ReadingIrParser {
             section_href,
             next_node: 0,
             blocks: Vec::new(),
+            anchors: Vec::new(),
+            pending_anchors: Vec::new(),
+            seen_anchors: HashSet::new(),
             styles,
         }
     }
 
-    fn parse_children(&mut self, parent: Node<'_, '_>) -> Result<(), EpubError> {
+    fn parse_children(&mut self, parent: Node<'_, '_>) -> Result<(), HtmlError> {
         for node in parent.children() {
             if !node.is_element() {
                 continue;
             }
             let name = node.tag_name().name().to_ascii_lowercase();
+            if matches!(name.as_str(), "script" | "style" | "head" | "nav") {
+                continue;
+            }
+            self.queue_node_anchors(node);
             match name.as_str() {
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                     let level = name[1..].parse::<u8>().unwrap_or(1);
@@ -104,19 +125,19 @@ impl ReadingIrParser {
                 "img" | "image" => self.push_image(node)?,
                 "hr" => self.blocks.push(Block::Separator),
                 "br" => self.blocks.push(Block::PageBreak),
-                "script" | "style" | "head" | "nav" => {}
                 _ => self.parse_children(node)?,
             }
         }
         Ok(())
     }
 
-    fn parse_list(&mut self, list: Node<'_, '_>, ordered: bool) -> Result<(), EpubError> {
+    fn parse_list(&mut self, list: Node<'_, '_>, ordered: bool) -> Result<(), HtmlError> {
         let mut ordinal = 1_u32;
         for item in list
             .children()
             .filter(|node| node.is_element() && node.tag_name().name().eq_ignore_ascii_case("li"))
         {
+            self.queue_node_anchors(item);
             let mut style = self.styles.block_style(item, BlockStyle::default());
             style.indent += 24.0;
             self.push_text_block(item, TextBlockKind::ListItem { ordered, ordinal }, style)?;
@@ -130,8 +151,9 @@ impl ReadingIrParser {
         node: Node<'_, '_>,
         kind: TextBlockKind,
         style: BlockStyle,
-    ) -> Result<(), EpubError> {
+    ) -> Result<(), HtmlError> {
         let node_id = self.allocate_node();
+        self.queue_descendant_anchors(node);
         let mut collector = InlineCollector::new(matches!(kind, TextBlockKind::Preformatted));
         collect_inline(
             node,
@@ -151,11 +173,13 @@ impl ReadingIrParser {
             })
             .sum();
         if text_len > 0 {
+            let source = self.source_range(&node_id, text_len);
+            self.bind_pending_anchors(&source.start);
             self.blocks.push(Block::Text(TextBlock {
                 kind,
                 content: collector.content,
                 style,
-                source: Some(self.source_range(&node_id, text_len)),
+                source: Some(source),
             }));
         }
 
@@ -172,7 +196,7 @@ impl ReadingIrParser {
         Ok(())
     }
 
-    fn push_image(&mut self, node: Node<'_, '_>) -> Result<(), EpubError> {
+    fn push_image(&mut self, node: Node<'_, '_>) -> Result<(), HtmlError> {
         let Some(src) = attribute_local(node, "src")
             .or_else(|| attribute_local(node, "href"))
             .filter(|value| !value.trim().is_empty())
@@ -181,13 +205,45 @@ impl ReadingIrParser {
         };
         let href = self.section_href.resolve(src)?.resource_url();
         let node_id = self.allocate_node();
+        let source = self.source_range(&node_id, 0);
+        self.bind_pending_anchors(&source.start);
         self.blocks.push(Block::Image(ImageBlock {
             href,
             alt: attribute_local(node, "alt").unwrap_or_default().to_owned(),
             style: self.styles.image_style(node),
-            source: Some(self.source_range(&node_id, 0)),
+            source: Some(source),
         }));
         Ok(())
+    }
+
+    fn queue_descendant_anchors(&mut self, node: Node<'_, '_>) {
+        for descendant in node.descendants().skip(1).filter(Node::is_element) {
+            self.queue_node_anchors(descendant);
+        }
+    }
+
+    fn queue_node_anchors(&mut self, node: Node<'_, '_>) {
+        for fragment in [attribute_local(node, "id"), attribute_local(node, "name")]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|fragment| !fragment.is_empty())
+        {
+            if self.seen_anchors.insert(fragment.to_owned()) {
+                self.pending_anchors.push(fragment.to_owned());
+            }
+        }
+    }
+
+    fn bind_pending_anchors(&mut self, source: &SourceAnchor) {
+        self.anchors.extend(
+            self.pending_anchors
+                .drain(..)
+                .map(|fragment| SectionAnchor {
+                    fragment,
+                    source: source.clone(),
+                }),
+        );
     }
 
     fn allocate_node(&mut self) -> String {
@@ -352,7 +408,7 @@ impl StyleSheet {
     fn from_document(
         document: &Document<'_>,
         base: &PublicationUrl,
-        load_stylesheet: &mut impl FnMut(&PublicationUrl) -> Result<String, EpubError>,
+        load_stylesheet: &mut impl FnMut(&PublicationUrl) -> Option<String>,
     ) -> Self {
         let mut sheet = Self::default();
         for node in document.descendants().filter(Node::is_element) {
@@ -377,7 +433,7 @@ impl StyleSheet {
                     let Ok(href) = base.resolve(href).map(|url| url.resource_url()) else {
                         continue;
                     };
-                    if let Ok(css) = load_stylesheet(&href) {
+                    if let Some(css) = load_stylesheet(&href) {
                         sheet.add_css(&css);
                     }
                 }
@@ -826,6 +882,12 @@ fn image_length(value: &str) -> Option<ImageLength> {
         .then_some(ImageLength::Pixels(pixels.max(0.0)))
 }
 
+fn attribute_local<'a>(node: Node<'a, '_>, name: &str) -> Option<&'a str> {
+    node.attributes()
+        .find(|attribute| attribute.name().eq_ignore_ascii_case(name))
+        .map(|attribute| attribute.value())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,7 +923,7 @@ mod tests {
         let section = parse_section(xml, &descriptor, |href| {
             loaded = true;
             assert_eq!(href.path(), "OPS/styles/book.css");
-            Ok(css.into())
+            Some(css.into())
         })
         .unwrap();
 
@@ -916,6 +978,33 @@ mod tests {
         assert_eq!(image.href.path(), "OPS/images/cover.jpeg");
         assert_eq!(image.style.width, Some(ImageLength::Pixels(622.0)));
         assert_eq!(image.style.height, Some(ImageLength::Pixels(910.0)));
+    }
+
+    #[test]
+    fn preserves_block_container_and_empty_element_fragment_anchors() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <a id="before-heading"></a>
+            <div id="chapter-start"><h2 id="heading">Heading</h2></div>
+            <p>Text <span id="inside-paragraph">target</span></p>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let anchors = section
+            .anchors
+            .iter()
+            .map(|anchor| (anchor.fragment.as_str(), anchor.source.node.as_str()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(anchors.get("before-heading"), Some(&"n0"));
+        assert_eq!(anchors.get("chapter-start"), Some(&"n0"));
+        assert_eq!(anchors.get("heading"), Some(&"n0"));
+        assert_eq!(anchors.get("inside-paragraph"), Some(&"n1"));
     }
 
     fn assert_close(actual: f32, expected: f32) {

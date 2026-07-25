@@ -1,21 +1,27 @@
-//! Inspect an EPUB without invoking a browser or renderer.
+//! Inspect an e-book without invoking a browser or renderer.
 
 use std::env;
 use std::process::ExitCode;
 
-use rebook_epub::EpubPublication;
-use rebook_publication::BookSource;
+use rebook_formats::open_file;
 use serde::Serialize;
 
 #[derive(Serialize)]
 struct Inspection<'a> {
+    format: String,
     id: String,
     metadata: &'a rebook_publication::Metadata,
     cover: Option<&'a rebook_publication::PublicationUrl>,
-    manifest: &'a [rebook_publication::Link],
     reading_order: &'a [rebook_publication::SpineItem],
     table_of_contents: &'a [rebook_publication::TocEntry],
-    diagnostics: &'a [rebook_epub::Diagnostic],
+    parsed_sections: Vec<SectionInspection>,
+}
+
+#[derive(Serialize)]
+struct SectionInspection {
+    index: usize,
+    block_count: usize,
+    anchor_count: usize,
 }
 
 fn main() -> ExitCode {
@@ -25,11 +31,11 @@ fn main() -> ExitCode {
         .and_then(|value| value.into_string().ok())
         .unwrap_or_else(|| "rebook-inspect".into());
     let Some(path) = arguments.next() else {
-        eprintln!("usage: {executable} <book.epub>");
+        eprintln!("usage: {executable} <book>");
         return ExitCode::from(2);
     };
     if arguments.next().is_some() {
-        eprintln!("usage: {executable} <book.epub>");
+        eprintln!("usage: {executable} <book>");
         return ExitCode::from(2);
     }
 
@@ -39,22 +45,34 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("failed to inspect EPUB: {error}");
+            eprintln!("failed to inspect e-book: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
 fn inspect(path: std::ffi::OsString) -> Result<String, Box<dyn std::error::Error>> {
-    let publication = EpubPublication::open_file(path)?;
+    let opened = open_file(std::path::PathBuf::from(path))?;
+    let source = opened.source();
+    let publication = source.book();
+    let parsed_sections = (0..publication.sections.len())
+        .map(|index| {
+            let section = source.parse_section(index)?;
+            Ok(SectionInspection {
+                index,
+                block_count: section.blocks.len(),
+                anchor_count: section.anchors.len(),
+            })
+        })
+        .collect::<Result<Vec<_>, rebook_publication::PublicationError>>()?;
     let inspection = Inspection {
-        id: publication.book().id.to_string(),
-        metadata: &publication.book().metadata,
-        cover: publication.book().cover.as_ref(),
-        manifest: publication.manifest(),
-        reading_order: &publication.book().sections,
-        table_of_contents: &publication.book().table_of_contents,
-        diagnostics: publication.diagnostics(),
+        format: opened.format().label().to_owned(),
+        id: publication.id.to_string(),
+        metadata: &publication.metadata,
+        cover: publication.cover.as_ref(),
+        reading_order: &publication.sections,
+        table_of_contents: &publication.table_of_contents,
+        parsed_sections,
     };
     serde_json::to_string_pretty(&inspection).map_err(Into::into)
 }

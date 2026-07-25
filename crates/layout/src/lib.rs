@@ -196,14 +196,40 @@ impl LayoutEngine {
         }
     }
 
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "reader viewport dimensions are bounded far below f32's exact integer range"
-    )]
     pub fn layout_section(
         &mut self,
         source: &dyn BookSource,
         section: &Section,
+        viewport: LayoutViewport,
+        reader_style: ReaderStyle,
+    ) -> Result<SectionLayout, LayoutError> {
+        self.layout_blocks(source, &section.blocks, viewport, reader_style)
+    }
+
+    /// Lays out one viewport-independent slice of a reflowable section. The
+    /// reader uses this entry point for bounded fragment compilation without
+    /// manufacturing synthetic authored sections.
+    pub fn layout_blocks(
+        &mut self,
+        source: &dyn BookSource,
+        blocks: &[Block],
+        viewport: LayoutViewport,
+        reader_style: ReaderStyle,
+    ) -> Result<SectionLayout, LayoutError> {
+        self.layout_fragments(source, &[blocks], viewport, reader_style)
+    }
+
+    /// Continuously paginates several stable content fragments as one bounded
+    /// layout segment. Fragment boundaries do not commit the partial page; the
+    /// caller controls random-access cost by choosing the segment size.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "reader viewport dimensions are bounded far below f32's exact integer range"
+    )]
+    pub fn layout_fragments(
+        &mut self,
+        source: &dyn BookSource,
+        fragments: &[&[Block]],
         viewport: LayoutViewport,
         reader_style: ReaderStyle,
     ) -> Result<SectionLayout, LayoutError> {
@@ -214,24 +240,26 @@ impl LayoutEngine {
 
         let mut paginator = Paginator::new(viewport, reader_style.background, geometry);
 
-        for block in &section.blocks {
-            match block {
-                Block::Text(block) => {
-                    let prepared = self.shape_text(block, reader_style, content_width);
-                    paginator.push_text(&prepared, block)?;
+        for blocks in fragments {
+            for block in *blocks {
+                match block {
+                    Block::Text(block) => {
+                        let prepared = self.shape_text(block, reader_style, content_width);
+                        paginator.push_text(&prepared, block)?;
+                    }
+                    Block::Image(image) => {
+                        let resource = source.resource(&image.href)?;
+                        let decoded = image::load_from_memory(&resource.bytes)?.to_rgba8();
+                        let raster = RasterImage {
+                            width: decoded.width(),
+                            height: decoded.height(),
+                            pixels: decoded.into_raw().into(),
+                        };
+                        paginator.push_image(raster, image.style, image.source.clone());
+                    }
+                    Block::Separator => paginator.push_separator(),
+                    Block::PageBreak => paginator.force_page(),
                 }
-                Block::Image(image) => {
-                    let resource = source.resource(&image.href)?;
-                    let decoded = image::load_from_memory(&resource.bytes)?.to_rgba8();
-                    let raster = RasterImage {
-                        width: decoded.width(),
-                        height: decoded.height(),
-                        pixels: decoded.into_raw().into(),
-                    };
-                    paginator.push_image(raster, image.style, image.source.clone());
-                }
-                Block::Separator => paginator.push_separator(),
-                Block::PageBreak => paginator.force_page(),
             }
         }
 
@@ -711,6 +739,7 @@ mod tests {
                 style: rebook_publication::BlockStyle::default(),
                 source: None,
             })],
+            anchors: Vec::new(),
         };
         let layout = LayoutEngine::new()
             .layout_section(
@@ -747,6 +776,7 @@ mod tests {
                 style: rebook_publication::BlockStyle::default(),
                 source: None,
             })],
+            anchors: Vec::new(),
         };
         let viewport = LayoutViewport::new(900, 700).unwrap();
         let single = LayoutEngine::new()

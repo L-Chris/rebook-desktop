@@ -257,6 +257,18 @@ pub struct Section {
     pub href: PublicationUrl,
     /// Semantic reading blocks in source order.
     pub blocks: Vec<Block>,
+    /// Authored fragment identifiers resolved to stable Reading IR positions.
+    #[serde(default)]
+    pub anchors: Vec<SectionAnchor>,
+}
+
+/// One authored HTML/XML fragment identifier and its normalized source position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SectionAnchor {
+    /// Decoded value of the source element's `id` or legacy `name` attribute.
+    pub fragment: String,
+    /// Stable position of the first rendered block at or after that element.
+    pub source: SourceAnchor,
 }
 
 /// Normalized reading block. It intentionally contains no DOM or renderer types.

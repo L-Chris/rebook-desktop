@@ -1,0 +1,15 @@
+[package]
+name = "rebook-html"
+description = "Shared HTML/CSS to format-neutral reading IR parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rebook-publication = { path = "../publication" }
+roxmltree.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

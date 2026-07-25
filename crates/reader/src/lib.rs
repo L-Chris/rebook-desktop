@@ -1,18 +1,25 @@
 //! Reader session with section, layout, and display-list caches.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ops::Range;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread::{self, JoinHandle};
 
-use rebook_layout::{LayoutEngine, LayoutError, LayoutViewport, ReaderStyle};
-use rebook_publication::{Book, BookSource, PublicationError, PublicationUrl};
+use rebook_layout::{LayoutEngine, LayoutError, LayoutViewport, PageItem, ReaderStyle};
+use rebook_publication::{
+    Block, Book, BookSource, Inline, PublicationError, PublicationUrl, Section, SourceAnchor,
+    SourceRange, TextBlock, TextRun, TocEntry,
+};
 use rebook_renderer::{DisplayListCompiler, PageDisplayList};
 use thiserror::Error;
 
 const PREFETCH_DISTANCE: usize = 2;
-const DEFAULT_SECTION_CACHE_CAPACITY: usize = PREFETCH_DISTANCE * 2 + 1;
+const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = PREFETCH_DISTANCE * 2 + 3;
+const FRAGMENT_TEXT_BUDGET: usize = 4_096;
+const FRAGMENT_BLOCK_BUDGET: usize = 64;
+const SEGMENT_FRAGMENT_CAPACITY: usize = 3;
 
 /// Direction requested by keyboard, pointer, or command navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,61 +28,327 @@ pub enum PageDirection {
     Previous,
 }
 
-/// Result of moving through cached pages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageTurn {
-    Moved {
-        section_index: usize,
-        page_index: usize,
-    },
-    Boundary {
-        section_index: usize,
-        page_index: usize,
-    },
-}
-
 /// Stable current position exposed to the application shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderLocation {
     pub section_index: usize,
+    pub segment_index: usize,
+    pub segment_count: usize,
     pub page_index: usize,
     pub page_count: usize,
 }
 
-struct CachedSection {
+/// Resolved random-access destination in the current pagination generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderPosition {
+    pub section_index: usize,
+    pub segment_index: usize,
+    pub page_index: usize,
+}
+
+/// Flattened, presentation-ready table-of-contents item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TocViewItem {
+    pub id: String,
+    pub label: String,
+    pub target: Option<PublicationUrl>,
+    pub depth: usize,
+    pub ancestors: Vec<String>,
+    pub has_children: bool,
+}
+
+/// Complete reader state after a command has been applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReaderSnapshot {
+    pub location: ReaderLocation,
+    pub total_progression: f64,
+    pub active_toc_id: Option<String>,
+    pub active_toc_path: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavigationOutcome {
+    Moved,
+    Boundary,
+}
+
+/// Navigation always returns the resulting state, including at book boundaries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NavigationResult {
+    pub outcome: NavigationOutcome,
+    pub snapshot: ReaderSnapshot,
+}
+
+struct CachedSegment {
+    section: Arc<PreparedSection>,
     pages: Vec<PageDisplayList>,
+    anchor_pages: HashMap<String, usize>,
+}
+
+struct PreparedSection {
+    fragments: Vec<ContentFragment>,
+    segments: Vec<LayoutSegment>,
+    anchor_segments: HashMap<String, usize>,
+}
+
+struct ContentFragment {
+    blocks: Vec<Block>,
+    anchors: Vec<rebook_publication::SectionAnchor>,
+}
+
+struct LayoutSegment {
+    fragment_range: Range<usize>,
+}
+
+struct SectionRepository {
+    source: Arc<dyn BookSource>,
+    sections: Vec<SectionSlot>,
+}
+
+struct SectionSlot {
+    state: Mutex<SectionSlotState>,
+    ready: Condvar,
+}
+
+enum SectionSlotState {
+    Empty,
+    Loading,
+    Ready(Weak<PreparedSection>),
+}
+
+impl SectionRepository {
+    fn new(source: Arc<dyn BookSource>) -> Self {
+        let section_count = source.book().sections.len();
+        Self {
+            source,
+            sections: (0..section_count)
+                .map(|_| SectionSlot {
+                    state: Mutex::new(SectionSlotState::Empty),
+                    ready: Condvar::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<Arc<PreparedSection>> {
+        let slot = self.sections.get(index)?;
+        let state = slot.state.lock().ok()?;
+        match &*state {
+            SectionSlotState::Ready(section) => section.upgrade(),
+            SectionSlotState::Empty | SectionSlotState::Loading => None,
+        }
+    }
+
+    fn load(&self, index: usize) -> Result<Arc<PreparedSection>, ReaderError> {
+        let slot = self
+            .sections
+            .get(index)
+            .ok_or(ReaderError::SectionOutOfBounds(index))?;
+        loop {
+            let mut state = slot
+                .state
+                .lock()
+                .map_err(|_| ReaderError::SectionRepositoryPoisoned)?;
+            match &*state {
+                SectionSlotState::Ready(section) => {
+                    if let Some(section) = section.upgrade() {
+                        return Ok(section);
+                    }
+                    *state = SectionSlotState::Loading;
+                }
+                SectionSlotState::Empty => *state = SectionSlotState::Loading,
+                SectionSlotState::Loading => {
+                    drop(
+                        slot.ready
+                            .wait(state)
+                            .map_err(|_| ReaderError::SectionRepositoryPoisoned)?,
+                    );
+                    continue;
+                }
+            }
+            drop(state);
+
+            let parsed = self.source.parse_section(index).map(prepare_section);
+            let mut state = slot
+                .state
+                .lock()
+                .map_err(|_| ReaderError::SectionRepositoryPoisoned)?;
+            match parsed {
+                Ok(section) => {
+                    let section = Arc::new(section);
+                    *state = SectionSlotState::Ready(Arc::downgrade(&section));
+                    slot.ready.notify_all();
+                    return Ok(section);
+                }
+                Err(error) => {
+                    *state = SectionSlotState::Empty;
+                    slot.ready.notify_all();
+                    return Err(error.into());
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SegmentKey {
+    section_index: usize,
+    segment_index: usize,
 }
 
 struct PrefetchRequest {
-    index: usize,
+    key: SegmentKey,
     viewport: LayoutViewport,
     style: ReaderStyle,
     generation: u64,
 }
 
 struct PrefetchResult {
-    index: usize,
+    key: SegmentKey,
     generation: u64,
-    section: Result<Arc<CachedSection>, ReaderError>,
+    segment: Result<Arc<CachedSegment>, ReaderError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PrefetchKey {
+    generation: u64,
+    segment: SegmentKey,
+}
+
+struct PrefetchWorker {
+    requests: Option<Sender<PrefetchRequest>>,
+    results: Mutex<Receiver<PrefetchResult>>,
+    active_generation: Arc<AtomicU64>,
+    cancelled: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PrefetchWorker {
+    fn spawn(
+        source: Arc<dyn BookSource>,
+        repository: Arc<SectionRepository>,
+    ) -> Result<Self, ReaderError> {
+        let (request_sender, request_receiver) = mpsc::channel::<PrefetchRequest>();
+        let (result_sender, result_receiver) = mpsc::channel::<PrefetchResult>();
+        let active_generation = Arc::new(AtomicU64::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_generation = Arc::clone(&active_generation);
+        let worker_cancelled = Arc::clone(&cancelled);
+        let handle = thread::Builder::new()
+            .name("rebook-prefetch".into())
+            .spawn(move || {
+                let mut layout_engine = LayoutEngine::new();
+                let display_compiler = DisplayListCompiler;
+                while let Ok(request) = request_receiver.recv() {
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if worker_generation.load(Ordering::Acquire) != request.generation {
+                        continue;
+                    }
+                    let segment = repository
+                        .load(request.key.section_index)
+                        .and_then(|section| {
+                            compile_segment(
+                                source.as_ref(),
+                                section,
+                                request.key,
+                                request.viewport,
+                                request.style,
+                                &mut layout_engine,
+                                &display_compiler,
+                            )
+                            .map(Arc::new)
+                        });
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if worker_generation.load(Ordering::Acquire) != request.generation {
+                        continue;
+                    }
+                    if result_sender
+                        .send(PrefetchResult {
+                            key: request.key,
+                            generation: request.generation,
+                            segment,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .map_err(ReaderError::PrefetchWorkerStart)?;
+        Ok(Self {
+            requests: Some(request_sender),
+            results: Mutex::new(result_receiver),
+            active_generation,
+            cancelled,
+            handle: Some(handle),
+        })
+    }
+
+    fn generation(&self) -> u64 {
+        self.active_generation.load(Ordering::Acquire)
+    }
+
+    fn invalidate(&self) -> u64 {
+        self.active_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn send(&self, request: PrefetchRequest) -> Result<(), ReaderError> {
+        self.requests
+            .as_ref()
+            .ok_or(ReaderError::PrefetchWorkerStopped)?
+            .send(request)
+            .map_err(|_| ReaderError::PrefetchWorkerStopped)
+    }
+
+    fn recv(&self) -> Result<PrefetchResult, ReaderError> {
+        self.results
+            .lock()
+            .map_err(|_| ReaderError::PrefetchWorkerStopped)?
+            .recv()
+            .map_err(|_| ReaderError::PrefetchWorkerStopped)
+    }
+
+    fn try_recv(&self) -> Result<PrefetchResult, TryRecvError> {
+        self.results
+            .lock()
+            .map_or(Err(TryRecvError::Disconnected), |results| {
+                results.try_recv()
+            })
+    }
+}
+
+impl Drop for PrefetchWorker {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.requests.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Single-owner reader orchestration. The parser and renderer communicate only
 /// through the publication and layout IR crates.
 pub struct ReaderSession {
     source: Arc<dyn BookSource>,
+    repository: Arc<SectionRepository>,
     layout_engine: LayoutEngine,
     display_compiler: DisplayListCompiler,
     viewport: LayoutViewport,
     style: ReaderStyle,
+    toc_items: Arc<[TocViewItem]>,
     cache_capacity: usize,
-    cache: HashMap<usize, Arc<CachedSection>>,
-    lru: VecDeque<usize>,
-    prefetch_requests: Sender<PrefetchRequest>,
-    prefetch_results: Receiver<PrefetchResult>,
-    prefetch_inflight: HashSet<usize>,
-    prefetch_failures: HashMap<usize, ReaderError>,
-    prefetch_generation: Arc<AtomicU64>,
+    cache: HashMap<SegmentKey, Arc<CachedSegment>>,
+    lru: VecDeque<SegmentKey>,
+    prefetch_worker: PrefetchWorker,
+    prefetch_inflight: HashSet<PrefetchKey>,
+    prefetch_failures: HashMap<SegmentKey, ReaderError>,
     current_section: usize,
+    current_segment: usize,
     current_page: usize,
 }
 
@@ -89,27 +362,31 @@ impl ReaderSession {
         if source.book().sections.is_empty() {
             return Err(ReaderError::EmptyBook);
         }
-        let prefetch_generation = Arc::new(AtomicU64::new(0));
-        let (prefetch_requests, prefetch_results) =
-            spawn_prefetch_worker(Arc::clone(&source), Arc::clone(&prefetch_generation))?;
+        let toc_items = flatten_toc(&source.book().table_of_contents).into();
+        let repository = Arc::new(SectionRepository::new(Arc::clone(&source)));
+        let prefetch_worker = PrefetchWorker::spawn(Arc::clone(&source), Arc::clone(&repository))?;
         let mut session = Self {
             source,
+            repository,
             layout_engine: LayoutEngine::new(),
             display_compiler: DisplayListCompiler,
             viewport,
             style,
-            cache_capacity: DEFAULT_SECTION_CACHE_CAPACITY,
+            toc_items,
+            cache_capacity: DEFAULT_SEGMENT_CACHE_CAPACITY,
             cache: HashMap::new(),
             lru: VecDeque::new(),
-            prefetch_requests,
-            prefetch_results,
+            prefetch_worker,
             prefetch_inflight: HashSet::new(),
             prefetch_failures: HashMap::new(),
-            prefetch_generation,
             current_section: 0,
+            current_segment: 0,
             current_page: 0,
         };
-        session.ensure_section(0)?;
+        session.ensure_segment(SegmentKey {
+            section_index: 0,
+            segment_index: 0,
+        })?;
         Ok(session)
     }
 
@@ -125,11 +402,45 @@ impl ReaderSession {
         self.style
     }
 
+    pub fn toc_items(&self) -> &[TocViewItem] {
+        &self.toc_items
+    }
+
     pub fn location(&self) -> ReaderLocation {
+        let segment_count = self.current_section_data().segments.len();
         ReaderLocation {
             section_index: self.current_section,
+            segment_index: self.current_segment,
+            segment_count,
             page_index: self.current_page,
             page_count: self.current_page_count(),
+        }
+    }
+
+    pub fn snapshot(&self) -> ReaderSnapshot {
+        let location = self.location();
+        let active_toc = active_toc_item_for_location(
+            &self.toc_items,
+            location.section_index,
+            location.segment_index,
+            location.page_index,
+            |target| self.position_for_href(target),
+        );
+        let (active_toc_id, active_toc_path) = active_toc.map_or_else(
+            || (None, Vec::new()),
+            |item| {
+                let mut path = item.ancestors.clone();
+                if item.has_children {
+                    path.push(item.id.clone());
+                }
+                (Some(item.id.clone()), path)
+            },
+        );
+        ReaderSnapshot {
+            location,
+            total_progression: total_progression(location, self.source.book().sections.len()),
+            active_toc_id,
+            active_toc_path,
         }
     }
 
@@ -142,13 +453,12 @@ impl ReaderSession {
     pub fn current_page(&self) -> &PageDisplayList {
         &self
             .cache
-            .get(&self.current_section)
-            .expect("current section must remain cached")
+            .get(&self.current_key())
+            .expect("current layout segment must remain cached")
             .pages[self.current_page]
     }
 
-    /// Resolves a publication URL to its spine section, ignoring a fragment
-    /// until source anchors retain authored element IDs.
+    /// Resolves a publication URL to its containing spine section.
     pub fn section_index_for_href(&self, href: &PublicationUrl) -> Option<usize> {
         let resource = href.resource_url();
         self.source
@@ -158,30 +468,96 @@ impl ReaderSession {
             .position(|section| section.href.resource_url() == resource)
     }
 
+    /// Resolves a publication URL to the layout segment and page containing its
+    /// authored anchor.
+    ///
+    /// A missing or unknown fragment falls back to the beginning of the section,
+    /// matching [`Self::go_to_href`]. Page indexes are available for compiled
+    /// segments; the current segment is always compiled.
+    pub fn position_for_href(&self, href: &PublicationUrl) -> Option<ReaderPosition> {
+        let section_index = self.section_index_for_href(href)?;
+        let section = self.repository.get(section_index);
+        let segment_index = href
+            .fragment()
+            .and_then(|fragment| {
+                section
+                    .as_ref()
+                    .and_then(|section| section.anchor_segments.get(fragment))
+            })
+            .copied()
+            .unwrap_or(0);
+        let key = SegmentKey {
+            section_index,
+            segment_index,
+        };
+        let page_index = href
+            .fragment()
+            .and_then(|fragment| {
+                self.cache
+                    .get(&key)
+                    .and_then(|cached| cached.anchor_pages.get(fragment))
+            })
+            .copied()
+            .unwrap_or(0);
+        Some(ReaderPosition {
+            section_index,
+            segment_index,
+            page_index,
+        })
+    }
+
     /// Navigates to the beginning of a spine section.
-    pub fn go_to_section(&mut self, index: usize) -> Result<PageTurn, ReaderError> {
+    pub fn go_to_section(&mut self, index: usize) -> Result<NavigationResult, ReaderError> {
         self.poll_prefetch()?;
         if index >= self.source.book().sections.len() {
             return Err(ReaderError::SectionOutOfBounds(index));
         }
-        self.ensure_section(index)?;
+        let key = SegmentKey {
+            section_index: index,
+            segment_index: 0,
+        };
+        self.ensure_segment(key)?;
         self.current_section = index;
+        self.current_segment = 0;
         self.current_page = 0;
-        self.touch(index);
+        self.touch(key);
         Ok(self.moved())
     }
 
-    /// Navigates a TOC or link target to the beginning of its containing section.
-    pub fn go_to_href(&mut self, href: &PublicationUrl) -> Result<PageTurn, ReaderError> {
+    /// Navigates a TOC or link target to its authored anchor when available.
+    pub fn go_to_href(&mut self, href: &PublicationUrl) -> Result<NavigationResult, ReaderError> {
         let index = self
             .section_index_for_href(href)
             .ok_or_else(|| ReaderError::NavigationTargetNotFound(href.to_string()))?;
-        self.go_to_section(index)
+        let section = self.repository.load(index)?;
+        let segment_index = href
+            .fragment()
+            .and_then(|fragment| section.anchor_segments.get(fragment))
+            .copied()
+            .unwrap_or(0);
+        let key = SegmentKey {
+            section_index: index,
+            segment_index,
+        };
+        self.ensure_segment(key)?;
+        self.current_section = index;
+        self.current_segment = segment_index;
+        self.current_page = href
+            .fragment()
+            .and_then(|fragment| {
+                self.cache
+                    .get(&key)
+                    .and_then(|cached| cached.anchor_pages.get(fragment))
+            })
+            .copied()
+            .unwrap_or(0);
+        self.touch(key);
+        Ok(self.moved())
     }
 
     /// Moves in constant time while pages are cached. Section boundaries compile
     /// only the destination section, never the previous one again.
-    pub fn turn_page(&mut self, direction: PageDirection) -> Result<PageTurn, ReaderError> {
+    pub fn turn_page(&mut self, direction: PageDirection) -> Result<NavigationResult, ReaderError> {
         self.poll_prefetch()?;
         match direction {
             PageDirection::Next => self.next_page(),
@@ -189,41 +565,59 @@ impl ReaderSession {
         }
     }
 
-    /// Queues a small chapter window around the current position for background
-    /// parsing, pagination, and display-list compilation. Looking two chapters
-    /// ahead keeps short, single-page chapters from outrunning the worker.
-    /// This method never performs chapter layout on the caller thread.
+    /// Queues a small layout-segment window around the current position for background
+    /// pagination and display-list compilation. Crossing forward over an
+    /// authored section boundary queues the start of the following sections.
+    /// This method never performs layout on the caller thread.
     pub fn prefetch_adjacent(&mut self) -> Result<(), ReaderError> {
         self.poll_prefetch()?;
         let section_count = self.source.book().sections.len();
+        let segment_count = self.current_section_data().segments.len();
         for distance in 1..=PREFETCH_DISTANCE {
-            if let Some(index) = self.current_section.checked_add(distance)
-                && index < section_count
+            if let Some(segment_index) = self.current_segment.checked_add(distance)
+                && segment_index < segment_count
             {
-                self.queue_prefetch(index)?;
+                self.queue_prefetch(SegmentKey {
+                    section_index: self.current_section,
+                    segment_index,
+                })?;
+            } else {
+                let overflow = self.current_segment + distance - segment_count;
+                let section_index = self.current_section + overflow + 1;
+                if section_index < section_count {
+                    self.queue_prefetch(SegmentKey {
+                        section_index,
+                        segment_index: 0,
+                    })?;
+                }
             }
         }
         for distance in 1..=PREFETCH_DISTANCE {
-            if let Some(index) = self.current_section.checked_sub(distance) {
-                self.queue_prefetch(index)?;
+            if let Some(segment_index) = self.current_segment.checked_sub(distance) {
+                self.queue_prefetch(SegmentKey {
+                    section_index: self.current_section,
+                    segment_index,
+                })?;
             }
         }
-        self.touch(self.current_section);
+        self.touch(self.current_key());
         Ok(())
     }
 
     /// Blocks until all currently queued prefetch work has been collected.
     /// Intended for diagnostics and deterministic tests, not interactive shells.
     pub fn wait_for_prefetch(&mut self) -> Result<(), ReaderError> {
-        while !self.prefetch_inflight.is_empty() {
-            let result = self
-                .prefetch_results
-                .recv()
-                .map_err(|_| ReaderError::PrefetchWorkerStopped)?;
+        let generation = self.prefetch_worker.generation();
+        while self
+            .prefetch_inflight
+            .iter()
+            .any(|key| key.generation == generation)
+        {
+            let result = self.prefetch_worker.recv()?;
             self.install_prefetch(result);
         }
-        if let Some(index) = self.prefetch_failures.keys().next().copied()
-            && let Some(error) = self.prefetch_failures.remove(&index)
+        if let Some(key) = self.prefetch_failures.keys().next().copied()
+            && let Some(error) = self.prefetch_failures.remove(&key)
         {
             return Err(error);
         }
@@ -232,120 +626,168 @@ impl ReaderSession {
 
     /// Invalidates layout/display caches while preserving approximate progress
     /// inside the active section.
-    pub fn resize(&mut self, viewport: LayoutViewport) -> Result<(), ReaderError> {
+    pub fn resize(&mut self, viewport: LayoutViewport) -> Result<ReaderSnapshot, ReaderError> {
         if self.viewport == viewport {
-            return Ok(());
+            return Ok(self.snapshot());
         }
         let old_count = self.current_page_count();
         let fraction = page_fraction(self.current_page, old_count);
         self.viewport = viewport;
-        self.invalidate_layout(fraction)
+        self.invalidate_layout(fraction)?;
+        Ok(self.snapshot())
     }
 
-    pub fn set_style(&mut self, style: ReaderStyle) -> Result<(), ReaderError> {
+    pub fn set_style(&mut self, style: ReaderStyle) -> Result<ReaderSnapshot, ReaderError> {
         if self.style == style {
-            return Ok(());
+            return Ok(self.snapshot());
         }
         let fraction = page_fraction(self.current_page, self.current_page_count());
         self.style = style;
-        self.invalidate_layout(fraction)
+        self.invalidate_layout(fraction)?;
+        Ok(self.snapshot())
     }
 
-    pub fn cached_section_count(&self) -> usize {
+    pub fn cached_segment_count(&self) -> usize {
         self.cache.len()
     }
 
-    fn next_page(&mut self) -> Result<PageTurn, ReaderError> {
+    fn next_page(&mut self) -> Result<NavigationResult, ReaderError> {
         if self.current_page + 1 < self.current_page_count() {
             self.current_page += 1;
             return Ok(self.moved());
         }
-        let next = self.current_section + 1;
-        if next >= self.source.book().sections.len() {
-            return Ok(self.boundary());
-        }
-        self.ensure_section(next)?;
-        self.current_section = next;
+        let current_segment_count = self.current_section_data().segments.len();
+        let next = if self.current_segment + 1 < current_segment_count {
+            SegmentKey {
+                section_index: self.current_section,
+                segment_index: self.current_segment + 1,
+            }
+        } else {
+            let section_index = self.current_section + 1;
+            if section_index >= self.source.book().sections.len() {
+                return Ok(self.boundary());
+            }
+            SegmentKey {
+                section_index,
+                segment_index: 0,
+            }
+        };
+        self.ensure_segment(next)?;
+        self.current_section = next.section_index;
+        self.current_segment = next.segment_index;
         self.current_page = 0;
         self.touch(next);
         Ok(self.moved())
     }
 
-    fn previous_page(&mut self) -> Result<PageTurn, ReaderError> {
+    fn previous_page(&mut self) -> Result<NavigationResult, ReaderError> {
         if self.current_page > 0 {
             self.current_page -= 1;
             return Ok(self.moved());
         }
-        let Some(previous) = self.current_section.checked_sub(1) else {
-            return Ok(self.boundary());
+        let previous = if let Some(segment_index) = self.current_segment.checked_sub(1) {
+            SegmentKey {
+                section_index: self.current_section,
+                segment_index,
+            }
+        } else {
+            let Some(section_index) = self.current_section.checked_sub(1) else {
+                return Ok(self.boundary());
+            };
+            let section = self.repository.load(section_index)?;
+            SegmentKey {
+                section_index,
+                segment_index: section.segments.len().saturating_sub(1),
+            }
         };
-        self.ensure_section(previous)?;
-        self.current_section = previous;
+        self.ensure_segment(previous)?;
+        self.current_section = previous.section_index;
+        self.current_segment = previous.segment_index;
         self.current_page = self.current_page_count().saturating_sub(1);
         self.touch(previous);
         Ok(self.moved())
     }
 
-    fn ensure_section(&mut self, index: usize) -> Result<(), ReaderError> {
-        if self.cache.contains_key(&index) {
-            self.touch(index);
+    fn ensure_segment(&mut self, key: SegmentKey) -> Result<(), ReaderError> {
+        if self.cache.contains_key(&key) {
+            self.touch(key);
             return Ok(());
         }
-        if let Some(error) = self.prefetch_failures.remove(&index) {
+        if let Some(error) = self.prefetch_failures.remove(&key) {
             return Err(error);
         }
-        if self.prefetch_inflight.contains(&index) {
-            self.wait_for_section(index)?;
-            if self.cache.contains_key(&index) {
-                self.touch(index);
+        let prefetch_key = PrefetchKey {
+            generation: self.prefetch_worker.generation(),
+            segment: key,
+        };
+        if self.prefetch_inflight.contains(&prefetch_key) {
+            self.wait_for_segment(key)?;
+            if self.cache.contains_key(&key) {
+                self.touch(key);
                 return Ok(());
             }
         }
-        let section = compile_section(
+        let section = self.repository.load(key.section_index)?;
+        let segment = compile_segment(
             self.source.as_ref(),
-            index,
+            section,
+            key,
             self.viewport,
             self.style,
             &mut self.layout_engine,
             &self.display_compiler,
         )?;
-        self.cache.insert(index, Arc::new(section));
-        self.touch(index);
+        self.cache.insert(key, Arc::new(segment));
+        self.touch(key);
         self.evict();
         Ok(())
     }
 
     fn invalidate_layout(&mut self, fraction: f32) -> Result<(), ReaderError> {
-        self.prefetch_generation.fetch_add(1, Ordering::Release);
+        self.prefetch_worker.invalidate();
         self.prefetch_inflight.clear();
         self.prefetch_failures.clear();
+        let current_section = Arc::clone(self.current_section_data());
         self.cache.clear();
         self.lru.clear();
-        self.ensure_section(self.current_section)?;
+        let key = self.current_key();
+        let segment = compile_segment(
+            self.source.as_ref(),
+            current_section,
+            key,
+            self.viewport,
+            self.style,
+            &mut self.layout_engine,
+            &self.display_compiler,
+        )?;
+        self.cache.insert(key, Arc::new(segment));
+        self.touch(key);
         let count = self.current_page_count();
         self.current_page = page_for_fraction(fraction, count);
         Ok(())
     }
 
-    fn queue_prefetch(&mut self, index: usize) -> Result<(), ReaderError> {
-        if self.cache.contains_key(&index) || self.prefetch_inflight.contains(&index) {
+    fn queue_prefetch(&mut self, segment: SegmentKey) -> Result<(), ReaderError> {
+        let key = PrefetchKey {
+            generation: self.prefetch_worker.generation(),
+            segment,
+        };
+        if self.cache.contains_key(&segment) || self.prefetch_inflight.contains(&key) {
             return Ok(());
         }
-        self.prefetch_requests
-            .send(PrefetchRequest {
-                index,
-                viewport: self.viewport,
-                style: self.style,
-                generation: self.prefetch_generation.load(Ordering::Acquire),
-            })
-            .map_err(|_| ReaderError::PrefetchWorkerStopped)?;
-        self.prefetch_inflight.insert(index);
+        self.prefetch_worker.send(PrefetchRequest {
+            key: segment,
+            viewport: self.viewport,
+            style: self.style,
+            generation: key.generation,
+        })?;
+        self.prefetch_inflight.insert(key);
         Ok(())
     }
 
     fn poll_prefetch(&mut self) -> Result<(), ReaderError> {
         loop {
-            match self.prefetch_results.try_recv() {
+            match self.prefetch_worker.try_recv() {
                 Ok(result) => self.install_prefetch(result),
                 Err(TryRecvError::Empty) => return Ok(()),
                 Err(TryRecvError::Disconnected) if self.prefetch_inflight.is_empty() => {
@@ -358,48 +800,68 @@ impl ReaderSession {
         }
     }
 
-    fn wait_for_section(&mut self, index: usize) -> Result<(), ReaderError> {
-        while self.prefetch_inflight.contains(&index) {
-            let result = self
-                .prefetch_results
-                .recv()
-                .map_err(|_| ReaderError::PrefetchWorkerStopped)?;
+    fn wait_for_segment(&mut self, segment: SegmentKey) -> Result<(), ReaderError> {
+        let key = PrefetchKey {
+            generation: self.prefetch_worker.generation(),
+            segment,
+        };
+        while self.prefetch_inflight.contains(&key) {
+            let result = self.prefetch_worker.recv()?;
             self.install_prefetch(result);
         }
-        if let Some(error) = self.prefetch_failures.remove(&index) {
+        if let Some(error) = self.prefetch_failures.remove(&segment) {
             return Err(error);
         }
         Ok(())
     }
 
     fn install_prefetch(&mut self, result: PrefetchResult) {
-        self.prefetch_inflight.remove(&result.index);
-        if result.generation != self.prefetch_generation.load(Ordering::Acquire) {
+        let key = PrefetchKey {
+            generation: result.generation,
+            segment: result.key,
+        };
+        self.prefetch_inflight.remove(&key);
+        if result.generation != self.prefetch_worker.generation() {
             return;
         }
-        let section = match result.section {
-            Ok(section) => section,
+        let segment = match result.segment {
+            Ok(segment) => segment,
             Err(error) => {
-                self.prefetch_failures.insert(result.index, error);
+                self.prefetch_failures.insert(result.key, error);
                 return;
             }
         };
-        if self.cache.insert(result.index, section).is_none() {
-            self.touch(result.index);
+        if self.cache.insert(result.key, segment).is_none() {
+            self.touch(result.key);
             self.evict();
         }
-        self.touch(self.current_section);
+        self.touch(self.current_key());
     }
 
     fn current_page_count(&self) -> usize {
         self.cache
-            .get(&self.current_section)
-            .map_or(0, |section| section.pages.len())
+            .get(&self.current_key())
+            .map_or(0, |segment| segment.pages.len())
     }
 
-    fn touch(&mut self, index: usize) {
-        self.lru.retain(|cached| *cached != index);
-        self.lru.push_back(index);
+    fn current_key(&self) -> SegmentKey {
+        SegmentKey {
+            section_index: self.current_section,
+            segment_index: self.current_segment,
+        }
+    }
+
+    fn current_section_data(&self) -> &Arc<PreparedSection> {
+        &self
+            .cache
+            .get(&self.current_key())
+            .expect("current layout segment must remain cached")
+            .section
+    }
+
+    fn touch(&mut self, key: SegmentKey) {
+        self.lru.retain(|cached| *cached != key);
+        self.lru.push_back(key);
     }
 
     fn evict(&mut self) {
@@ -407,7 +869,7 @@ impl ReaderSession {
             let Some(candidate) = self.lru.pop_front() else {
                 break;
             };
-            if candidate == self.current_section {
+            if candidate == self.current_key() {
                 self.lru.push_back(candidate);
                 continue;
             }
@@ -415,80 +877,401 @@ impl ReaderSession {
         }
     }
 
-    fn moved(&self) -> PageTurn {
-        PageTurn::Moved {
-            section_index: self.current_section,
-            page_index: self.current_page,
+    fn moved(&self) -> NavigationResult {
+        NavigationResult {
+            outcome: NavigationOutcome::Moved,
+            snapshot: self.snapshot(),
         }
     }
 
-    fn boundary(&self) -> PageTurn {
-        PageTurn::Boundary {
-            section_index: self.current_section,
-            page_index: self.current_page,
+    fn boundary(&self) -> NavigationResult {
+        NavigationResult {
+            outcome: NavigationOutcome::Boundary,
+            snapshot: self.snapshot(),
         }
     }
 }
 
-fn spawn_prefetch_worker(
-    source: Arc<dyn BookSource>,
-    active_generation: Arc<AtomicU64>,
-) -> Result<(Sender<PrefetchRequest>, Receiver<PrefetchResult>), ReaderError> {
-    let (request_sender, request_receiver) = mpsc::channel::<PrefetchRequest>();
-    let (result_sender, result_receiver) = mpsc::channel::<PrefetchResult>();
-    thread::Builder::new()
-        .name("rebook-prefetch".into())
-        .spawn(move || {
-            let mut layout_engine = LayoutEngine::new();
-            let display_compiler = DisplayListCompiler;
-            while let Ok(request) = request_receiver.recv() {
-                if active_generation.load(Ordering::Acquire) != request.generation {
-                    continue;
-                }
-                let section = compile_section(
-                    source.as_ref(),
-                    request.index,
-                    request.viewport,
-                    request.style,
-                    &mut layout_engine,
-                    &display_compiler,
-                )
-                .map(Arc::new);
-                if active_generation.load(Ordering::Acquire) != request.generation {
-                    continue;
-                }
-                if result_sender
-                    .send(PrefetchResult {
-                        index: request.index,
-                        generation: request.generation,
-                        section,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .map_err(ReaderError::PrefetchWorkerStart)?;
-    Ok((request_sender, result_receiver))
-}
-
-fn compile_section(
+fn compile_segment(
     source: &dyn BookSource,
-    index: usize,
+    section: Arc<PreparedSection>,
+    key: SegmentKey,
     viewport: LayoutViewport,
     style: ReaderStyle,
     layout_engine: &mut LayoutEngine,
     display_compiler: &DisplayListCompiler,
-) -> Result<CachedSection, ReaderError> {
-    let section = source.parse_section(index)?;
-    let layout = layout_engine.layout_section(source, &section, viewport, style)?;
+) -> Result<CachedSegment, ReaderError> {
+    let segment =
+        section
+            .segments
+            .get(key.segment_index)
+            .ok_or(ReaderError::SegmentOutOfBounds {
+                section: key.section_index,
+                segment: key.segment_index,
+            })?;
+    let fragments = section.fragments[segment.fragment_range.clone()]
+        .iter()
+        .map(|fragment| fragment.blocks.as_slice())
+        .collect::<Vec<_>>();
+    let layout = layout_engine.layout_fragments(source, &fragments, viewport, style)?;
+    let anchor_pages = section.fragments[segment.fragment_range.clone()]
+        .iter()
+        .flat_map(|fragment| &fragment.anchors)
+        .filter_map(|anchor| {
+            layout
+                .pages
+                .iter()
+                .position(|page| {
+                    page.items.iter().any(|item| {
+                        let source = match item {
+                            PageItem::Text(placement) => placement.source.as_ref(),
+                            PageItem::Image(placement) => placement.source.as_ref(),
+                            PageItem::Separator(_) => None,
+                        };
+                        source.is_some_and(|range| source_range_contains(range, &anchor.source))
+                    })
+                })
+                .map(|page| (anchor.fragment.clone(), page))
+        })
+        .collect();
     let pages = layout
         .pages
         .iter()
         .map(|page| display_compiler.compile(page))
         .collect();
-    Ok(CachedSection { pages })
+    Ok(CachedSegment {
+        section,
+        pages,
+        anchor_pages,
+    })
+}
+
+fn prepare_section(section: Section) -> PreparedSection {
+    let Section {
+        blocks, anchors, ..
+    } = section;
+    let mut block_groups = Vec::<Vec<Block>>::new();
+    let mut current = Vec::new();
+    let mut current_text = 0_usize;
+
+    let flush =
+        |current: &mut Vec<Block>, current_text: &mut usize, block_groups: &mut Vec<Vec<Block>>| {
+            if !current.is_empty() {
+                block_groups.push(std::mem::take(current));
+                *current_text = 0;
+            }
+        };
+
+    for block in blocks {
+        let pieces = match block {
+            Block::Text(block) => split_text_block(block)
+                .into_iter()
+                .map(Block::Text)
+                .collect::<Vec<_>>(),
+            block => vec![block],
+        };
+        for piece in pieces {
+            let text_len = block_text_len(&piece);
+            if !current.is_empty()
+                && (current.len() >= FRAGMENT_BLOCK_BUDGET
+                    || current_text.saturating_add(text_len) > FRAGMENT_TEXT_BUDGET)
+            {
+                flush(&mut current, &mut current_text, &mut block_groups);
+            }
+            current_text = current_text.saturating_add(text_len);
+            current.push(piece);
+            if current.len() >= FRAGMENT_BLOCK_BUDGET || current_text >= FRAGMENT_TEXT_BUDGET {
+                flush(&mut current, &mut current_text, &mut block_groups);
+            }
+        }
+    }
+    flush(&mut current, &mut current_text, &mut block_groups);
+    if block_groups.is_empty() {
+        block_groups.push(Vec::new());
+    }
+
+    let mut fragments = block_groups
+        .into_iter()
+        .map(|blocks| ContentFragment {
+            blocks,
+            anchors: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let mut anchor_fragments = HashMap::new();
+    for anchor in anchors {
+        let fragment_index = fragments
+            .iter()
+            .position(|fragment| {
+                fragment.blocks.iter().any(|block| {
+                    block_source(block)
+                        .is_some_and(|range| source_range_contains(range, &anchor.source))
+                })
+            })
+            .unwrap_or(0);
+        anchor_fragments.insert(anchor.fragment.clone(), fragment_index);
+        fragments[fragment_index].anchors.push(anchor);
+    }
+
+    let segments = (0..fragments.len())
+        .step_by(SEGMENT_FRAGMENT_CAPACITY)
+        .map(|start| LayoutSegment {
+            fragment_range: start..(start + SEGMENT_FRAGMENT_CAPACITY).min(fragments.len()),
+        })
+        .collect::<Vec<_>>();
+    let anchor_segments = anchor_fragments
+        .into_iter()
+        .map(|(fragment, fragment_index)| (fragment, fragment_index / SEGMENT_FRAGMENT_CAPACITY))
+        .collect();
+
+    PreparedSection {
+        fragments,
+        segments,
+        anchor_segments,
+    }
+}
+
+fn split_text_block(block: TextBlock) -> Vec<TextBlock> {
+    let content_len = inline_content_len(&block.content);
+    if content_len <= FRAGMENT_TEXT_BUDGET {
+        return vec![block];
+    }
+
+    let TextBlock {
+        kind,
+        content,
+        style,
+        source,
+    } = block;
+    let content_parts = split_inline_content(content);
+    let part_count = content_parts.len();
+    let mut source_offset = 0_usize;
+    content_parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, (content, length))| {
+            let mut part_style = style;
+            let part_kind = if index > 0
+                && matches!(kind, rebook_publication::TextBlockKind::ListItem { .. })
+            {
+                rebook_publication::TextBlockKind::Paragraph
+            } else {
+                kind
+            };
+            if index > 0 {
+                part_style.margin_before = 0.0;
+                part_style.indent = 0.0;
+            }
+            if index + 1 < part_count {
+                part_style.margin_after = 0.0;
+            }
+            let part_source = source
+                .as_ref()
+                .map(|range| slice_source_range(range, source_offset, source_offset + length));
+            source_offset += length;
+            TextBlock {
+                kind: part_kind,
+                content,
+                style: part_style,
+                source: part_source,
+            }
+        })
+        .collect()
+}
+
+fn split_inline_content(content: Vec<Inline>) -> Vec<(Vec<Inline>, usize)> {
+    let mut parts = Vec::new();
+    let mut current = Vec::new();
+    let mut current_len = 0_usize;
+
+    let flush = |current: &mut Vec<Inline>,
+                 current_len: &mut usize,
+                 parts: &mut Vec<(Vec<Inline>, usize)>| {
+        if !current.is_empty() {
+            parts.push((std::mem::take(current), *current_len));
+            *current_len = 0;
+        }
+    };
+
+    for inline in content {
+        match inline {
+            Inline::Break => {
+                if current_len == FRAGMENT_TEXT_BUDGET {
+                    flush(&mut current, &mut current_len, &mut parts);
+                }
+                current.push(Inline::Break);
+                current_len += 1;
+            }
+            Inline::Text(run) => {
+                let TextRun { text, style, link } = run;
+                let mut remaining = text.as_str();
+                while !remaining.is_empty() {
+                    if current_len == FRAGMENT_TEXT_BUDGET {
+                        flush(&mut current, &mut current_len, &mut parts);
+                    }
+                    let capacity = FRAGMENT_TEXT_BUDGET - current_len;
+                    let split_at = byte_index_after_chars(remaining, capacity);
+                    let (slice, rest) = remaining.split_at(split_at);
+                    current.push(Inline::Text(TextRun {
+                        text: slice.to_owned(),
+                        style,
+                        link: link.clone(),
+                    }));
+                    current_len += slice.chars().count();
+                    remaining = rest;
+                }
+            }
+        }
+    }
+    flush(&mut current, &mut current_len, &mut parts);
+    parts
+}
+
+fn byte_index_after_chars(text: &str, count: usize) -> usize {
+    text.char_indices()
+        .nth(count)
+        .map_or(text.len(), |(index, _)| index)
+}
+
+fn slice_source_range(range: &SourceRange, start: usize, end: usize) -> SourceRange {
+    if range.start.spine == range.end.spine && range.start.node == range.end.node {
+        let offset = |value: usize| {
+            range
+                .start
+                .text_offset
+                .saturating_add(u64::try_from(value).unwrap_or(u64::MAX))
+                .min(range.end.text_offset)
+        };
+        SourceRange {
+            start: SourceAnchor {
+                spine: range.start.spine.clone(),
+                node: range.start.node.clone(),
+                text_offset: offset(start),
+            },
+            end: SourceAnchor {
+                spine: range.end.spine.clone(),
+                node: range.end.node.clone(),
+                text_offset: offset(end),
+            },
+        }
+    } else {
+        range.clone()
+    }
+}
+
+fn inline_content_len(content: &[Inline]) -> usize {
+    content
+        .iter()
+        .map(|inline| match inline {
+            Inline::Text(run) => run.text.chars().count(),
+            Inline::Break => 1,
+        })
+        .sum()
+}
+
+fn block_text_len(block: &Block) -> usize {
+    match block {
+        Block::Text(block) => inline_content_len(&block.content),
+        Block::Image(_) | Block::Separator | Block::PageBreak => 0,
+    }
+}
+
+fn block_source(block: &Block) -> Option<&SourceRange> {
+    match block {
+        Block::Text(block) => block.source.as_ref(),
+        Block::Image(block) => block.source.as_ref(),
+        Block::Separator | Block::PageBreak => None,
+    }
+}
+
+fn source_range_contains(range: &SourceRange, anchor: &SourceAnchor) -> bool {
+    if range.start.spine != anchor.spine || range.start.node != anchor.node {
+        return false;
+    }
+    if range.start.spine != range.end.spine || range.start.node != range.end.node {
+        return range.start == *anchor;
+    }
+    anchor.text_offset >= range.start.text_offset
+        && (anchor.text_offset < range.end.text_offset
+            || (range.start.text_offset == range.end.text_offset
+                && anchor.text_offset == range.start.text_offset))
+}
+
+fn flatten_toc(entries: &[TocEntry]) -> Vec<TocViewItem> {
+    fn append(
+        entries: &[TocEntry],
+        depth: usize,
+        ancestors: &[String],
+        items: &mut Vec<TocViewItem>,
+    ) {
+        for (index, entry) in entries.iter().enumerate() {
+            let id = ancestors
+                .last()
+                .map_or_else(|| index.to_string(), |parent| format!("{parent}/{index}"));
+            items.push(TocViewItem {
+                id: id.clone(),
+                label: entry.label.clone(),
+                target: entry.href.clone(),
+                depth,
+                ancestors: ancestors.to_vec(),
+                has_children: !entry.children.is_empty(),
+            });
+            let mut child_ancestors = ancestors.to_vec();
+            child_ancestors.push(id);
+            append(&entry.children, depth + 1, &child_ancestors, items);
+        }
+    }
+
+    let mut items = Vec::new();
+    append(entries, 0, &[], &mut items);
+    items
+}
+
+fn active_toc_item_for_location(
+    items: &[TocViewItem],
+    current_section: usize,
+    current_segment: usize,
+    current_page: usize,
+    mut resolve: impl FnMut(&PublicationUrl) -> Option<ReaderPosition>,
+) -> Option<&TocViewItem> {
+    let mut first_in_current_section = None;
+    let mut best = None;
+
+    for (order, item) in items.iter().enumerate() {
+        let Some(position) = item.target.as_ref().and_then(&mut resolve) else {
+            continue;
+        };
+        let ReaderPosition {
+            section_index,
+            segment_index,
+            page_index,
+        } = position;
+        if section_index == current_section && first_in_current_section.is_none() {
+            first_in_current_section = Some(item);
+        }
+        if section_index > current_section
+            || (section_index == current_section
+                && (segment_index, page_index) > (current_segment, current_page))
+        {
+            continue;
+        }
+        let key = (section_index, segment_index, page_index, order);
+        if best.is_none_or(|(best_key, _)| key > best_key) {
+            best = Some((key, item));
+        }
+    }
+
+    best.map(|(_, item)| item).or(first_in_current_section)
+}
+
+fn total_progression(location: ReaderLocation, section_count: usize) -> f64 {
+    let to_f64 = |value: usize| f64::from(u32::try_from(value).unwrap_or(u32::MAX));
+    let section_count = to_f64(section_count.max(1));
+    let segment_count = to_f64(location.segment_count.max(1));
+    let page_count = to_f64(location.page_count.max(1));
+    let segment_progress = (to_f64(location.segment_index)
+        + to_f64(location.page_index + 1) / page_count)
+        / segment_count;
+    ((to_f64(location.section_index) + segment_progress) / section_count).clamp(0.0, 1.0)
 }
 
 // Page counts are bounded by the pages that fit in memory, so they remain far
@@ -522,6 +1305,8 @@ pub enum ReaderError {
     EmptyBook,
     #[error("section index is outside the reading order: {0}")]
     SectionOutOfBounds(usize),
+    #[error("layout segment {segment} is outside section {section}")]
+    SegmentOutOfBounds { section: usize, segment: usize },
     #[error("navigation target is not in the reading order: {0}")]
     NavigationTargetNotFound(String),
     #[error(transparent)]
@@ -532,6 +1317,8 @@ pub enum ReaderError {
     PrefetchWorkerStart(std::io::Error),
     #[error("section prefetch worker stopped unexpectedly")]
     PrefetchWorkerStopped,
+    #[error("parsed section repository lock is poisoned")]
+    SectionRepositoryPoisoned,
 }
 
 #[cfg(test)]
@@ -542,7 +1329,8 @@ mod tests {
     use rebook_layout::ReaderFontFamily;
     use rebook_publication::{
         Block, BlockStyle, Inline, Metadata, PublicationId, PublicationUrl, Resource, Section,
-        SpineItem, SpineItemId, TextBlock, TextBlockKind, TextRun, TextStyle,
+        SectionAnchor, SourceAnchor, SourceRange, SpineItem, SpineItemId, TextBlock, TextBlockKind,
+        TextRun, TextStyle, TocEntry,
     };
 
     use super::*;
@@ -585,6 +1373,7 @@ mod tests {
                         style: BlockStyle::default(),
                         source: None,
                     })],
+                    anchors: Vec::new(),
                 });
             }
 
@@ -639,29 +1428,198 @@ mod tests {
         let mut reader =
             ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
                 .unwrap();
-        let page_count = reader.location().page_count;
-        assert!(page_count > 2);
+        assert!(reader.location().page_count > 2);
         assert_eq!(source.parse_count(0), 1);
 
         assert!(matches!(
-            reader.turn_page(PageDirection::Previous).unwrap(),
-            PageTurn::Boundary { .. }
+            reader.turn_page(PageDirection::Previous).unwrap().outcome,
+            NavigationOutcome::Boundary
         ));
-        for _ in 1..page_count {
-            assert!(matches!(
-                reader.turn_page(PageDirection::Next).unwrap(),
-                PageTurn::Moved { .. }
-            ));
+        let mut moved = 0;
+        loop {
+            let result = reader.turn_page(PageDirection::Next).unwrap();
+            if result.outcome == NavigationOutcome::Boundary {
+                break;
+            }
+            moved += 1;
+            assert!(moved < 10_000);
         }
-        assert!(matches!(
-            reader.turn_page(PageDirection::Next).unwrap(),
-            PageTurn::Boundary { .. }
-        ));
+        assert!(moved > 2);
         assert_eq!(source.parse_count(0), 1);
     }
 
     #[test]
-    fn chapter_window_prefetch_makes_short_section_switches_cache_only() {
+    fn oversized_text_block_is_split_into_stable_source_ranged_fragments() {
+        let source = CountingSource::new(&["a".repeat(FRAGMENT_TEXT_BUDGET * 2 + 17)]);
+        let mut section = source.sections[0].clone();
+        let spine = section.id.clone();
+        section.blocks[0] = Block::Text(TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun {
+                text: "a".repeat(FRAGMENT_TEXT_BUDGET * 2 + 17),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: BlockStyle::default(),
+            source: Some(SourceRange {
+                start: SourceAnchor {
+                    spine: spine.clone(),
+                    node: "n0".into(),
+                    text_offset: 0,
+                },
+                end: SourceAnchor {
+                    spine,
+                    node: "n0".into(),
+                    text_offset: u64::try_from(FRAGMENT_TEXT_BUDGET * 2 + 17).unwrap(),
+                },
+            }),
+        });
+
+        let prepared = prepare_section(section);
+
+        assert_eq!(prepared.fragments.len(), 3);
+        assert_eq!(prepared.segments.len(), 1);
+        assert_eq!(block_text_len(&prepared.fragments[0].blocks[0]), 4_096);
+        assert_eq!(block_text_len(&prepared.fragments[1].blocks[0]), 4_096);
+        assert_eq!(block_text_len(&prepared.fragments[2].blocks[0]), 17);
+        let ranges = prepared
+            .fragments
+            .iter()
+            .map(|fragment| block_source(&fragment.blocks[0]).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ranges[0].start.text_offset, 0);
+        assert_eq!(ranges[0].end.text_offset, 4_096);
+        assert_eq!(ranges[1].start.text_offset, 4_096);
+        assert_eq!(ranges[1].end.text_offset, 8_192);
+        assert_eq!(ranges[2].start.text_offset, 8_192);
+        assert_eq!(ranges[2].end.text_offset, 8_209);
+    }
+
+    #[test]
+    fn content_fragment_boundaries_do_not_commit_partial_pages_inside_a_segment() {
+        let text_len = FRAGMENT_TEXT_BUDGET + 100;
+        let source = CountingSource::new(&["a".repeat(text_len)]);
+        let mut section = source.sections[0].clone();
+        let spine = section.id.clone();
+        let Block::Text(block) = &mut section.blocks[0] else {
+            unreachable!();
+        };
+        block.source = Some(SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "n0".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "n0".into(),
+                text_offset: u64::try_from(text_len).unwrap(),
+            },
+        });
+        let prepared = prepare_section(section);
+        let segment = &prepared.segments[0];
+        let fragments = prepared.fragments[segment.fragment_range.clone()]
+            .iter()
+            .map(|fragment| fragment.blocks.as_slice())
+            .collect::<Vec<_>>();
+
+        let layout = LayoutEngine::new()
+            .layout_fragments(
+                source.as_ref(),
+                &fragments,
+                viewport(600, 20_000),
+                ReaderStyle::default(),
+            )
+            .unwrap();
+
+        assert_eq!(prepared.fragments.len(), 2);
+        assert_eq!(layout.pages.len(), 1);
+        let ranges = layout.pages[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                PageItem::Text(placement) => placement.source.as_ref(),
+                PageItem::Image(placement) => placement.source.as_ref(),
+                PageItem::Separator(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            ranges
+                .iter()
+                .any(|range| range.end.text_offset == u64::try_from(FRAGMENT_TEXT_BUDGET).unwrap())
+        );
+        assert!(ranges.iter().any(|range| {
+            range.start.text_offset == u64::try_from(FRAGMENT_TEXT_BUDGET).unwrap()
+        }));
+    }
+
+    #[test]
+    fn continued_list_item_does_not_repeat_its_marker() {
+        let parts = split_text_block(TextBlock {
+            kind: TextBlockKind::ListItem {
+                ordered: true,
+                ordinal: 7,
+            },
+            content: vec![Inline::Text(TextRun {
+                text: "item ".repeat(FRAGMENT_TEXT_BUDGET),
+                style: TextStyle::default(),
+                link: None,
+            })],
+            style: BlockStyle {
+                indent: 24.0,
+                ..BlockStyle::default()
+            },
+            source: None,
+        });
+
+        assert!(parts.len() > 1);
+        assert!(matches!(
+            parts[0].kind,
+            TextBlockKind::ListItem {
+                ordered: true,
+                ordinal: 7
+            }
+        ));
+        assert!(
+            parts[1..]
+                .iter()
+                .all(|part| part.kind == TextBlockKind::Paragraph)
+        );
+        assert!(parts[1..].iter().all(|part| part.style.indent == 0.0));
+    }
+
+    #[test]
+    fn page_turns_cross_layout_segments_without_reparsing_the_authored_section() {
+        let source = CountingSource::new(&["long text ".repeat(FRAGMENT_TEXT_BUDGET)]);
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+        assert!(reader.location().segment_count > 2);
+
+        while reader.location().segment_index == 0 {
+            assert_eq!(
+                reader.turn_page(PageDirection::Next).unwrap().outcome,
+                NavigationOutcome::Moved
+            );
+        }
+        assert_eq!(reader.location().segment_index, 1);
+        assert_eq!(reader.location().page_index, 0);
+        assert_eq!(source.parse_count(0), 1);
+
+        assert_eq!(
+            reader.turn_page(PageDirection::Previous).unwrap().outcome,
+            NavigationOutcome::Moved
+        );
+        assert_eq!(reader.location().segment_index, 0);
+        assert_eq!(
+            reader.location().page_index,
+            reader.location().page_count - 1
+        );
+        assert_eq!(source.parse_count(0), 1);
+    }
+
+    #[test]
+    fn segment_window_prefetch_makes_short_section_switches_cache_only() {
         let source = CountingSource::new(&["第一章".into(), "第二章".into(), "第三章".into()]);
         let mut reader =
             ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
@@ -669,7 +1627,7 @@ mod tests {
 
         reader.prefetch_adjacent().unwrap();
         reader.wait_for_prefetch().unwrap();
-        assert_eq!(reader.cached_section_count(), 3);
+        assert_eq!(reader.cached_segment_count(), 3);
         assert_eq!(source.parse_count(1), 1);
         assert_eq!(source.parse_count(2), 1);
         reader.turn_page(PageDirection::Next).unwrap();
@@ -678,7 +1636,7 @@ mod tests {
 
         reader.prefetch_adjacent().unwrap();
         reader.wait_for_prefetch().unwrap();
-        assert_eq!(reader.cached_section_count(), 3);
+        assert_eq!(reader.cached_segment_count(), 3);
         assert_eq!(source.parse_count(2), 1);
         reader.turn_page(PageDirection::Next).unwrap();
         assert_eq!(reader.location().section_index, 2);
@@ -686,12 +1644,52 @@ mod tests {
     }
 
     #[test]
-    fn toc_href_navigation_resolves_fragments_and_uses_the_section_cache() {
-        let source = CountingSource::new(&[
+    fn toc_href_navigation_resolves_segments_and_reuses_parsed_sections() {
+        let mut source = CountingSource::new(&[
             "第一章".repeat(100),
             "第二章".repeat(100),
             "第三章".repeat(100),
         ]);
+        let target_section = &mut Arc::get_mut(&mut source).unwrap().sections[1];
+        let spine = target_section.id.clone();
+        let source_range = |node: &str, length: u64| SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: node.to_owned(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: node.to_owned(),
+                text_offset: length,
+            },
+        };
+        target_section.blocks = vec![
+            Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: "目标之前的长正文。".repeat(2_000),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: Some(source_range("n0", 18_000)),
+            }),
+            Block::Text(TextBlock {
+                kind: TextBlockKind::Heading(2),
+                content: vec![Inline::Text(TextRun {
+                    text: "目录目标".to_owned(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: Some(source_range("n1", 4)),
+            }),
+        ];
+        target_section.anchors = vec![SectionAnchor {
+            fragment: "part-2".to_owned(),
+            source: source_range("n1", 4).start,
+        }];
         let mut reader =
             ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
                 .unwrap();
@@ -700,11 +1698,165 @@ mod tests {
 
         let target = PublicationUrl::parse("section-1.xhtml#part-2").unwrap();
         assert_eq!(reader.section_index_for_href(&target), Some(1));
+        let target_location = reader.position_for_href(&target).unwrap();
+        assert_eq!(target_location.section_index, 1);
+        assert!(target_location.segment_index > 0);
         reader.go_to_href(&target).unwrap();
+        let resolved_location = reader.position_for_href(&target).unwrap();
 
         assert_eq!(reader.location().section_index, 1);
-        assert_eq!(reader.location().page_index, 0);
+        assert_eq!(
+            reader.location().segment_index,
+            target_location.segment_index
+        );
+        assert_eq!(reader.location().page_index, resolved_location.page_index);
+        assert!(reader.location().page_index > 0);
         assert_eq!(source.parse_count(1), 1);
+    }
+
+    #[test]
+    fn distant_anchor_navigation_compiles_only_its_bounded_layout_segment() {
+        let mut source = CountingSource::new(&["placeholder".into()]);
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        let spine = source_mut.sections[0].id.clone();
+        let preceding_text_len = FRAGMENT_TEXT_BUDGET * SEGMENT_FRAGMENT_CAPACITY * 2 + 100;
+        let source_range = |node: &str, length: usize| SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: u64::try_from(length).unwrap(),
+            },
+        };
+        source_mut.sections[0].blocks = vec![
+            Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: "a".repeat(preceding_text_len),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: Some(source_range("n0", preceding_text_len)),
+            }),
+            Block::Text(TextBlock {
+                kind: TextBlockKind::Heading(2),
+                content: vec![Inline::Text(TextRun {
+                    text: "Target".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: Some(source_range("n1", 6)),
+            }),
+        ];
+        source_mut.sections[0].anchors = vec![SectionAnchor {
+            fragment: "target".into(),
+            source: source_range("n1", 6).start,
+        }];
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+        let target = PublicationUrl::parse("section-0.xhtml#target").unwrap();
+        assert_eq!(reader.position_for_href(&target).unwrap().segment_index, 2);
+
+        reader.go_to_href(&target).unwrap();
+
+        assert_eq!(reader.location().segment_index, 2);
+        assert!(reader.cache.contains_key(&SegmentKey {
+            section_index: 0,
+            segment_index: 0,
+        }));
+        assert!(!reader.cache.contains_key(&SegmentKey {
+            section_index: 0,
+            segment_index: 1,
+        }));
+        assert!(reader.cache.contains_key(&SegmentKey {
+            section_index: 0,
+            segment_index: 2,
+        }));
+        assert_eq!(source.parse_count(0), 1);
+    }
+
+    #[test]
+    fn toc_and_total_progression_advance_across_segment_boundaries() {
+        let mut source = CountingSource::new(&["placeholder".into()]);
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        let spine = source_mut.sections[0].id.clone();
+        let source_range = |node: &str, length: u64| SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: node.into(),
+                text_offset: length,
+            },
+        };
+        source_mut.sections[0].blocks = vec![
+            Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: "a".repeat(FRAGMENT_TEXT_BUDGET * SEGMENT_FRAGMENT_CAPACITY + 100),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: Some(source_range(
+                    "n0",
+                    u64::try_from(FRAGMENT_TEXT_BUDGET * SEGMENT_FRAGMENT_CAPACITY + 100).unwrap(),
+                )),
+            }),
+            Block::Text(TextBlock {
+                kind: TextBlockKind::Heading(2),
+                content: vec![Inline::Text(TextRun {
+                    text: "Later".into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle::default(),
+                source: Some(source_range("n1", 5)),
+            }),
+        ];
+        source_mut.sections[0].anchors = vec![SectionAnchor {
+            fragment: "later".into(),
+            source: source_range("n1", 5).start,
+        }];
+        source_mut.book.table_of_contents = vec![
+            TocEntry {
+                label: "Start".into(),
+                href: Some(PublicationUrl::parse("section-0.xhtml").unwrap()),
+                children: Vec::new(),
+            },
+            TocEntry {
+                label: "Later".into(),
+                href: Some(PublicationUrl::parse("section-0.xhtml#later").unwrap()),
+                children: Vec::new(),
+            },
+        ];
+        let mut reader =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+        assert_eq!(reader.snapshot().active_toc_id.as_deref(), Some("0"));
+        let mut previous_progress = reader.snapshot().total_progression;
+
+        for _ in 0..100 {
+            let result = reader.turn_page(PageDirection::Next).unwrap();
+            assert!(result.snapshot.total_progression > previous_progress);
+            previous_progress = result.snapshot.total_progression;
+            if result.snapshot.active_toc_id.as_deref() == Some("1") {
+                assert!(result.snapshot.location.segment_index > 0);
+                assert_eq!(source.parse_count(0), 1);
+                return;
+            }
+        }
+        panic!("reader did not reach the later fragment TOC anchor");
     }
 
     #[test]
@@ -726,6 +1878,29 @@ mod tests {
     }
 
     #[test]
+    fn background_section_parse_does_not_block_snapshot_updates() {
+        let mut source = CountingSource::with_background_delay(
+            &["first".into(), "second".into()],
+            Duration::from_millis(300),
+        );
+        Arc::get_mut(&mut source).unwrap().book.table_of_contents = vec![TocEntry {
+            label: "Second".into(),
+            href: Some(PublicationUrl::parse("section-1.xhtml").unwrap()),
+            children: Vec::new(),
+        }];
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        reader.prefetch_adjacent().unwrap();
+        thread::sleep(Duration::from_millis(30));
+
+        let started = Instant::now();
+        let _snapshot = reader.snapshot();
+
+        assert!(started.elapsed() < Duration::from_millis(100));
+        reader.wait_for_prefetch().unwrap();
+    }
+
+    #[test]
     fn resize_rebuilds_layout_and_preserves_approximate_progress() {
         let source = CountingSource::new(&["调整窗口后保持阅读进度。".repeat(600)]);
         let mut reader =
@@ -744,8 +1919,8 @@ mod tests {
         let new_fraction = page_fraction(location.page_index, location.page_count);
         let one_page = page_fraction(1, location.page_count);
         assert!((new_fraction - old_fraction).abs() <= one_page);
-        assert_eq!(source.parse_count(0), 2);
-        assert_eq!(reader.cached_section_count(), 1);
+        assert_eq!(source.parse_count(0), 1);
+        assert_eq!(reader.cached_segment_count(), 1);
     }
 
     #[test]
@@ -770,7 +1945,176 @@ mod tests {
         let one_page = page_fraction(1, location.page_count);
         assert!((new_fraction - old_fraction).abs() <= one_page);
         assert_eq!(reader.style().font_family, ReaderFontFamily::SansSerif);
-        assert_eq!(source.parse_count(0), 2);
-        assert_eq!(reader.cached_section_count(), 1);
+        assert_eq!(source.parse_count(0), 1);
+        assert_eq!(reader.cached_segment_count(), 1);
+    }
+
+    #[test]
+    fn toc_items_preserve_reading_order_depth_and_ancestry() {
+        let first_target = PublicationUrl::parse("text/chapter-1.xhtml").unwrap();
+        let child_target = PublicationUrl::parse("text/chapter-1.xhtml#part-1").unwrap();
+        let items = flatten_toc(&[
+            TocEntry {
+                label: "第一章".into(),
+                href: Some(first_target.clone()),
+                children: vec![TocEntry {
+                    label: "第一节".into(),
+                    href: Some(child_target.clone()),
+                    children: Vec::new(),
+                }],
+            },
+            TocEntry {
+                label: "第二章".into(),
+                href: None,
+                children: Vec::new(),
+            },
+        ]);
+
+        assert_eq!(items.len(), 3);
+        assert_eq!((items[0].label.as_str(), items[0].depth), ("第一章", 0));
+        assert_eq!(items[0].target.as_ref(), Some(&first_target));
+        assert!(items[0].has_children);
+        assert!(items[0].ancestors.is_empty());
+        assert_eq!((items[1].label.as_str(), items[1].depth), ("第一节", 1));
+        assert_eq!(items[1].target.as_ref(), Some(&child_target));
+        assert_eq!(items[1].ancestors, ["0"]);
+        assert_eq!((items[2].label.as_str(), items[2].depth), ("第二章", 0));
+        assert!(items[2].target.is_none());
+    }
+
+    #[test]
+    fn active_toc_follows_the_nearest_preceding_segment_page() {
+        let items = vec![
+            TocViewItem {
+                id: "previous".into(),
+                label: "Previous".into(),
+                target: Some(PublicationUrl::parse("section-0.xhtml#previous").unwrap()),
+                depth: 0,
+                ancestors: Vec::new(),
+                has_children: false,
+            },
+            TocViewItem {
+                id: "chapter".into(),
+                label: "Chapter".into(),
+                target: Some(PublicationUrl::parse("section-1.xhtml#chapter").unwrap()),
+                depth: 0,
+                ancestors: Vec::new(),
+                has_children: true,
+            },
+            TocViewItem {
+                id: "subsection".into(),
+                label: "Subsection".into(),
+                target: Some(PublicationUrl::parse("section-1.xhtml#subsection").unwrap()),
+                depth: 1,
+                ancestors: vec!["chapter".into()],
+                has_children: false,
+            },
+            TocViewItem {
+                id: "future".into(),
+                label: "Future".into(),
+                target: Some(PublicationUrl::parse("section-2.xhtml#future").unwrap()),
+                depth: 0,
+                ancestors: Vec::new(),
+                has_children: false,
+            },
+        ];
+        let position = |section_index, segment_index, page_index| ReaderPosition {
+            section_index,
+            segment_index,
+            page_index,
+        };
+        let resolve = |target: &PublicationUrl| match (target.path(), target.fragment()) {
+            ("section-0.xhtml", _) => Some(position(0, 0, 4)),
+            ("section-1.xhtml", Some("chapter")) => Some(position(1, 1, 2)),
+            ("section-1.xhtml", Some("subsection")) => Some(position(1, 2, 0)),
+            ("section-2.xhtml", _) => Some(position(2, 0, 0)),
+            _ => None,
+        };
+
+        assert_eq!(
+            active_toc_item_for_location(&items, 1, 0, 1, resolve)
+                .unwrap()
+                .id,
+            "previous"
+        );
+        assert_eq!(
+            active_toc_item_for_location(&items, 1, 1, 2, resolve)
+                .unwrap()
+                .id,
+            "chapter"
+        );
+        assert_eq!(
+            active_toc_item_for_location(&items, 1, 2, 0, resolve)
+                .unwrap()
+                .id,
+            "subsection"
+        );
+    }
+
+    #[test]
+    fn snapshot_owns_active_toc_state_and_progression() {
+        let mut source = CountingSource::new(&["正文".repeat(600)]);
+        Arc::get_mut(&mut source).unwrap().book.table_of_contents = vec![TocEntry {
+            label: "Chapter".into(),
+            href: Some(PublicationUrl::parse("section-0.xhtml").unwrap()),
+            children: vec![TocEntry {
+                label: "Child".into(),
+                href: Some(PublicationUrl::parse("section-0.xhtml").unwrap()),
+                children: Vec::new(),
+            }],
+        }];
+        let reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+
+        let snapshot = reader.snapshot();
+        assert_eq!(snapshot.active_toc_id.as_deref(), Some("0/0"));
+        assert_eq!(snapshot.active_toc_path, ["0"]);
+        assert!(snapshot.total_progression > 0.0);
+        assert!(snapshot.total_progression <= 1.0);
+    }
+
+    #[test]
+    fn stale_prefetch_result_cannot_clear_current_generation_request() {
+        let source = CountingSource::new(&["第一章".into(), "第二章".into()]);
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        let stale_generation = reader.prefetch_worker.generation();
+        let current_generation = reader.prefetch_worker.invalidate();
+        let segment = SegmentKey {
+            section_index: 1,
+            segment_index: 0,
+        };
+        let current_key = PrefetchKey {
+            generation: current_generation,
+            segment,
+        };
+        reader.prefetch_inflight.insert(current_key);
+        let section = Arc::clone(reader.current_section_data());
+
+        reader.install_prefetch(PrefetchResult {
+            key: segment,
+            generation: stale_generation,
+            segment: Ok(Arc::new(CachedSegment {
+                section,
+                pages: Vec::new(),
+                anchor_pages: HashMap::new(),
+            })),
+        });
+
+        assert!(reader.prefetch_inflight.contains(&current_key));
+    }
+
+    #[test]
+    fn dropping_reader_joins_worker_and_releases_source() {
+        let source = CountingSource::new(&["正文".into()]);
+        let weak = Arc::downgrade(&source);
+        let reader =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+        drop(source);
+
+        assert!(weak.upgrade().is_some());
+        drop(reader);
+        assert!(weak.upgrade().is_none());
     }
 }

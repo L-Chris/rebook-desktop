@@ -1,6 +1,6 @@
 # 原生 Reading IR 重构状态
 
-- 日期：2026-07-24
+- 日期：2026-07-25
 - 主机：Windows x86_64，Rust 1.97.1，优化的增量 dev profile / 默认 test profile
 - 结论：新的 parser -> renderer 主链已贯通，分页和缓存翻页已验证；当前仍是阅读内核，不是完整产品。
 
@@ -9,11 +9,13 @@
 | 层 | 当前实现 |
 | --- | --- |
 | Publication | `BookSource`、`Book/Section/Block/Inline`、文字/块/图片样式子集、PublicationUrl、SourceRange |
-| EPUB | 安全 ZIP/OCF/OPF、EPUB 3 Nav、EPUB 2 NCX、层级 TOC、懒章节/资源、独立 XHTML Reading IR parser、受控内外联 CSS cascade |
-| Layout | 持久化 Parley context、中文塑形、长段落跨页、图片 CSS 尺寸/单次解码/缩放、单页/双页 spread、renderer-independent PageLayout |
+| Formats | EPUB archive source，以及 Kindle、FB2、CBZ 直接 `BookSource`；不再构造内存 EPUB |
+| HTML | EPUB、Kindle、FB2 共享的 HTML/CSS → Reading IR parser 与受控 CSS cascade |
+| EPUB | 安全 ZIP/OCF/OPF、EPUB 3 Nav、EPUB 2 NCX、层级 TOC、懒章节/资源 |
+| Layout | 持久化 Parley context、中文塑形、长段落跨页、多 content fragment 连续分页、图片 CSS 尺寸/单次解码/缩放、单页/双页 spread、renderer-independent PageLayout |
 | Renderer | retained PageDisplayList、glyph/font/image/rule 命令、Vello GPU/CPU、DPI 缩放 |
-| Reader | 当前章节/页状态、TOC/href 跳转、五章节 LRU、持久 worker 前后各两章预取、缓存翻页、resize/样式 generation 失效与进度恢复 |
-| Desktop | Xilem 0.4.0/Masonry 原生组件、Lucide 图标、Vello GPU 阅读页与 32 页 Scene LRU、44px 悬浮工具栏、默认双栏、设置弹窗、固定/浮动目录侧边栏、虚拟目录滚动、EPUB2/3 封面、方向键翻页、resize 重排、4px 阅读进度条、CPU 诊断模式 |
+| Reader | `ReaderSnapshot` / `ReaderPosition`、统一导航结果、稳定 content fragment、三个 fragment 一组的有界 layout segment/checkpoint、超长单段与列表 continuation、TOC/href segment 直达、segment LRU、受管 worker 相邻 segment 预取、逐章节解析协调、generation 失效与进度恢复 |
+| Desktop | 直接持有 `ReaderSession` 并消费快照；Xilem 0.4.0/Masonry 原生组件、Vello GPU 阅读页与 32 页 Scene LRU、设置弹窗和目录侧边栏 |
 
 Blitz、Stylo、Taffy、DOM adapter 和旧 `Publication` trait 已从当前代码主链移除。
 
@@ -28,7 +30,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-当前共有 26 项核心单元测试：Desktop 4、Publication 4、EPUB 9、Layout 3、Renderer 1、Reader 5。Desktop 测试覆盖层级目录展开顺序/深度、Canvas 逻辑尺寸转换、顶部悬停区和方向键翻页映射；EPUB 测试同时覆盖 EPUB 3 `cover-image` 与 EPUB 2 `meta name="cover"` 封面定位。其余测试覆盖 fragment 章节导航、双栏两列几何，以及图片百分比 width、max-width 和纵横比约束；Reader 仍以人工 300ms 慢章节确认预取投递不会阻塞调用线程。
+测试覆盖 Desktop、Publication、HTML、EPUB、Formats、Layout、Renderer 与 Reader。除格式解析外，Reader 还覆盖超长单段的 Unicode/SourceRange 切分、列表 marker continuation、content fragment 边界不提交半页、跨 segment 前后翻页、目录与总进度跨 segment 更新、远距离锚点只编译目标 segment、旧 generation 预取结果隔离、worker 回收，以及人工 300ms 慢章节解析期间的非阻塞快照更新。
 
 ## 真实 EPUB 诊断
 
@@ -46,12 +48,12 @@ cargo test --workspace
 | CPU raster paint | 3.30 ms |
 | total | 41.98 ms |
 
-这些数值用于定位数量级，不是 release 性能承诺。章节工作发生在持久 worker，UI 线程只负责投递和安装结果；缓存翻页不包含 parser/layout/compile。桌面交互还会缓存最近 32 个 Vello Scene，工具栏显隐、菜单开关和已访问页面不会重新编码整页。CPU paint 是完整页面栅格化成本，GPU 窗口路径另行执行。
+这些数值是分片重构前的 EPUB 基线，只用于定位数量级，不是 release 性能承诺。当前实现把布局和 display-list compile 限制在单个有界 layout segment；缓存翻页不包含 parser/layout/compile。桌面交互还会缓存最近 32 个 Vello Scene，工具栏显隐、菜单开关和已访问页面不会重新编码整页。CPU paint 是完整页面栅格化成本，GPU 窗口路径另行执行。
 
 ## 已知缺口与优先级
 
-1. 当前打开的首章和未能提前命中的章节仍需等待整章分页；前后各两章已有后台预取，后续可增加增量分页，但保持相同 Reading IR 和页面缓存协议。
+1. 大型 authored section 已拆成稳定 content fragment 与有界 layout segment；Paginator 在 segment 内连续分页，只有每三个 fragment 的 checkpoint 会提交当前页。后续可让 Paginator 导出/恢复跨 checkpoint continuation state，进一步减少极长章节中的少量 checkpoint 留白，同时保持随机直达成本有界。
 2. CSS cascade 只覆盖 tag/class/id/`tag.class`/selector group 和阅读所需属性；复杂 selector、`@import`、媒体查询与完整盒模型仍按真实书籍需求逐步进入 IR，不回退到完整浏览器 DOM。
-3. TOC href fragment 当前解析到所属 spine section；章内精确定位需要 Reading IR 保留 authored element ID 并建立 anchor 到页面的索引。
+3. TOC href fragment 已通过 Reading IR authored element ID 映射到重排后的页面；长段落内部的字符级 fragment 目前仍定位到该段落第一页。
 4. 完善稳定 SourceAnchor 到 glyph/rect 的双向映射，为选择、书签、批注和搜索服务。
-5. 增加固定字体截图、真实 Windows GPU 窗口冒烟、图片像素预算，以及 ruby/bidi/竖排/fixed-layout 能力矩阵。
+5. 已完成 `rebook/data/1.azw3` 的真实 Windows GPU 窗口、封面和深层目录直达冒烟；仍需增加固定字体截图、图片像素预算，以及 ruby/bidi/竖排/fixed-layout 能力矩阵。

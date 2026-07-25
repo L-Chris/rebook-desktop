@@ -1,149 +1,89 @@
 //! Safe, pull-based EPUB publication parser.
 
-mod reading;
-
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
 use std::io::{Cursor, Read};
-use std::path::Path;
 use std::sync::Arc;
 
 use quick_xml::Reader;
 use quick_xml::events::Event;
+use rebook_html::parse_section;
 use rebook_publication::{
-    Book, BookSource, Link, Metadata, PublicationError, PublicationId, PublicationUrl,
-    RenditionLayout, Resource, Section, SpineItem, SpineItemId, TocEntry,
+    Book, BookSource, Metadata, PublicationError, PublicationId, PublicationUrl, RenditionLayout,
+    Resource, Section, SpineItem, SpineItemId, TocEntry,
 };
 use roxmltree::{Document, Node};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zip::{CompressionMethod, ZipArchive};
 
 /// Resource budgets applied before and during decompression.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EpubLimits {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EpubLimits {
     /// Maximum compressed EPUB file size.
-    pub max_archive_bytes: u64,
+    archive_bytes: u64,
     /// Maximum number of non-directory archive entries.
-    pub max_entries: usize,
+    entries: usize,
     /// Maximum uncompressed size of one entry.
-    pub max_entry_bytes: u64,
+    entry_bytes: u64,
     /// Maximum declared uncompressed size across all entries.
-    pub max_total_uncompressed_bytes: u64,
+    total_uncompressed_bytes: u64,
     /// Maximum uncompressed/compressed ratio for a non-empty entry.
-    pub max_compression_ratio: u64,
+    compression_ratio: u64,
     /// Maximum bytes accepted for one XML document.
-    pub max_xml_bytes: u64,
+    xml_bytes: u64,
     /// Maximum XML element nesting depth.
-    pub max_xml_depth: usize,
+    xml_depth: usize,
 }
 
 impl Default for EpubLimits {
     fn default() -> Self {
         Self {
-            max_archive_bytes: 512 * 1024 * 1024,
-            max_entries: 10_000,
-            max_entry_bytes: 64 * 1024 * 1024,
-            max_total_uncompressed_bytes: 1024 * 1024 * 1024,
-            max_compression_ratio: 200,
-            max_xml_bytes: 8 * 1024 * 1024,
-            max_xml_depth: 128,
+            archive_bytes: 512 * 1024 * 1024,
+            entries: 10_000,
+            entry_bytes: 64 * 1024 * 1024,
+            total_uncompressed_bytes: 1024 * 1024 * 1024,
+            compression_ratio: 200,
+            xml_bytes: 8 * 1024 * 1024,
+            xml_depth: 128,
         }
     }
 }
 
 /// Parser behavior for spec violations commonly found in real publications.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EpubOpenOptions {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EpubOpenOptions {
     /// Resource budgets.
-    pub limits: EpubLimits,
+    limits: EpubLimits,
     /// When true, missing or misplaced `mimetype` is an error instead of a warning.
-    pub strict_container: bool,
-}
-
-/// Machine-readable diagnostic severity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DiagnosticSeverity {
-    /// Publication opened, but compatibility recovery was needed.
-    Warning,
-    /// Informational parser observation.
-    Info,
-}
-
-/// Parser diagnostic retained by a successfully opened publication.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Diagnostic {
-    /// Stable diagnostic code.
-    pub code: String,
-    /// Severity.
-    pub severity: DiagnosticSeverity,
-    /// Human-readable explanation.
-    pub message: String,
-    /// Related publication resource.
-    pub resource: Option<String>,
+    strict_container: bool,
 }
 
 /// Parsed EPUB backed by an immutable in-memory archive and lazy resource reads.
 #[derive(Debug)]
-pub struct EpubPublication {
+pub(super) struct EpubPublication {
     book: Book,
-    manifest: Vec<Link>,
-    diagnostics: Vec<Diagnostic>,
     media_types: HashMap<String, String>,
     archive: EpubArchive,
 }
 
 impl EpubPublication {
-    /// Opens an EPUB from a local file after enforcing the archive-size budget.
-    pub fn open_file(path: impl AsRef<Path>) -> Result<Self, EpubError> {
-        Self::open_file_with_options(path, EpubOpenOptions::default())
-    }
-
-    /// Opens an EPUB from a local file with explicit parser options.
-    pub fn open_file_with_options(
-        path: impl AsRef<Path>,
-        options: EpubOpenOptions,
-    ) -> Result<Self, EpubError> {
-        let mut file = File::open(path.as_ref())?;
-        let size = file.metadata()?.len();
-        ensure_limit(
-            size <= options.limits.max_archive_bytes,
-            format!(
-                "archive contains {size} bytes; limit is {}",
-                options.limits.max_archive_bytes
-            ),
-        )?;
-        let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
-        file.by_ref()
-            .take(options.limits.max_archive_bytes.saturating_add(1))
-            .read_to_end(&mut bytes)?;
-        ensure_limit(
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= options.limits.max_archive_bytes,
-            "archive grew beyond its configured size while being read",
-        )?;
-        Self::open_bytes_with_options(bytes, options)
-    }
-
     /// Opens an EPUB from immutable bytes using default limits.
-    pub fn open_bytes(bytes: impl Into<Arc<[u8]>>) -> Result<Self, EpubError> {
+    pub(super) fn open_bytes(bytes: impl Into<Arc<[u8]>>) -> Result<Self, EpubError> {
         Self::open_bytes_with_options(bytes, EpubOpenOptions::default())
     }
 
     /// Opens an EPUB from immutable bytes with explicit limits and compatibility behavior.
-    pub fn open_bytes_with_options(
+    fn open_bytes_with_options(
         bytes: impl Into<Arc<[u8]>>,
         options: EpubOpenOptions,
     ) -> Result<Self, EpubError> {
         let bytes = bytes.into();
         ensure_limit(
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= options.limits.max_archive_bytes,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= options.limits.archive_bytes,
             "archive exceeds configured byte limit",
         )?;
         let archive = EpubArchive::new(bytes.clone(), options.limits)?;
-        let mut diagnostics = Vec::new();
-        validate_mimetype(&archive, options.strict_container, &mut diagnostics)?;
+        validate_mimetype(&archive, options.strict_container)?;
 
         let container_url = PublicationUrl::parse("META-INF/container.xml")?;
         let container = archive.read_xml(&container_url)?;
@@ -153,33 +93,18 @@ impl EpubPublication {
         let package_model = parse_package(&package, &package_url)?;
 
         let mut media_types = HashMap::new();
-        let mut manifest = Vec::with_capacity(package_model.manifest.len());
         for item in package_model
             .manifest_order
             .iter()
             .filter_map(|id| package_model.manifest.get(id))
         {
             media_types.insert(item.href.path().to_owned(), item.media_type.clone());
-            manifest.push(Link {
-                href: item.href.clone(),
-                media_type: item.media_type.clone(),
-                properties: item.properties.clone(),
-            });
         }
 
         let reading_order = build_reading_order(&package_model)?;
         let table_of_contents = parse_navigation(&archive, &package_model)?;
         let digest = Sha256::digest(bytes.as_ref());
-        let id = PublicationId::new(format!("sha256:{digest:x}"))?;
-
-        if table_of_contents.is_empty() {
-            diagnostics.push(Diagnostic {
-                code: "epub.navigation.missing".into(),
-                severity: DiagnosticSeverity::Warning,
-                message: "publication has no usable EPUB navigation document or NCX".into(),
-                resource: Some(package_url.to_string()),
-            });
-        }
+        let id = PublicationId::new(format!("{digest:x}"))?;
 
         Ok(Self {
             book: Book {
@@ -189,21 +114,9 @@ impl EpubPublication {
                 sections: reading_order,
                 table_of_contents,
             },
-            manifest,
-            diagnostics,
             media_types,
             archive,
         })
-    }
-
-    /// Returns package manifest links in declaration order.
-    pub fn manifest(&self) -> &[Link] {
-        &self.manifest
-    }
-
-    /// Returns compatibility diagnostics emitted while opening.
-    pub fn diagnostics(&self) -> &[Diagnostic] {
-        &self.diagnostics
     }
 }
 
@@ -250,7 +163,9 @@ impl EpubPublication {
         }
 
         let xml = self.archive.read_xml(&descriptor.href)?;
-        reading::parse_section(&xml, descriptor, |href| self.archive.read_stylesheet(href))
+        Ok(parse_section(&xml, descriptor, |href| {
+            self.archive.read_stylesheet(href).ok()
+        })?)
     }
 }
 #[derive(Debug)]
@@ -272,11 +187,11 @@ impl EpubArchive {
     fn new(bytes: Arc<[u8]>, limits: EpubLimits) -> Result<Self, EpubError> {
         let mut archive = ZipArchive::new(Cursor::new(bytes.clone()))?;
         ensure_limit(
-            archive.len() <= limits.max_entries,
+            archive.len() <= limits.entries,
             format!(
                 "archive contains {} entries; limit is {}",
                 archive.len(),
-                limits.max_entries
+                limits.entries
             ),
         )?;
 
@@ -304,12 +219,12 @@ impl EpubArchive {
 
             let href = PublicationUrl::parse(file.name())?.resource_url();
             ensure_limit(
-                file.size() <= limits.max_entry_bytes,
+                file.size() <= limits.entry_bytes,
                 format!(
                     "entry {} declares {} uncompressed bytes; per-entry limit is {}",
                     href,
                     file.size(),
-                    limits.max_entry_bytes
+                    limits.entry_bytes
                 ),
             )?;
             ensure_compression_ratio(file.size(), file.compressed_size(), limits, &href)?;
@@ -317,10 +232,10 @@ impl EpubArchive {
                 .checked_add(file.size())
                 .ok_or_else(|| EpubError::ResourceLimit("uncompressed size overflow".into()))?;
             ensure_limit(
-                total_uncompressed <= limits.max_total_uncompressed_bytes,
+                total_uncompressed <= limits.total_uncompressed_bytes,
                 format!(
                     "archive declares {total_uncompressed} uncompressed bytes; total limit is {}",
-                    limits.max_total_uncompressed_bytes
+                    limits.total_uncompressed_bytes
                 ),
             )?;
 
@@ -349,7 +264,7 @@ impl EpubArchive {
             .get(href.path())
             .ok_or_else(|| EpubError::ResourceNotFound(href.to_string()))?;
         ensure_limit(
-            entry.size <= self.limits.max_entry_bytes,
+            entry.size <= self.limits.entry_bytes,
             format!("resource exceeded size budget: {href}"),
         )?;
         ensure_compression_ratio(entry.size, entry.compressed_size, self.limits, href)?;
@@ -359,10 +274,10 @@ impl EpubArchive {
         let capacity = usize::try_from(entry.size).unwrap_or(0);
         let mut bytes = Vec::with_capacity(capacity);
         file.by_ref()
-            .take(self.limits.max_entry_bytes.saturating_add(1))
+            .take(self.limits.entry_bytes.saturating_add(1))
             .read_to_end(&mut bytes)?;
         ensure_limit(
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= self.limits.max_entry_bytes,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= self.limits.entry_bytes,
             format!("resource expanded beyond size budget: {href}"),
         )?;
         Ok(bytes)
@@ -374,15 +289,15 @@ impl EpubArchive {
             .get(href.path())
             .ok_or_else(|| EpubError::ResourceNotFound(href.to_string()))?;
         ensure_limit(
-            entry.size <= self.limits.max_xml_bytes,
+            entry.size <= self.limits.xml_bytes,
             format!(
                 "XML resource {} declares {} bytes; XML limit is {}",
-                href, entry.size, self.limits.max_xml_bytes
+                href, entry.size, self.limits.xml_bytes
             ),
         )?;
         let bytes = self.read(href)?;
         let text = decode_xml(&bytes, href)?;
-        sanitize_and_validate_xml(&text, href, self.limits.max_xml_depth)
+        sanitize_and_validate_xml(&text, href, self.limits.xml_depth)
     }
 
     fn read_stylesheet(&self, href: &PublicationUrl) -> Result<String, EpubError> {
@@ -391,10 +306,10 @@ impl EpubArchive {
             .get(href.path())
             .ok_or_else(|| EpubError::ResourceNotFound(href.to_string()))?;
         ensure_limit(
-            entry.size <= self.limits.max_xml_bytes,
+            entry.size <= self.limits.xml_bytes,
             format!(
                 "stylesheet {} declares {} bytes; text limit is {}",
-                href, entry.size, self.limits.max_xml_bytes
+                href, entry.size, self.limits.xml_bytes
             ),
         )?;
         decode_xml(&self.read(href)?, href)
@@ -426,48 +341,26 @@ struct SpineReference {
     properties: Vec<String>,
 }
 
-fn validate_mimetype(
-    archive: &EpubArchive,
-    strict: bool,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Result<(), EpubError> {
+fn validate_mimetype(archive: &EpubArchive, strict: bool) -> Result<(), EpubError> {
     let href = PublicationUrl::parse("mimetype")?;
     let Some(entry) = archive.entries.get(href.path()) else {
-        return container_issue(
-            strict,
-            diagnostics,
-            "epub.container.mimetype-missing",
-            "EPUB archive is missing its root mimetype entry",
-        );
+        return container_issue(strict, "EPUB archive is missing its root mimetype entry");
     };
     let bytes = archive.read(&href)?;
     let valid_value = bytes == b"application/epub+zip";
     if !valid_value || !entry.stored || entry.index != 0 {
         return container_issue(
             strict,
-            diagnostics,
-            "epub.container.mimetype-invalid",
             "mimetype must be the first, stored entry and contain application/epub+zip",
         );
     }
     Ok(())
 }
 
-fn container_issue(
-    strict: bool,
-    diagnostics: &mut Vec<Diagnostic>,
-    code: &str,
-    message: &str,
-) -> Result<(), EpubError> {
+fn container_issue(strict: bool, message: &str) -> Result<(), EpubError> {
     if strict {
         Err(EpubError::InvalidArchive(message.into()))
     } else {
-        diagnostics.push(Diagnostic {
-            code: code.into(),
-            severity: DiagnosticSeverity::Warning,
-            message: message.into(),
-            resource: Some("mimetype".into()),
-        });
         Ok(())
     }
 }
@@ -893,10 +786,10 @@ fn ensure_compression_ratio(
         return Ok(());
     }
     ensure_limit(
-        compressed_size > 0 && size / compressed_size.max(1) <= limits.max_compression_ratio,
+        compressed_size > 0 && size / compressed_size.max(1) <= limits.compression_ratio,
         format!(
             "entry compression ratio exceeds {}: {href}",
-            limits.max_compression_ratio
+            limits.compression_ratio
         ),
     )
 }
@@ -983,7 +876,7 @@ fn guess_media_type(path: &str) -> &'static str {
 
 /// EPUB open and resource errors.
 #[derive(Debug, Error)]
-pub enum EpubError {
+pub(super) enum EpubError {
     /// File-system access failed.
     #[error("EPUB I/O failed: {0}")]
     Io(#[from] std::io::Error),
@@ -1013,6 +906,9 @@ pub enum EpubError {
     /// An intentionally unsupported container feature was encountered.
     #[error("unsupported EPUB feature: {0}")]
     Unsupported(String),
+    /// Shared HTML reading-IR parsing failed.
+    #[error(transparent)]
+    Html(#[from] rebook_html::HtmlError),
     /// Format-neutral publication validation failed.
     #[error(transparent)]
     Publication(#[from] PublicationError),
@@ -1055,10 +951,8 @@ mod tests {
             publication.book().metadata.layout,
             RenditionLayout::Reflowable
         );
-        assert_eq!(publication.manifest()[0].href.path(), "OPS/nav.xhtml");
         assert_eq!(publication.book().sections.len(), 1);
         assert_eq!(publication.book().table_of_contents[0].label, "第一章");
-        assert_eq!(publication.diagnostics().len(), 0);
 
         let href = PublicationUrl::parse("OPS/Text/chapter.xhtml").expect("valid URL");
         let resource = publication.resource(&href).expect("chapter resource");
@@ -1084,7 +978,7 @@ mod tests {
         let bytes = minimal_epub();
         let options = EpubOpenOptions {
             limits: EpubLimits {
-                max_total_uncompressed_bytes: 128,
+                total_uncompressed_bytes: 128,
                 ..EpubLimits::default()
             },
             strict_container: false,

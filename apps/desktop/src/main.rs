@@ -1,4 +1,4 @@
-//! Native EPUB reader: parser -> reading IR -> page layout -> display list -> Xilem/Vello.
+//! Native e-book reader: parser -> reading IR -> page layout -> display list -> Xilem/Vello.
 
 mod library;
 mod pointer_button;
@@ -10,18 +10,17 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyrender_vello_cpu::VelloCpuImageRenderer;
-use library::{LibraryBook, LocalLibrary, publication_cover_bytes};
+use library::{LibraryBook, LocalLibrary};
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 use pointer_button::button;
 use reader_canvas::{ReaderCanvasAction, reader_canvas};
-use rebook_epub::EpubPublication;
+use rebook_formats::{BookFormat, open_file as open_publication_file};
 use rebook_layout::{LayoutViewport, ReaderFontFamily, ReaderStyle, SpreadMode};
-use rebook_publication::{BookSource, PublicationUrl, Rgba, TocEntry};
-use rebook_reader::{PageDirection, PageTurn, ReaderSession};
+use rebook_publication::{PublicationUrl, Rgba};
+use rebook_reader::{NavigationOutcome, PageDirection, ReaderSession, ReaderSnapshot, TocViewItem};
 use vello_bridge::XilemVelloScene;
 use xilem::core::{fork, map_state};
 use xilem::masonry::kurbo::Size;
@@ -83,20 +82,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let launch = match parse_arguments()? {
-        LaunchMode::Diagnose(path) => {
-            let started = Instant::now();
-            let publication = Arc::new(EpubPublication::open_file(path)?);
-            let parsed = Instant::now();
-            let source: Arc<dyn BookSource> = publication;
-            let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
-            let reader = ReaderSession::open(source, viewport, ReaderStyle::default())?;
-            let laid_out = Instant::now();
-            diagnose_reader(reader, started, parsed, laid_out)?;
-            return Ok(());
-        }
-        launch => launch,
-    };
+    let launch = parse_arguments()?;
 
     let library =
         LocalLibrary::load_default().map_err(|error| io::Error::other(error.to_string()))?;
@@ -118,24 +104,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn open_reader(path: &Path) -> Result<DesktopReader, Box<dyn std::error::Error>> {
     let started = Instant::now();
-    let publication = Arc::new(EpubPublication::open_file(path)?);
-    let cover = publication_cover_bytes(&publication)
-        .as_deref()
+    let publication = open_publication_file(path)?;
+    let format = publication.format();
+    let cover = publication
+        .cover_bytes()
         .and_then(|bytes| decode_cover(bytes).ok());
-    let source: Arc<dyn BookSource> = publication;
+    let source = publication.source();
     let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
     let reader = ReaderSession::open(source, viewport, ReaderStyle::default())?;
     tracing::debug!(
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         "opened book"
     );
-    Ok(DesktopReader::new(reader, cover))
+    Ok(DesktopReader::new(reader, cover, format))
 }
 
 enum LaunchMode {
     Shelf,
     Open(PathBuf),
-    Diagnose(PathBuf),
 }
 
 fn parse_arguments() -> Result<LaunchMode, Box<dyn std::error::Error>> {
@@ -147,13 +133,7 @@ fn parse_arguments() -> Result<LaunchMode, Box<dyn std::error::Error>> {
     let Some(first) = arguments.next() else {
         return Ok(LaunchMode::Shelf);
     };
-    let launch = if first == "--diagnose" {
-        LaunchMode::Diagnose(PathBuf::from(
-            arguments.next().ok_or_else(|| usage(&executable))?,
-        ))
-    } else {
-        LaunchMode::Open(PathBuf::from(first))
-    };
+    let launch = LaunchMode::Open(PathBuf::from(first));
     if arguments.next().is_some() {
         return Err(usage(&executable).into());
     }
@@ -253,9 +233,10 @@ impl ShelfState {
 }
 
 struct DesktopReader {
-    reader: Mutex<ReaderSession>,
-    toc_rows: Vec<TocRow>,
+    reader: ReaderSession,
+    snapshot: ReaderSnapshot,
     cover: Option<ImageData>,
+    format: BookFormat,
     ui: ReaderUiState,
     canvas_size: Option<(u32, u32)>,
     scene_revision: u64,
@@ -267,8 +248,9 @@ struct DesktopReader {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct PageSceneKey {
-    section_index: usize,
-    page_index: usize,
+    section: usize,
+    segment: usize,
+    page: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -363,7 +345,6 @@ struct ReaderUiState {
     settings_motion: Motion,
     last_motion_tick: Option<Instant>,
     expanded_toc: HashSet<String>,
-    active_toc_row: Option<String>,
 }
 
 impl ReaderUiState {
@@ -404,29 +385,20 @@ impl ReaderUiState {
     }
 }
 
-#[derive(Clone)]
-struct TocRow {
-    id: String,
-    label: String,
-    target: Option<PublicationUrl>,
-    depth: usize,
-    ancestors: Vec<String>,
-    has_children: bool,
-}
-
 impl DesktopReader {
-    fn new(mut reader: ReaderSession, cover: Option<ImageData>) -> Self {
-        let mut toc_rows = Vec::new();
-        flatten_toc(&reader.book().table_of_contents, 0, &[], &mut toc_rows);
+    fn new(mut reader: ReaderSession, cover: Option<ImageData>, format: BookFormat) -> Self {
         let draft_style = reader.style();
         let error = reader
             .prefetch_adjacent()
             .err()
             .map(|error| error.to_string());
-        let mut state = Self {
-            reader: Mutex::new(reader),
-            toc_rows,
+        let snapshot = reader.snapshot();
+        let expanded_toc = snapshot.active_toc_path.iter().cloned().collect();
+        Self {
+            reader,
+            snapshot,
             cover,
+            format,
             ui: ReaderUiState {
                 sidebar_open: true,
                 sidebar_pinned: true,
@@ -442,8 +414,7 @@ impl DesktopReader {
                 menu_motion: Motion::settled(0.0),
                 settings_motion: Motion::settled(0.0),
                 last_motion_tick: None,
-                expanded_toc: HashSet::new(),
-                active_toc_row: None,
+                expanded_toc,
             },
             canvas_size: None,
             scene_revision: 0,
@@ -451,9 +422,7 @@ impl DesktopReader {
             page_scene_lru: VecDeque::new(),
             error,
             exit_requested: false,
-        };
-        state.expand_active_toc_path();
-        state
+        }
     }
 
     fn request_exit(&mut self) {
@@ -461,28 +430,29 @@ impl DesktopReader {
     }
 
     fn turn_page(&mut self, direction: PageDirection) {
-        let (previous_section, result) = {
-            let mut reader = self.reader();
-            let previous_section = reader.location().section_index;
-            let result = reader.turn_page(direction);
-            (previous_section, result)
-        };
+        let previous_section = self.snapshot.location.section_index;
+        let previous_segment = self.snapshot.location.segment_index;
+        let result = self.reader.turn_page(direction);
         match result {
-            Ok(PageTurn::Moved { section_index, .. }) => {
-                self.bump_scene_revision();
+            Ok(result) => {
+                let moved = result.outcome == NavigationOutcome::Moved;
+                let section_changed = result.snapshot.location.section_index != previous_section;
+                let segment_changed = result.snapshot.location.segment_index != previous_segment;
+                self.install_snapshot(result.snapshot);
                 self.error = None;
-                if section_index != previous_section {
+                if moved {
+                    self.bump_scene_revision();
+                }
+                if moved && (section_changed || segment_changed) {
                     self.prefetch();
                 }
-                self.expand_active_toc_path();
             }
-            Ok(PageTurn::Boundary { .. }) => self.error = None,
             Err(error) => self.error = Some(format!("翻页失败：{error}")),
         }
     }
 
     fn open_settings(&mut self) {
-        let style = self.reader().style();
+        let style = self.reader.style();
         self.ui.draft_spread = style.spread;
         self.ui.draft_font_family = style.font_family;
         self.ui.draft_font_size = style.font_size;
@@ -490,13 +460,14 @@ impl DesktopReader {
     }
 
     fn apply_settings(&mut self) {
-        let mut style = self.reader().style();
+        let mut style = self.reader.style();
         style.spread = self.ui.draft_spread;
         style.font_family = self.ui.draft_font_family;
         style.font_size = self.ui.draft_font_size;
-        let result = self.reader().set_style(style);
+        let result = self.reader.set_style(style);
         match result {
-            Ok(()) => {
+            Ok(snapshot) => {
+                self.install_snapshot(snapshot);
                 self.close_overlay();
                 self.invalidate_page_scenes();
                 self.prefetch();
@@ -505,15 +476,14 @@ impl DesktopReader {
         }
     }
 
-    fn go_to(&mut self, row_id: &str, target: &PublicationUrl) {
-        let result = self.reader().go_to_href(target);
+    fn go_to(&mut self, target: &PublicationUrl) {
+        let result = self.reader.go_to_href(target);
         match result {
-            Ok(_) => {
+            Ok(result) => {
+                self.install_snapshot(result.snapshot);
                 self.bump_scene_revision();
                 self.error = None;
                 self.prefetch();
-                self.ui.active_toc_row = Some(row_id.to_owned());
-                self.expand_active_toc_path();
             }
             Err(error) => self.error = Some(format!("目录跳转失败：{error}")),
         }
@@ -531,9 +501,10 @@ impl DesktopReader {
         let Ok(viewport) = LayoutViewport::new(width, height) else {
             return;
         };
-        let result = self.reader().resize(viewport);
+        let result = self.reader.resize(viewport);
         match result {
-            Ok(()) => {
+            Ok(snapshot) => {
+                self.install_snapshot(snapshot);
                 self.canvas_size = Some((width, height));
                 self.invalidate_page_scenes();
                 self.prefetch();
@@ -544,7 +515,7 @@ impl DesktopReader {
 
     fn prefetch(&mut self) {
         let result = self
-            .reader()
+            .reader
             .prefetch_adjacent()
             .err()
             .map(|error| format!("章节预取失败：{error}"));
@@ -557,53 +528,18 @@ impl DesktopReader {
         }
     }
 
-    fn expand_active_toc_path(&mut self) {
-        let active_row = self.ui.active_toc_row.clone();
-        let path = {
-            let reader = self.reader();
-            let current_section = reader.location().section_index;
-            let matching_active_row = active_row.as_ref().and_then(|active_row| {
-                self.toc_rows.iter().find(|row| {
-                    &row.id == active_row
-                        && row
-                            .target
-                            .as_ref()
-                            .and_then(|target| reader.section_index_for_href(target))
-                            == Some(current_section)
-                })
-            });
-            matching_active_row
-                .or_else(|| {
-                    self.toc_rows.iter().find(|row| {
-                        let target_section = row
-                            .target
-                            .as_ref()
-                            .and_then(|target| reader.section_index_for_href(target));
-                        target_section == Some(current_section)
-                    })
-                })
-                .map(|row| {
-                    let mut path = row.ancestors.clone();
-                    if row.has_children {
-                        path.push(row.id.clone());
-                    }
-                    (row.id.clone(), path)
-                })
-        };
-        if let Some((row_id, path)) = path {
-            self.ui.active_toc_row = Some(row_id);
-            self.ui.expanded_toc.extend(path);
-        }
+    fn install_snapshot(&mut self, snapshot: ReaderSnapshot) {
+        self.ui
+            .expanded_toc
+            .extend(snapshot.active_toc_path.iter().cloned());
+        self.snapshot = snapshot;
     }
 
     fn page_scene(&mut self) -> Arc<Scene> {
-        let key = {
-            let reader = self.reader();
-            let location = reader.location();
-            PageSceneKey {
-                section_index: location.section_index,
-                page_index: location.page_index,
-            }
+        let key = PageSceneKey {
+            section: self.snapshot.location.section_index,
+            segment: self.snapshot.location.segment_index,
+            page: self.snapshot.location.page_index,
         };
         if let Some(scene) = self.page_scenes.get(&key).cloned() {
             self.touch_page_scene(key);
@@ -613,7 +549,7 @@ impl DesktopReader {
         let mut scene = Scene::new();
         {
             let mut bridge = XilemVelloScene::new(&mut scene);
-            self.reader().current_page().paint(&mut bridge);
+            self.reader.current_page().paint(&mut bridge);
         }
         let scene = Arc::new(scene);
         self.page_scenes.insert(key, Arc::clone(&scene));
@@ -647,18 +583,7 @@ impl DesktopReader {
     }
 
     fn progress(&self) -> f64 {
-        let reader = self.reader();
-        let location = reader.location();
-        let to_f64 = |value: usize| f64::from(u32::try_from(value).unwrap_or(u32::MAX));
-        let section_count = to_f64(reader.book().sections.len().max(1));
-        let page_count = to_f64(location.page_count.max(1));
-        ((to_f64(location.section_index) + to_f64(location.page_index + 1) / page_count)
-            / section_count)
-            .clamp(0.0, 1.0)
-    }
-
-    fn reader(&self) -> MutexGuard<'_, ReaderSession> {
-        self.reader.lock().expect("reader mutex was poisoned")
+        self.snapshot.total_progression
     }
 
     fn set_sidebar_open(&mut self, open: bool) {
@@ -977,7 +902,7 @@ fn shelf_book_card(book: &LibraryBook, cover: Option<ImageData>) -> impl WidgetV
             )
             .height(24.px())
             .expand_width(),
-            shelf_book_status(available),
+            shelf_book_status(available, book.format),
         ))
         .gap(7.px())
         .cross_axis_alignment(CrossAxisAlignment::Fill),
@@ -1044,7 +969,7 @@ fn shelf_remove_button(id: String, title: String) -> impl WidgetView<DesktopApp>
     .transform(Affine::translate((-8.0, 8.0)))
 }
 
-fn shelf_book_status(available: bool) -> impl WidgetView<DesktopApp> {
+fn shelf_book_status(available: bool, format: BookFormat) -> impl WidgetView<DesktopApp> {
     let (icon, text, color) = if available {
         (Icon::HardDrive, "本地", UI_MUTED)
     } else {
@@ -1058,7 +983,7 @@ fn shelf_book_status(available: bool) -> impl WidgetView<DesktopApp> {
         icon_label_for_app(icon, 12.0, color),
         label(text).text_size(11.5).color(color),
         FlexSpacer::Flex(1.0),
-        label("EPUB").text_size(11.5).color(UI_MUTED),
+        label(format.label()).text_size(11.5).color(UI_MUTED),
     ))
     .gap(5.px())
     .cross_axis_alignment(CrossAxisAlignment::Center)
@@ -1126,7 +1051,10 @@ fn divider_for_app() -> impl WidgetView<DesktopApp> {
 
 fn import_with_dialog(state: &mut DesktopApp) {
     let Some(paths) = rfd::FileDialog::new()
-        .add_filter("EPUB 电子书", &["epub"])
+        .add_filter(
+            "电子书（EPUB / Kindle / FB2 / CBZ）",
+            &["epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "zip"],
+        )
         .set_title("导入本地书籍")
         .pick_files()
     else {
@@ -1261,10 +1189,9 @@ fn reader_workspace(
     progress: f64,
 ) -> impl WidgetView<DesktopReader> + use<> {
     let (title, reader_background) = {
-        let reader = state.reader();
         (
-            reader.book().metadata.title.clone(),
-            ui_color(reader.style().background),
+            state.reader.book().metadata.title.clone(),
+            ui_color(state.reader.style().background),
         )
     };
     let menu_open = state.ui.overlay == ReaderOverlay::Menu;
@@ -1352,9 +1279,11 @@ fn reader_view(scene_revision: u64, reader_background: Color) -> impl WidgetView
 fn toc_view(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     let (title, author) = sidebar_book_metadata(state);
     let cover = state.cover.clone();
-    let active_row_id = state.ui.active_toc_row.clone();
+    let format = state.format;
+    let active_row_id = state.snapshot.active_toc_id.clone();
     let toc_rows = state
-        .toc_rows
+        .reader
+        .toc_items()
         .iter()
         .filter(|row| {
             row.ancestors
@@ -1371,7 +1300,7 @@ fn toc_view(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     sized_box(
         flex_col((
             sidebar_toolbar(state.ui.sidebar_pinned),
-            sidebar_book_summary(cover, title, author),
+            sidebar_book_summary(cover, title, author, format),
             divider(),
             sized_box(zstack((
                 portal(
@@ -1418,12 +1347,11 @@ fn sidebar_toolbar(pinned: bool) -> impl WidgetView<DesktopReader> {
 }
 
 fn sidebar_book_metadata(state: &DesktopReader) -> (String, String) {
-    let reader = state.reader();
-    let title = reader.book().metadata.title.clone();
-    let author = if reader.book().metadata.authors.is_empty() {
+    let title = state.reader.book().metadata.title.clone();
+    let author = if state.reader.book().metadata.authors.is_empty() {
         "未知作者".to_owned()
     } else {
-        reader.book().metadata.authors.join(" / ")
+        state.reader.book().metadata.authors.join(" / ")
     };
     (title, author)
 }
@@ -1432,9 +1360,10 @@ fn sidebar_book_summary(
     cover: Option<ImageData>,
     title: String,
     author: String,
+    format: BookFormat,
 ) -> impl WidgetView<DesktopReader> {
     flex_row((
-        sidebar_book_cover(cover),
+        sidebar_book_cover(cover, format),
         flex_col((
             prose(title)
                 .text_size(13.5)
@@ -1451,7 +1380,10 @@ fn sidebar_book_summary(
     .padding(Padding::from_vh(14.0, 4.0))
 }
 
-fn sidebar_book_cover(cover: Option<ImageData>) -> Box<AnyWidgetView<DesktopReader>> {
+fn sidebar_book_cover(
+    cover: Option<ImageData>,
+    format: BookFormat,
+) -> Box<AnyWidgetView<DesktopReader>> {
     if let Some(cover) = cover {
         sized_box(image(cover).fit(ObjectFit::Contain))
             .width(54.px())
@@ -1467,7 +1399,7 @@ fn sidebar_book_cover(cover: Option<ImageData>) -> Box<AnyWidgetView<DesktopRead
                     .text_size(10.0)
                     .weight(FontWeight::BOLD)
                     .color(UI_ACCENT),
-                label("EPUB").text_size(10.0).color(UI_MUTED),
+                label(format.label()).text_size(10.0).color(UI_MUTED),
             ))
             .gap(2.px())
             .cross_axis_alignment(CrossAxisAlignment::Center)
@@ -1483,13 +1415,12 @@ fn sidebar_book_cover(cover: Option<ImageData>) -> Box<AnyWidgetView<DesktopRead
 }
 
 fn toc_row_view(
-    row: TocRow,
+    row: TocViewItem,
     selected: bool,
     expanded: bool,
 ) -> impl WidgetView<DesktopReader> + use<> {
     let target = row.target;
-    let row_id = row.id;
-    let disclosure_row_id = row_id.clone();
+    let disclosure_row_id = row.id;
     let label_units = 22_usize.saturating_sub(row.depth.saturating_mul(2)).max(10);
     let row_label = ellipsize_display_text(&row.label, label_units);
     let (background, foreground) = if selected {
@@ -1548,7 +1479,7 @@ fn toc_row_view(
                 .cross_axis_alignment(CrossAxisAlignment::Center),
                 move |state: &mut DesktopReader| {
                     if let Some(target) = &target {
-                        state.go_to(&row_id, target);
+                        state.go_to(target);
                     }
                 },
             )
@@ -1591,7 +1522,6 @@ fn reader_toolbar(
         .boxed()
     };
     flex_row((
-        icon_button(Icon::ArrowLeft, false, DesktopReader::request_exit),
         left,
         FlexSpacer::Flex(1.0),
         label(title)
@@ -2145,110 +2075,8 @@ fn ui_color(color: Rgba) -> Color {
     Color::from_rgba8(color.red, color.green, color.blue, color.alpha)
 }
 
-fn flatten_toc(entries: &[TocEntry], depth: usize, ancestors: &[String], rows: &mut Vec<TocRow>) {
-    for (index, entry) in entries.iter().enumerate() {
-        let id = if let Some(parent) = ancestors.last() {
-            format!("{parent}/{index}")
-        } else {
-            index.to_string()
-        };
-        rows.push(TocRow {
-            id: id.clone(),
-            label: entry.label.clone(),
-            target: entry.href.clone(),
-            depth,
-            ancestors: ancestors.to_vec(),
-            has_children: !entry.children.is_empty(),
-        });
-        let mut child_ancestors = ancestors.to_vec();
-        child_ancestors.push(id);
-        flatten_toc(&entry.children, depth + 1, &child_ancestors, rows);
-    }
-}
-
-fn diagnose_reader(
-    mut reader: ReaderSession,
-    started: Instant,
-    parsed: Instant,
-    laid_out: Instant,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let prefetch_started = Instant::now();
-    reader.prefetch_adjacent()?;
-    let prefetch_dispatched = Instant::now();
-    reader.wait_for_prefetch()?;
-    let prefetched = Instant::now();
-    let switch_started = Instant::now();
-    let _ = reader.turn_page(PageDirection::Next)?;
-    let switched = Instant::now();
-    let cached_page_turn_ms = if reader.location().page_count > 1 {
-        let page_turn_started = Instant::now();
-        let _ = reader.turn_page(PageDirection::Next)?;
-        Some(page_turn_started.elapsed().as_secs_f64() * 1000.0)
-    } else {
-        None
-    };
-    let page = reader.current_page();
-    let scene_build_started = Instant::now();
-    let mut vello_scene = Scene::new();
-    {
-        let mut bridge = XilemVelloScene::new(&mut vello_scene);
-        page.paint(&mut bridge);
-    }
-    let scene_built = Instant::now();
-    let cpu_paint_started = Instant::now();
-    let rgba = anyrender::render_to_buffer::<VelloCpuImageRenderer, _>(
-        |scene| page.paint(scene),
-        page.width(),
-        page.height(),
-    );
-    let painted = Instant::now();
-    let distinct_colors = rgba
-        .chunks_exact(4)
-        .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
-        .collect::<HashSet<_>>()
-        .len();
-    let non_transparent_pixels = rgba.chunks_exact(4).filter(|pixel| pixel[3] != 0).count();
-    let location = reader.location();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "architecture": "EPUB parser -> reading IR -> Parley pagination -> cached display list -> Vello",
-            "backend": "Vello CPU offscreen",
-            "parser_ms": elapsed_ms(started, parsed),
-            "layout_and_compile_ms": elapsed_ms(parsed, laid_out),
-            "prefetch_dispatch_ms": elapsed_ms(prefetch_started, prefetch_dispatched),
-            "prefetch_complete_ms": elapsed_ms(prefetch_started, prefetched),
-            "cached_section_switch_ms": elapsed_ms(switch_started, switched),
-            "cached_page_turn_ms": cached_page_turn_ms,
-            "vello_scene_build_ms": elapsed_ms(scene_build_started, scene_built),
-            "cpu_raster_paint_ms": elapsed_ms(cpu_paint_started, painted),
-            "total_ms": elapsed_ms(started, painted),
-            "book": {
-                "title": reader.book().metadata.title,
-                "section_count": reader.book().sections.len(),
-            },
-            "location": {
-                "section_index": location.section_index,
-                "page_index": location.page_index,
-                "page_count": location.page_count,
-            },
-            "display_list": {
-                "command_count": page.command_count(),
-                "width": page.width(),
-                "height": page.height(),
-            },
-            "render_target": {
-                "rgba_bytes": rgba.len(),
-                "non_transparent_pixels": non_transparent_pixels,
-                "distinct_colors": distinct_colors,
-            },
-        }))?
-    );
-    Ok(())
-}
-
 fn usage(executable: &str) -> String {
-    format!("usage: {executable} [book.epub] | {executable} --diagnose <book.epub>")
+    format!("usage: {executable} [book]")
 }
 
 fn decode_cover(bytes: &[u8]) -> Result<ImageData, ::image::ImageError> {
@@ -2272,49 +2100,9 @@ fn logical_dimension(value: f64) -> u32 {
     value.round().clamp(1.0, f64::from(u32::MAX)) as u32
 }
 
-fn elapsed_ms(start: Instant, end: Instant) -> f64 {
-    end.duration_since(start).as_secs_f64() * 1000.0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn flatten_toc_preserves_reading_order_and_depth() {
-        let first_target = PublicationUrl::parse("text/chapter-1.xhtml").unwrap();
-        let child_target = PublicationUrl::parse("text/chapter-1.xhtml#part-1").unwrap();
-        let entries = vec![
-            TocEntry {
-                label: "第一章".into(),
-                href: Some(first_target.clone()),
-                children: vec![TocEntry {
-                    label: "第一节".into(),
-                    href: Some(child_target.clone()),
-                    children: Vec::new(),
-                }],
-            },
-            TocEntry {
-                label: "第二章".into(),
-                href: None,
-                children: Vec::new(),
-            },
-        ];
-
-        let mut rows = Vec::new();
-        flatten_toc(&entries, 0, &[], &mut rows);
-
-        assert_eq!(rows.len(), 3);
-        assert_eq!((rows[0].label.as_str(), rows[0].depth), ("第一章", 0));
-        assert_eq!(rows[0].target.as_ref(), Some(&first_target));
-        assert!(rows[0].has_children);
-        assert!(rows[0].ancestors.is_empty());
-        assert_eq!((rows[1].label.as_str(), rows[1].depth), ("第一节", 1));
-        assert_eq!(rows[1].target.as_ref(), Some(&child_target));
-        assert_eq!(rows[1].ancestors, ["0"]);
-        assert_eq!((rows[2].label.as_str(), rows[2].depth), ("第二章", 0));
-        assert!(rows[2].target.is_none());
-    }
 
     #[test]
     fn logical_dimension_rejects_invalid_sizes_and_rounds_pixels() {
@@ -2373,7 +2161,6 @@ mod tests {
             settings_motion: Motion::settled(0.0),
             last_motion_tick: None,
             expanded_toc: HashSet::new(),
-            active_toc_row: None,
         };
 
         ui.reveal_toolbar(now);
@@ -2393,6 +2180,7 @@ mod tests {
             title: "系统之美".into(),
             authors: vec!["Donella Meadows".into()],
             file_name: "thinking-in-systems.epub".into(),
+            format: BookFormat::Epub,
             path: PathBuf::from("book.epub"),
             cover_bytes: None,
             added_at: 0,

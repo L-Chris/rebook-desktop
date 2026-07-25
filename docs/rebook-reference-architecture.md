@@ -122,7 +122,7 @@ Rust 版应保留原始规范 DOM 与样式来源，资源始终通过进程内 
 | Loader/remote loader | 直接借鉴语义 | `ResourceResolver` + `ResourceHandle` |
 | Book/Section | 直接借鉴并改名 | `Publication` + `SpineItem` |
 | Section 三类派生数据缓存 | 借鉴 | `DocumentCache` + `SemanticCache` + `LayoutCache` |
-| EPUB 初始化阶段 | 迁移并加强验证 | `rebook-epub` open pipeline |
+| EPUB 初始化阶段 | 迁移并加强验证 | `rebook-formats::epub` open pipeline |
 | ResourceLoader pending/cache/ref-count | 迁移思想 | 有预算、可取消的 `ResourceStore` |
 | ReadableContent/blocks | 保留为派生索引 | 搜索、TTS、翻译、AI、无障碍 |
 | ReaderSession | 直接借鉴职责 | `ReaderController` actor/state machine |

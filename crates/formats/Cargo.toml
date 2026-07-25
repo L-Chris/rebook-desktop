@@ -1,22 +1,21 @@
 [package]
-name = "rebook-epub"
-description = "Budgeted EPUB OCF, package, navigation, and resource parser"
+name = "rebook-formats"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+base64.workspace = true
+encoding_rs.workspace = true
+iepub.workspace = true
 quick-xml.workspace = true
+rebook-html = { path = "../html" }
 rebook-publication = { path = "../publication" }
 roxmltree.workspace = true
-serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 zip.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [lints]
 workspace = true

@@ -111,7 +111,7 @@ rebook-desktop/
 
 ### 1. EPUB 与资源层
 
-`crates/epub` 不需要承担 XHTML 排版，只负责把一个不可信归档转换为可靠的 Publication：
+`crates/formats` 的 EPUB 模块不承担 XHTML 排版，只负责把一个不可信归档转换为可靠的 Publication：
 
 - 用成熟 ZIP crate 随机读取归档，不把整本书解压到磁盘；
 - 用 namespace-aware XML reader 解析 container、OPF、encryption、NCX；

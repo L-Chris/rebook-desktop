@@ -1,12 +1,10 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
-use rebook_epub::EpubPublication;
-use rebook_publication::BookSource;
+use rebook_formats::{BookFormat, open_bytes};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -23,6 +21,7 @@ pub struct LibraryBook {
     pub title: String,
     pub authors: Vec<String>,
     pub file_name: String,
+    pub format: BookFormat,
     pub path: PathBuf,
     pub cover_bytes: Option<Vec<u8>>,
     pub added_at: u64,
@@ -98,6 +97,16 @@ impl LocalLibrary {
                     id: book.id,
                     title: book.title,
                     authors: book.authors,
+                    format: BookFormat::from_file_name(&book.file_name)
+                        .or_else(|| {
+                            BookFormat::from_file_name(
+                                root.join(BOOKS_DIRECTORY)
+                                    .join(&book.storage_name)
+                                    .to_string_lossy()
+                                    .as_ref(),
+                            )
+                        })
+                        .unwrap_or(BookFormat::Epub),
                     file_name: book.file_name,
                     path: root.join(BOOKS_DIRECTORY).join(book.storage_name),
                     cover_bytes,
@@ -132,20 +141,23 @@ impl LocalLibrary {
             return Ok(false);
         }
 
-        let publication = EpubPublication::open_bytes(Arc::<[u8]>::from(bytes.clone()))?;
+        let file_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "书籍文件名不是有效 Unicode")
+            })?
+            .to_owned();
+        let publication = open_bytes(bytes.clone(), &file_name)?;
         let metadata = &publication.book().metadata;
         let title = if metadata.title.trim().is_empty() {
             title_from_file_name(source_path)
         } else {
             metadata.title.trim().to_owned()
         };
-        let file_name = source_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("book.epub")
-            .to_owned();
-        let storage_name = format!("{id}.epub");
-        let cover_bytes = publication_cover_bytes(&publication);
+        let format = publication.format();
+        let storage_name = format!("{id}.{}", format.storage_extension());
+        let cover_bytes = publication.cover_bytes().map(<[u8]>::to_vec);
         let cover_name = cover_bytes.as_ref().map(|_| format!("{id}.cover"));
 
         fs::write(self.root.join(BOOKS_DIRECTORY).join(&storage_name), bytes)?;
@@ -160,6 +172,7 @@ impl LocalLibrary {
                 title,
                 authors: metadata.authors.clone(),
                 file_name,
+                format,
                 path: self.root.join(BOOKS_DIRECTORY).join(storage_name),
                 cover_bytes,
                 added_at: unix_timestamp_millis(),
@@ -221,15 +234,6 @@ impl LocalLibrary {
     }
 }
 
-pub fn publication_cover_bytes(publication: &EpubPublication) -> Option<Vec<u8>> {
-    publication
-        .book()
-        .cover
-        .as_ref()
-        .and_then(|href| publication.resource(href).ok())
-        .map(|resource| resource.bytes.to_vec())
-}
-
 fn title_from_file_name(path: &Path) -> String {
     path.file_stem()
         .and_then(|name| name.to_str())
@@ -283,6 +287,7 @@ mod tests {
             title: "第一本书".into(),
             authors: vec!["作者".into()],
             file_name: "source.epub".into(),
+            format: BookFormat::Epub,
             path: managed_path,
             cover_bytes: None,
             added_at: 42,
@@ -309,6 +314,7 @@ mod tests {
             title: "Managed".into(),
             authors: Vec::new(),
             file_name: "original.epub".into(),
+            format: BookFormat::Epub,
             path: managed_path.clone(),
             cover_bytes: None,
             added_at: 1,
@@ -336,6 +342,8 @@ mod tests {
         assert_eq!(library.books[0].authors, ["Rebook"]);
         assert!(library.books[0].path.exists());
         assert_ne!(library.books[0].path, source);
+        let publication = open_bytes(fs::read(&source).unwrap(), "source.epub").unwrap();
+        assert_eq!(publication.book().id.as_str(), library.books[0].id);
 
         let second = library.import_files(std::slice::from_ref(&source)).unwrap();
         assert_eq!(second.imported, 0);
