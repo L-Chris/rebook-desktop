@@ -7,7 +7,9 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 
-use rebook_layout::{LayoutEngine, LayoutError, LayoutViewport, PageItem, ReaderStyle};
+use rebook_layout::{
+    LayoutEngine, LayoutError, LayoutViewport, PageItem, ReaderFontBlob, ReaderStyle,
+};
 use rebook_publication::{
     Block, Book, BookSource, Inline, PublicationError, PublicationUrl, Section, SourceAnchor,
     SourceRange, TextBlock, TextRun, TocEntry,
@@ -264,6 +266,7 @@ impl PrefetchWorker {
     fn spawn(
         source: Arc<dyn BookSource>,
         repository: Arc<SectionRepository>,
+        fonts: Arc<[ReaderFontBlob]>,
     ) -> Result<Self, ReaderError> {
         let (request_sender, request_receiver) = mpsc::channel::<PrefetchRequest>();
         let (result_sender, result_receiver) = mpsc::channel::<PrefetchResult>();
@@ -274,7 +277,7 @@ impl PrefetchWorker {
         let handle = thread::Builder::new()
             .name("rebook-prefetch".into())
             .spawn(move || {
-                let mut layout_engine = LayoutEngine::new();
+                let mut layout_engine = LayoutEngine::with_fonts(fonts.iter().cloned());
                 let display_compiler = DisplayListCompiler;
                 while let Ok(request) = request_receiver.recv() {
                     if worker_cancelled.load(Ordering::Acquire) {
@@ -291,7 +294,7 @@ impl PrefetchWorker {
                                 section,
                                 request.key,
                                 request.viewport,
-                                request.style,
+                                &request.style,
                                 &mut layout_engine,
                                 &display_compiler,
                             )
@@ -373,6 +376,7 @@ impl Drop for PrefetchWorker {
 pub struct ReaderSession {
     source: Arc<dyn BookSource>,
     repository: Arc<SectionRepository>,
+    fonts: Arc<[ReaderFontBlob]>,
     layout_engine: LayoutEngine,
     display_compiler: DisplayListCompiler,
     viewport: LayoutViewport,
@@ -396,16 +400,32 @@ impl ReaderSession {
         viewport: LayoutViewport,
         style: ReaderStyle,
     ) -> Result<Self, ReaderError> {
+        Self::open_with_fonts(source, viewport, style, Arc::default())
+    }
+
+    /// Opens a reader with application-provided fonts registered in both the
+    /// foreground and background pagination engines.
+    pub fn open_with_fonts(
+        source: Arc<dyn BookSource>,
+        viewport: LayoutViewport,
+        style: ReaderStyle,
+        fonts: Arc<[ReaderFontBlob]>,
+    ) -> Result<Self, ReaderError> {
         if source.book().sections.is_empty() {
             return Err(ReaderError::EmptyBook);
         }
         let toc_items = flatten_toc(&source.book().table_of_contents).into();
         let repository = Arc::new(SectionRepository::new(Arc::clone(&source)));
-        let prefetch_worker = PrefetchWorker::spawn(Arc::clone(&source), Arc::clone(&repository))?;
+        let prefetch_worker = PrefetchWorker::spawn(
+            Arc::clone(&source),
+            Arc::clone(&repository),
+            Arc::clone(&fonts),
+        )?;
         let mut session = Self {
             source,
             repository,
-            layout_engine: LayoutEngine::new(),
+            layout_engine: LayoutEngine::with_fonts(fonts.iter().cloned()),
+            fonts,
             display_compiler: DisplayListCompiler,
             viewport,
             style,
@@ -436,7 +456,11 @@ impl ReaderSession {
     }
 
     pub fn style(&self) -> ReaderStyle {
-        self.style
+        self.style.clone()
+    }
+
+    pub fn available_font_families(&mut self) -> Vec<String> {
+        self.layout_engine.available_font_families()
     }
 
     pub fn toc_items(&self) -> &[TocViewItem] {
@@ -909,12 +933,15 @@ impl ReaderSession {
             section,
             key,
             self.viewport,
-            self.style,
+            &self.style,
             &mut self.layout_engine,
             &self.display_compiler,
         )?;
-        let prefetch_worker =
-            PrefetchWorker::spawn(Arc::clone(&self.source), Arc::clone(&repository))?;
+        let prefetch_worker = PrefetchWorker::spawn(
+            Arc::clone(&self.source),
+            Arc::clone(&repository),
+            Arc::clone(&self.fonts),
+        )?;
 
         self.repository = repository;
         self.prefetch_worker = prefetch_worker;
@@ -1127,7 +1154,7 @@ impl ReaderSession {
             section,
             key,
             self.viewport,
-            self.style,
+            &self.style,
             &mut self.layout_engine,
             &self.display_compiler,
         )?;
@@ -1150,7 +1177,7 @@ impl ReaderSession {
             current_section,
             key,
             self.viewport,
-            self.style,
+            &self.style,
             &mut self.layout_engine,
             &self.display_compiler,
         )?;
@@ -1172,7 +1199,7 @@ impl ReaderSession {
         self.prefetch_worker.send(PrefetchRequest {
             key: segment,
             viewport: self.viewport,
-            style: self.style,
+            style: self.style.clone(),
             generation: key.generation,
         })?;
         self.prefetch_inflight.insert(key);
@@ -1291,7 +1318,7 @@ fn compile_segment(
     section: Arc<PreparedSection>,
     key: SegmentKey,
     viewport: LayoutViewport,
-    style: ReaderStyle,
+    style: &ReaderStyle,
     layout_engine: &mut LayoutEngine,
     display_compiler: &DisplayListCompiler,
 ) -> Result<CachedSegment, ReaderError> {
@@ -1771,7 +1798,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use rebook_layout::ReaderFontFamily;
+    use rebook_layout::ReaderDefaultFont;
     use rebook_publication::{
         Block, BlockStyle, Inline, Metadata, PublicationId, PublicationUrl, Resource, Section,
         SectionAnchor, SourceAnchor, SourceRange, SpineItem, SpineItemId, TextBlock, TextBlockKind,
@@ -2046,7 +2073,7 @@ mod tests {
                 source.as_ref(),
                 &fragments,
                 viewport(600, 50_000),
-                ReaderStyle::default(),
+                &ReaderStyle::default(),
             )
             .unwrap();
 
@@ -2522,14 +2549,17 @@ mod tests {
         let old_fraction = page_fraction(reader.location().page_index, old_count);
 
         let mut style = reader.style();
-        style.font_family = ReaderFontFamily::SansSerif;
+        style.typography.default_font = ReaderDefaultFont::SansSerif;
         reader.set_style(style).unwrap();
 
         let location = reader.location();
         let new_fraction = page_fraction(location.page_index, location.page_count);
         let one_page = page_fraction(1, location.page_count);
         assert!((new_fraction - old_fraction).abs() <= one_page);
-        assert_eq!(reader.style().font_family, ReaderFontFamily::SansSerif);
+        assert_eq!(
+            reader.style().typography.default_font,
+            ReaderDefaultFont::SansSerif
+        );
         assert_eq!(source.parse_count(0), 1);
         assert_eq!(reader.cached_segment_count(), 1);
     }

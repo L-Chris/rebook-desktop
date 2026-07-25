@@ -1,12 +1,15 @@
 //! Native e-book reader: parser -> reading IR -> page layout -> display list -> Xilem/Vello.
 
+mod fonts;
 mod highlights;
 mod library;
 mod plugins;
 mod pointer_button;
+mod preferences;
 mod reader_canvas;
 mod vello_bridge;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io;
@@ -26,7 +29,7 @@ use plugins::{
 use pointer_button::button;
 use reader_canvas::{ReaderCanvasAction, reader_canvas};
 use rebook_formats::{BookFormat, open_file as open_publication_file};
-use rebook_layout::{LayoutViewport, ReaderFontFamily, ReaderStyle, SpreadMode};
+use rebook_layout::{LayoutViewport, ReaderDefaultFont, ReaderStyle, ReaderTypography, SpreadMode};
 use rebook_publication::{BookSource, PublicationUrl, Rgba, SourceRange};
 use rebook_reader::{
     NavigationOutcome, PageDirection, ReaderSelection, ReaderSession, ReaderSnapshot,
@@ -35,6 +38,7 @@ use rebook_reader::{
 use vello_bridge::XilemVelloScene;
 use xilem::core::{fork, map_state};
 use xilem::masonry::kurbo::Size;
+use xilem::masonry::parley::style::FontStack;
 use xilem::masonry::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
 use xilem::masonry::properties::LineBreaking;
 use xilem::masonry::properties::types::{AsUnit, UnitPoint};
@@ -63,6 +67,7 @@ const SHELF_TITLE_MAX_DISPLAY_UNITS: usize = 18;
 const PAGE_SCENE_CACHE_CAPACITY: usize = 32;
 const MOTION_DURATION: Duration = Duration::from_millis(180);
 const TOOLBAR_MOTION_DURATION: Duration = Duration::from_millis(200);
+const SETTINGS_MOTION_DURATION: Duration = Duration::from_millis(200);
 const TOOLBAR_HIDE_DELAY: Duration = Duration::from_millis(500);
 const MOTION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const SIDEBAR_SCRIM_ALPHA: f32 = 0.28;
@@ -98,10 +103,11 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let launch = parse_arguments()?;
+    let reader_fonts = fonts::embedded_reader_fonts();
 
     let library =
         LocalLibrary::load_default().map_err(|error| io::Error::other(error.to_string()))?;
-    let mut state = DesktopApp::new(library);
+    let mut state = DesktopApp::new(library, Arc::clone(&reader_fonts));
     if let LaunchMode::Open(path) = launch {
         state.open_book(&path);
     }
@@ -111,13 +117,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             INITIAL_HEIGHT,
         ))
         .with_min_inner_size(xilem::winit::dpi::LogicalSize::new(720_u32, 520_u32));
-    Xilem::new_simple(state, root_view, window)
-        .with_font(LUCIDE_FONT_BYTES.to_vec())
-        .run_in(EventLoop::with_user_event())?;
+    let mut application =
+        Xilem::new_simple(state, root_view, window).with_font(LUCIDE_FONT_BYTES.to_vec());
+    for font in reader_fonts.iter() {
+        application = application.with_font(font.clone());
+    }
+    application.run_in(EventLoop::with_user_event())?;
     Ok(())
 }
 
-fn open_reader(path: &Path) -> Result<DesktopReader, Box<dyn std::error::Error>> {
+fn open_reader(
+    path: &Path,
+    reader_fonts: Arc<[Blob<u8>]>,
+) -> Result<DesktopReader, Box<dyn std::error::Error>> {
     let started = Instant::now();
     let publication = open_publication_file(path)?;
     let format = publication.format();
@@ -135,7 +147,17 @@ fn open_reader(path: &Path) -> Result<DesktopReader, Box<dyn std::error::Error>>
         PluginSettings::default()
     });
     let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
-    let reader = ReaderSession::open(Arc::clone(&source), viewport, ReaderStyle::default())?;
+    let typography = preferences::load_reader_typography().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to load reader typography; using defaults");
+        ReaderTypography::default()
+    });
+    let style = ReaderStyle {
+        typography,
+        ..ReaderStyle::default()
+    };
+    let mut reader =
+        ReaderSession::open_with_fonts(Arc::clone(&source), viewport, style, reader_fonts)?;
+    let available_font_families = reader.available_font_families().into();
     tracing::debug!(
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         "opened book"
@@ -151,6 +173,7 @@ fn open_reader(path: &Path) -> Result<DesktopReader, Box<dyn std::error::Error>>
             highlight_store,
             highlights,
             plugin_settings,
+            available_font_families,
         },
     ))
 }
@@ -179,6 +202,7 @@ fn parse_arguments() -> Result<LaunchMode, Box<dyn std::error::Error>> {
 struct DesktopApp {
     shelf: ShelfState,
     reader: Option<DesktopReader>,
+    reader_fonts: Arc<[Blob<u8>]>,
 }
 
 struct ShelfState {
@@ -190,15 +214,16 @@ struct ShelfState {
 }
 
 impl DesktopApp {
-    fn new(library: LocalLibrary) -> Self {
+    fn new(library: LocalLibrary, reader_fonts: Arc<[Blob<u8>]>) -> Self {
         Self {
             shelf: ShelfState::new(library),
             reader: None,
+            reader_fonts,
         }
     }
 
     fn open_book(&mut self, path: &Path) {
-        match open_reader(path) {
+        match open_reader(path, Arc::clone(&self.reader_fonts)) {
             Ok(reader) => {
                 self.reader = Some(reader);
                 self.shelf.error = None;
@@ -283,6 +308,7 @@ struct DesktopReader {
     selected_highlight_id: Option<String>,
     focused_range: Option<SourceRange>,
     plugin_settings: PluginSettings,
+    available_font_families: Arc<[String]>,
     search: SearchUiState,
     chat: ChatUiState,
     translation: TranslationUiState,
@@ -304,6 +330,7 @@ struct DesktopReaderResources {
     highlight_store: HighlightStore,
     highlights: Vec<StoredHighlight>,
     plugin_settings: PluginSettings,
+    available_font_families: Arc<[String]>,
 }
 
 #[derive(Clone)]
@@ -398,6 +425,25 @@ enum SettingsTab {
     Plugins,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FontPickerKind {
+    Cjk,
+    Serif,
+    SansSerif,
+    Monospace,
+}
+
+impl FontPickerKind {
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Cjk => "中文字体",
+            Self::Serif => "衬线字体",
+            Self::SansSerif => "无衬线字体",
+            Self::Monospace => "等宽字体",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SidebarTab {
     #[default]
@@ -413,12 +459,19 @@ enum AssistantPanel {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum MotionCurve {
+    EaseOut,
+    EnterExit,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct Motion {
     value: f32,
     start: f32,
     target: f32,
     elapsed: Duration,
     duration: Duration,
+    curve: MotionCurve,
 }
 
 impl Motion {
@@ -427,12 +480,17 @@ impl Motion {
     }
 
     const fn settled_with_duration(value: f32, duration: Duration) -> Self {
+        Self::settled_with_curve(value, duration, MotionCurve::EaseOut)
+    }
+
+    const fn settled_with_curve(value: f32, duration: Duration, curve: MotionCurve) -> Self {
         Self {
             value,
             start: value,
             target: value,
             elapsed: Duration::ZERO,
             duration,
+            curve,
         }
     }
 
@@ -456,7 +514,10 @@ impl Motion {
         } else {
             (self.elapsed.as_secs_f32() / self.duration.as_secs_f32()).min(1.0)
         };
-        let eased = 1.0 - (1.0 - progress).powi(3);
+        let eased = match self.curve {
+            MotionCurve::EnterExit if self.target < self.start => progress.powi(2),
+            MotionCurve::EaseOut | MotionCurve::EnterExit => 1.0 - (1.0 - progress).powi(3),
+        };
         self.value = self.start + (self.target - self.start) * eased;
         if progress >= 1.0 {
             self.value = self.target;
@@ -483,8 +544,8 @@ struct ReaderUiState {
     overlay: ReaderOverlay,
     settings_tab: SettingsTab,
     draft_spread: SpreadMode,
-    draft_font_family: ReaderFontFamily,
-    draft_font_size: f32,
+    draft_typography: ReaderTypography,
+    font_picker: Option<FontPickerKind>,
     draft_plugin_settings: PluginSettings,
     assistant_panel: Option<AssistantPanel>,
     toolbar_motion: Motion,
@@ -544,6 +605,7 @@ impl DesktopReader {
             highlight_store,
             highlights,
             plugin_settings,
+            available_font_families,
         } = resources;
         let draft_style = reader.style();
         let error = reader
@@ -578,18 +640,23 @@ impl DesktopReader {
                 overlay: ReaderOverlay::None,
                 settings_tab: SettingsTab::Reading,
                 draft_spread: draft_style.spread,
-                draft_font_family: draft_style.font_family,
-                draft_font_size: draft_style.font_size,
+                draft_typography: draft_style.typography,
+                font_picker: None,
                 draft_plugin_settings: plugin_settings.clone(),
                 assistant_panel: None,
                 toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
                 sidebar_motion: Motion::settled(1.0),
                 menu_motion: Motion::settled(0.0),
-                settings_motion: Motion::settled(0.0),
+                settings_motion: Motion::settled_with_curve(
+                    0.0,
+                    SETTINGS_MOTION_DURATION,
+                    MotionCurve::EnterExit,
+                ),
                 last_motion_tick: None,
                 expanded_toc,
             },
             plugin_settings,
+            available_font_families,
             canvas_size: None,
             scene_revision: 0,
             page_scenes: HashMap::new(),
@@ -1059,8 +1126,8 @@ impl DesktopReader {
         self.cancel_text_selection();
         let style = self.reader.style();
         self.ui.draft_spread = style.spread;
-        self.ui.draft_font_family = style.font_family;
-        self.ui.draft_font_size = style.font_size;
+        self.ui.draft_typography = style.typography;
+        self.ui.font_picker = None;
         self.ui
             .draft_plugin_settings
             .clone_from(&self.plugin_settings);
@@ -1073,10 +1140,15 @@ impl DesktopReader {
             self.error = Some(format!("保存插件设置失败：{error}"));
             return;
         }
+        let mut typography = self.ui.draft_typography.clone();
+        typography.normalize();
+        if let Err(error) = preferences::save_reader_typography(&typography) {
+            self.error = Some(format!("保存字体设置失败：{error}"));
+            return;
+        }
         let mut style = self.reader.style();
         style.spread = self.ui.draft_spread;
-        style.font_family = self.ui.draft_font_family;
-        style.font_size = self.ui.draft_font_size;
+        style.typography = typography;
         let result = self.reader.set_style(style);
         match result {
             Ok(snapshot) => {
@@ -3135,11 +3207,11 @@ fn settings_overlay(
     state: &DesktopReader,
     progress: f32,
 ) -> impl WidgetView<DesktopReader> + use<> {
-    let scale = 0.97 + 0.03 * f64::from(progress);
-    let offset = 12.0 * f64::from(1.0 - progress);
-    let dialog_transform =
-        Affine::scale_about(scale, (SETTINGS_WIDTH / 2.0, SETTINGS_HEIGHT / 2.0))
-            .then_translate((0.0, offset).into());
+    // Keep glyphs and one-pixel borders at their native scale throughout the
+    // transition. Scaling the complete dialog makes text shimmer as Vello
+    // resamples it on every frame, which reads as dropped frames on Windows.
+    let offset = 8.0 * f64::from(1.0 - progress);
+    let dialog_transform = Affine::translate((0.0, offset));
     sized_box(zstack((
         animated_scrim(modal_scrim_color(progress), DesktopReader::close_overlay),
         sized_box(settings_dialog(state))
@@ -3159,48 +3231,64 @@ fn settings_dialog(state: &DesktopReader) -> impl WidgetView<DesktopReader> + us
 
 fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     let spread = state.ui.draft_spread;
-    let font_family = state.ui.draft_font_family;
-    let font_size = state.ui.draft_font_size;
+    let typography = &state.ui.draft_typography;
+    let font_picker = state.ui.font_picker;
     let tab = state.ui.settings_tab;
     let title = match tab {
         SettingsTab::Reading => "阅读",
-        SettingsTab::Font => "字体",
+        SettingsTab::Font => font_picker.map_or("字体", FontPickerKind::title),
         SettingsTab::Plugins => "插件",
     };
     let body: Box<AnyWidgetView<DesktopReader>> = match tab {
         SettingsTab::Reading => reading_settings_content(spread).boxed(),
-        SettingsTab::Font => font_settings_content(font_family, font_size).boxed(),
+        SettingsTab::Font => match font_picker {
+            Some(kind) => {
+                font_picker_content(kind, typography, &state.available_font_families).boxed()
+            }
+            None => font_settings_content(typography).boxed(),
+        },
         SettingsTab::Plugins => {
             plugin_settings_content(state.ui.draft_plugin_settings.clone()).boxed()
         }
     };
 
     flex_row((
-        sized_box(
-            flex_col((
-                flex_row((
-                    icon_label(Icon::Settings, 17.0, UI_MUTED),
-                    label("设置")
-                        .font(UI_FONT_STACK)
-                        .text_size(15.0)
-                        .weight(FontWeight::BOLD)
-                        .color(UI_TEXT),
+        sized_box(zstack((
+            sized_box(label(""))
+                .expand()
+                .background_color(UI_SURFACE_MUTED)
+                .corner_radius(17.0),
+            sized_box(label(""))
+                .width(18.px())
+                .expand_height()
+                .background_color(UI_SURFACE_MUTED)
+                .alignment(UnitPoint::RIGHT),
+            sized_box(
+                flex_col((
+                    flex_row((
+                        icon_label(Icon::Settings, 17.0, UI_MUTED),
+                        label("设置")
+                            .font(UI_FONT_STACK)
+                            .text_size(15.0)
+                            .weight(FontWeight::BOLD)
+                            .color(UI_TEXT),
+                    ))
+                    .gap(9.px())
+                    .cross_axis_alignment(CrossAxisAlignment::Center)
+                    .padding(Padding::from_vh(12.0, 10.0)),
+                    settings_tab_button("阅读", SettingsTab::Reading, tab),
+                    settings_tab_button("字体", SettingsTab::Font, tab),
+                    settings_tab_button("插件", SettingsTab::Plugins, tab),
+                    FlexSpacer::Flex(1.0),
                 ))
-                .gap(9.px())
-                .cross_axis_alignment(CrossAxisAlignment::Center)
-                .padding(Padding::from_vh(12.0, 10.0)),
-                settings_tab_button("阅读", SettingsTab::Reading, tab),
-                settings_tab_button("字体", SettingsTab::Font, tab),
-                settings_tab_button("插件", SettingsTab::Plugins, tab),
-                FlexSpacer::Flex(1.0),
-            ))
-            .gap(4.px())
-            .cross_axis_alignment(CrossAxisAlignment::Fill)
-            .padding(10.0),
-        )
+                .gap(4.px())
+                .cross_axis_alignment(CrossAxisAlignment::Fill)
+                .padding(10.0),
+            )
+            .expand(),
+        )))
         .width(146.px())
-        .expand_height()
-        .background_color(UI_SURFACE_MUTED),
+        .expand_height(),
         flex_col((
             flex_row((
                 label(title)
@@ -3253,7 +3341,10 @@ fn settings_tab_button(
                     .color(if active { UI_TEXT } else { UI_TEXT_SOFT }),
                 FlexSpacer::Flex(1.0),
             )),
-            move |state: &mut DesktopReader| state.ui.settings_tab = value,
+            move |state: &mut DesktopReader| {
+                state.ui.settings_tab = value;
+                state.ui.font_picker = None;
+            },
         )
         .background_color(if active {
             UI_SURFACE
@@ -3295,73 +3386,473 @@ fn reading_settings_content(spread: SpreadMode) -> impl WidgetView<DesktopReader
     .padding(Padding::from_vh(18.0, 20.0))
 }
 
-fn font_settings_content(
-    font_family: ReaderFontFamily,
+fn font_settings_content(typography: &ReaderTypography) -> impl WidgetView<DesktopReader> + use<> {
+    let preview_font = typography.default_stack();
+    let preview_size = typography.font_size.min(24.0);
+    let preview_weight = FontWeight::new(f32::from(typography.font_weight));
+    let default_font = typography.default_font;
+    let font_size = typography.font_size;
+    let minimum_font_size = typography.minimum_font_size;
+    let font_weight = typography.font_weight;
+
+    portal(
+        flex_col((
+            settings_section_label("字号与字重"),
+            typography_metrics_card(font_size, minimum_font_size, font_weight),
+            settings_section_label("字体"),
+            flex_col((
+                default_font_row(default_font),
+                divider(),
+                font_family_settings_row(
+                    "中文字体",
+                    typography.default_cjk_font.clone(),
+                    FontPickerKind::Cjk,
+                ),
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .background_color(UI_SURFACE)
+            .border(UI_BORDER, 1.0)
+            .corner_radius(12.0),
+            settings_section_label("字型"),
+            flex_col((
+                font_family_settings_row(
+                    "衬线字体",
+                    typography.serif_font.clone(),
+                    FontPickerKind::Serif,
+                ),
+                divider(),
+                font_family_settings_row(
+                    "无衬线字体",
+                    typography.sans_serif_font.clone(),
+                    FontPickerKind::SansSerif,
+                ),
+                divider(),
+                font_family_settings_row(
+                    "等宽字体",
+                    typography.monospace_font.clone(),
+                    FontPickerKind::Monospace,
+                ),
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .background_color(UI_SURFACE)
+            .border(UI_BORDER, 1.0)
+            .corner_radius(12.0),
+            sized_box(
+                flex_col((
+                    label("字体预览")
+                        .font(UI_FONT_STACK)
+                        .text_size(11.0)
+                        .color(UI_MUTED),
+                    label("阅读让思想抵达更远的地方 Reading 0123")
+                        .font(ui_font_stack(preview_font))
+                        .text_size(preview_size)
+                        .weight(preview_weight)
+                        .color(UI_TEXT),
+                ))
+                .gap(6.px())
+                .cross_axis_alignment(CrossAxisAlignment::Start),
+            )
+            .background_color(UI_SURFACE_MUTED)
+            .border(UI_BORDER, 1.0)
+            .corner_radius(12.0)
+            .padding(Padding::from_vh(12.0, 14.0)),
+        ))
+        .gap(10.px())
+        .cross_axis_alignment(CrossAxisAlignment::Fill)
+        .padding(Padding::from_vh(14.0, 20.0)),
+    )
+}
+
+fn typography_metrics_card(
     font_size: f32,
+    minimum_font_size: f32,
+    font_weight: u16,
 ) -> impl WidgetView<DesktopReader> {
     flex_col((
-        label("字体类型")
-            .font(UI_FONT_STACK)
-            .text_size(12.0)
-            .weight(FontWeight::BOLD)
-            .color(UI_MUTED),
-        sized_box(
-            flex_col((
-                flex_row((
-                    font_choice("衬线", ReaderFontFamily::Serif, font_family),
-                    font_choice("无衬线", ReaderFontFamily::SansSerif, font_family),
-                    font_choice("等宽", ReaderFontFamily::Monospace, font_family),
-                ))
-                .gap(8.px()),
-                flex_row((
-                    font_choice("微软雅黑", ReaderFontFamily::MicrosoftYaHei, font_family),
-                    font_choice("宋体", ReaderFontFamily::SimSun, font_family),
-                    font_choice("楷体", ReaderFontFamily::KaiTi, font_family),
-                ))
-                .gap(8.px()),
-            ))
-            .gap(8.px()),
-        )
-        .background_color(UI_SURFACE)
-        .border(UI_BORDER, 1.0)
-        .corner_radius(12.0)
-        .padding(12.0),
+        typography_stepper_row(
+            "默认字号",
+            format!("{font_size:.0} px"),
+            |state: &mut DesktopReader| {
+                let minimum = state.ui.draft_typography.minimum_font_size;
+                state.ui.draft_typography.font_size =
+                    (state.ui.draft_typography.font_size - 1.0).max(minimum);
+            },
+            |state: &mut DesktopReader| {
+                state.ui.draft_typography.font_size =
+                    (state.ui.draft_typography.font_size + 1.0).min(120.0);
+            },
+        ),
+        divider(),
+        typography_stepper_row(
+            "最小字号",
+            format!("{minimum_font_size:.0} px"),
+            |state: &mut DesktopReader| {
+                state.ui.draft_typography.minimum_font_size =
+                    (state.ui.draft_typography.minimum_font_size - 1.0).max(1.0);
+            },
+            |state: &mut DesktopReader| {
+                let typography = &mut state.ui.draft_typography;
+                typography.minimum_font_size = (typography.minimum_font_size + 1.0).min(120.0);
+                typography.font_size = typography.font_size.max(typography.minimum_font_size);
+            },
+        ),
+        divider(),
+        typography_stepper_row(
+            "字体粗细",
+            font_weight.to_string(),
+            |state: &mut DesktopReader| {
+                state.ui.draft_typography.font_weight = state
+                    .ui
+                    .draft_typography
+                    .font_weight
+                    .saturating_sub(100)
+                    .max(100);
+            },
+            |state: &mut DesktopReader| {
+                state.ui.draft_typography.font_weight = state
+                    .ui
+                    .draft_typography
+                    .font_weight
+                    .saturating_add(100)
+                    .min(900);
+            },
+        ),
+    ))
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+    .background_color(UI_SURFACE)
+    .border(UI_BORDER, 1.0)
+    .corner_radius(12.0)
+}
+
+fn settings_section_label(text: &'static str) -> impl WidgetView<DesktopReader> {
+    label(text)
+        .font(UI_FONT_STACK)
+        .text_size(12.0)
+        .weight(FontWeight::BOLD)
+        .color(UI_MUTED)
+}
+
+fn typography_stepper_row(
+    name: &'static str,
+    value: String,
+    decrease: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
+    increase: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
+) -> impl WidgetView<DesktopReader> {
+    sized_box(
         flex_row((
-            label("字号")
+            label(name)
                 .font(UI_FONT_STACK)
                 .text_size(13.0)
                 .color(UI_TEXT_SOFT),
             FlexSpacer::Flex(1.0),
-            font_size_choice(14.0, font_size),
-            font_size_choice(16.0, font_size),
-            font_size_choice(18.0, font_size),
-            font_size_choice(20.0, font_size),
-            font_size_choice(22.0, font_size),
+            stepper_button(Icon::Minus, decrease),
+            sized_box(
+                label(value)
+                    .font(UI_FONT_STACK)
+                    .text_size(12.0)
+                    .color(UI_TEXT),
+            )
+            .width(62.px()),
+            stepper_button(Icon::Plus, increase),
+        ))
+        .gap(5.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(48.px())
+    .expand_width()
+    .padding(Padding::horizontal(12.0))
+}
+
+fn stepper_button(
+    icon: Icon,
+    callback: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
+) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        button(icon_label(icon, 13.0, UI_TEXT_SOFT), callback)
+            .background_color(UI_SURFACE_MUTED)
+            .active_background_color(UI_ACCENT_SOFT)
+            .border_color(UI_BORDER)
+            .hovered_border_color(UI_ACCENT_BORDER)
+            .corner_radius(7.0)
+            .padding(0.0),
+    )
+    .width(28.px())
+    .height(28.px())
+}
+
+fn default_font_row(selected: ReaderDefaultFont) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        flex_row((
+            label("默认字体")
+                .font(UI_FONT_STACK)
+                .text_size(13.0)
+                .color(UI_TEXT_SOFT),
+            FlexSpacer::Flex(1.0),
+            default_font_choice("衬线", ReaderDefaultFont::Serif, selected),
+            default_font_choice("无衬线", ReaderDefaultFont::SansSerif, selected),
         ))
         .gap(6.px())
         .cross_axis_alignment(CrossAxisAlignment::Center),
-        sized_box(
-            flex_col((
-                label("字体预览")
-                    .font(UI_FONT_STACK)
-                    .text_size(11.0)
-                    .color(UI_MUTED),
-                label("阅读让思想抵达更远的地方  Reading 0123")
-                    .font(font_family.css_stack())
-                    .text_size(font_size.min(20.0))
-                    .color(UI_TEXT),
-            ))
-            .gap(6.px())
-            .cross_axis_alignment(CrossAxisAlignment::Start),
+    )
+    .height(48.px())
+    .expand_width()
+    .padding(Padding::horizontal(12.0))
+}
+
+fn default_font_choice(
+    text: &'static str,
+    value: ReaderDefaultFont,
+    selected: ReaderDefaultFont,
+) -> impl WidgetView<DesktopReader> {
+    let active = value == selected;
+    sized_box(
+        button(
+            label(text)
+                .font(UI_FONT_STACK)
+                .text_size(12.0)
+                .weight(if active {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
+            move |state: &mut DesktopReader| state.ui.draft_typography.default_font = value,
         )
-        .background_color(UI_SURFACE_MUTED)
-        .border(UI_BORDER, 1.0)
-        .corner_radius(12.0)
-        .padding(Padding::from_vh(12.0, 14.0)),
-    ))
-    .gap(10.px())
-    .cross_axis_alignment(CrossAxisAlignment::Fill)
-    .padding(Padding::from_vh(14.0, 20.0))
+        .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
+        .active_background_color(UI_ACCENT_SOFT)
+        .border_color(if active { UI_ACCENT_BORDER } else { UI_BORDER })
+        .hovered_border_color(UI_ACCENT_BORDER)
+        .corner_radius(8.0)
+        .padding(Padding::from_vh(5.0, 9.0)),
+    )
+    .height(30.px())
+}
+
+fn font_family_settings_row(
+    name: &'static str,
+    value: String,
+    picker: FontPickerKind,
+) -> impl WidgetView<DesktopReader> {
+    let display_value = value.clone();
+    sized_box(
+        button(
+            flex_row((
+                label(name)
+                    .font(UI_FONT_STACK)
+                    .text_size(13.0)
+                    .color(UI_TEXT_SOFT),
+                FlexSpacer::Flex(1.0),
+                label(display_value)
+                    .font(ui_font_stack(value))
+                    .text_size(12.0)
+                    .color(UI_TEXT),
+                icon_label(Icon::ChevronRight, 14.0, UI_MUTED),
+            ))
+            .gap(8.px())
+            .cross_axis_alignment(CrossAxisAlignment::Center),
+            move |state: &mut DesktopReader| state.ui.font_picker = Some(picker),
+        )
+        .background_color(UI_SURFACE)
+        .active_background_color(UI_SURFACE_MUTED)
+        .border_color(Color::TRANSPARENT)
+        .hovered_border_color(Color::TRANSPARENT)
+        .border_width(0.0)
+        .padding(Padding::horizontal(12.0)),
+    )
+    .height(48.px())
+    .expand_width()
+}
+
+fn font_picker_content(
+    kind: FontPickerKind,
+    typography: &ReaderTypography,
+    available_families: &[String],
+) -> impl WidgetView<DesktopReader> + use<> {
+    let selected = selected_font_family(typography, kind).to_owned();
+    let rows = font_candidates(kind, available_families)
+        .into_iter()
+        .map(|family| font_picker_row(family, &selected, kind))
+        .collect::<Vec<_>>();
+
+    portal(
+        flex_col((
+            sized_box(
+                button(
+                    flex_row((
+                        icon_label(Icon::ChevronLeft, 14.0, UI_MUTED),
+                        label("返回字体设置")
+                            .font(UI_FONT_STACK)
+                            .text_size(12.0)
+                            .color(UI_TEXT_SOFT),
+                    ))
+                    .gap(6.px())
+                    .cross_axis_alignment(CrossAxisAlignment::Center),
+                    |state: &mut DesktopReader| state.ui.font_picker = None,
+                )
+                .background_color(Color::TRANSPARENT)
+                .active_background_color(UI_SURFACE_MUTED)
+                .border_color(Color::TRANSPARENT)
+                .hovered_border_color(Color::TRANSPARENT)
+                .border_width(0.0)
+                .padding(Padding::from_vh(6.0, 8.0)),
+            )
+            .height(34.px()),
+            flex_col(rows)
+                .cross_axis_alignment(CrossAxisAlignment::Fill)
+                .background_color(UI_SURFACE)
+                .border(UI_BORDER, 1.0)
+                .corner_radius(12.0),
+        ))
+        .gap(10.px())
+        .cross_axis_alignment(CrossAxisAlignment::Fill)
+        .padding(Padding::from_vh(14.0, 20.0)),
+    )
+}
+
+fn selected_font_family(typography: &ReaderTypography, kind: FontPickerKind) -> &str {
+    match kind {
+        FontPickerKind::Cjk => &typography.default_cjk_font,
+        FontPickerKind::Serif => &typography.serif_font,
+        FontPickerKind::SansSerif => &typography.sans_serif_font,
+        FontPickerKind::Monospace => &typography.monospace_font,
+    }
+}
+
+fn font_picker_row(
+    family: String,
+    selected: &str,
+    kind: FontPickerKind,
+) -> impl WidgetView<DesktopReader> + use<> {
+    let active = family.eq_ignore_ascii_case(selected);
+    let label_text = family.clone();
+    let label_font = family.clone();
+    sized_box(
+        button(
+            flex_row((
+                label(label_text)
+                    .font(ui_font_stack(label_font))
+                    .text_size(13.0)
+                    .weight(if active {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .color(if active { UI_ACCENT } else { UI_TEXT }),
+                FlexSpacer::Flex(1.0),
+                icon_label(
+                    Icon::Check,
+                    14.0,
+                    if active {
+                        UI_ACCENT
+                    } else {
+                        Color::TRANSPARENT
+                    },
+                ),
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Center),
+            move |state: &mut DesktopReader| {
+                match kind {
+                    FontPickerKind::Cjk => {
+                        state
+                            .ui
+                            .draft_typography
+                            .default_cjk_font
+                            .clone_from(&family);
+                    }
+                    FontPickerKind::Serif => {
+                        state.ui.draft_typography.serif_font.clone_from(&family);
+                    }
+                    FontPickerKind::SansSerif => {
+                        state
+                            .ui
+                            .draft_typography
+                            .sans_serif_font
+                            .clone_from(&family);
+                    }
+                    FontPickerKind::Monospace => {
+                        state.ui.draft_typography.monospace_font.clone_from(&family);
+                    }
+                }
+                state.ui.font_picker = None;
+            },
+        )
+        .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
+        .active_background_color(UI_ACCENT_SOFT)
+        .border_color(Color::TRANSPARENT)
+        .hovered_border_color(Color::TRANSPARENT)
+        .border_width(0.0)
+        .padding(Padding::horizontal(12.0)),
+    )
+    .height(42.px())
+    .expand_width()
+}
+
+fn font_candidates(kind: FontPickerKind, available_families: &[String]) -> Vec<String> {
+    let curated: &[&str] = match kind {
+        FontPickerKind::Cjk => &[
+            "LXGW WenKai GB Screen",
+            "LXGW WenKai",
+            "Noto Serif SC",
+            "Noto Sans SC",
+            "Microsoft YaHei",
+            "SimSun",
+            "KaiTi",
+        ],
+        FontPickerKind::Serif => &[
+            "Bitter",
+            "Literata",
+            "Merriweather",
+            "Noto Serif",
+            "Georgia",
+        ],
+        FontPickerKind::SansSerif => &[
+            "Roboto",
+            "Noto Sans",
+            "Open Sans",
+            "Inter",
+            "Microsoft YaHei",
+        ],
+        FontPickerKind::Monospace => &["Consolas", "Fira Code", "Roboto Mono", "IBM Plex Mono"],
+    };
+    let available = available_families
+        .iter()
+        .map(|family| family.to_lowercase())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for family in curated
+        .iter()
+        .filter(|family| {
+            **family == "LXGW WenKai GB Screen" || available.contains(&family.to_lowercase())
+        })
+        .map(|family| (*family).to_owned())
+        .chain(available_families.iter().filter_map(|family| {
+            if kind != FontPickerKind::Cjk || looks_like_cjk_font(family) {
+                Some(family.clone())
+            } else {
+                None
+            }
+        }))
+    {
+        if seen.insert(family.to_lowercase()) {
+            candidates.push(family);
+        }
+    }
+    candidates
+}
+
+fn looks_like_cjk_font(family: &str) -> bool {
+    let name = family.to_lowercase();
+    [
+        "cjk", "han", "song", "ming", "hei", "kai", "yahei", "wenkai", "gothic", "meiryo",
+        "malgun", "pingfang", "fangsong", "simsun", "simhei",
+    ]
+    .iter()
+    .any(|keyword| name.contains(keyword))
+}
+
+fn ui_font_stack(source: String) -> FontStack<'static> {
+    FontStack::Source(Cow::Owned(source))
 }
 
 #[derive(Clone, Copy)]
@@ -3529,63 +4020,6 @@ fn settings_value_row(name: &'static str, value: &'static str) -> impl WidgetVie
     .height(64.px())
     .expand_width()
     .padding(Padding::horizontal(16.0))
-}
-
-fn font_choice(
-    text: &'static str,
-    value: ReaderFontFamily,
-    selected: ReaderFontFamily,
-) -> impl WidgetView<DesktopReader> {
-    let active = value == selected;
-    sized_box(
-        button(
-            label(text)
-                .font(UI_FONT_STACK)
-                .text_size(12.0)
-                .weight(if active {
-                    FontWeight::BOLD
-                } else {
-                    FontWeight::NORMAL
-                })
-                .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
-            move |state: &mut DesktopReader| state.ui.draft_font_family = value,
-        )
-        .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
-        .active_background_color(UI_ACCENT_SOFT)
-        .border_color(if active { UI_ACCENT_BORDER } else { UI_BORDER })
-        .hovered_border_color(UI_ACCENT_BORDER)
-        .corner_radius(8.0)
-        .padding(Padding::from_vh(6.0, 8.0)),
-    )
-    .width(104.px())
-    .height(34.px())
-}
-
-fn font_size_choice(value: f32, selected: f32) -> impl WidgetView<DesktopReader> {
-    let active = (value - selected).abs() < f32::EPSILON;
-    let text = format!("{value:.0}");
-    sized_box(
-        button(
-            label(text)
-                .font(UI_FONT_STACK)
-                .text_size(12.0)
-                .weight(if active {
-                    FontWeight::BOLD
-                } else {
-                    FontWeight::NORMAL
-                })
-                .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
-            move |state: &mut DesktopReader| state.ui.draft_font_size = value,
-        )
-        .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
-        .active_background_color(UI_ACCENT_SOFT)
-        .border_color(if active { UI_ACCENT_BORDER } else { UI_BORDER })
-        .hovered_border_color(UI_ACCENT_BORDER)
-        .corner_radius(8.0)
-        .padding(0.0),
-    )
-    .width(42.px())
-    .height(32.px())
 }
 
 fn spread_settings_row(spread: SpreadMode) -> impl WidgetView<DesktopReader> {
@@ -3798,6 +4232,18 @@ mod tests {
     }
 
     #[test]
+    fn modal_motion_uses_a_gentler_exit_curve() {
+        let mut motion =
+            Motion::settled_with_curve(1.0, SETTINGS_MOTION_DURATION, MotionCurve::EnterExit);
+
+        motion.animate_to(0.0);
+        motion.advance(SETTINGS_MOTION_DURATION / 2);
+
+        assert!((motion.value - 0.75).abs() < f32::EPSILON);
+        assert!(motion.is_animating());
+    }
+
+    #[test]
     fn toolbar_hide_delay_is_cancelled_when_pointer_returns() {
         let now = Instant::now();
         let mut ui = ReaderUiState {
@@ -3809,14 +4255,18 @@ mod tests {
             overlay: ReaderOverlay::None,
             settings_tab: SettingsTab::Reading,
             draft_spread: SpreadMode::Single,
-            draft_font_family: ReaderFontFamily::Serif,
-            draft_font_size: 16.0,
+            draft_typography: ReaderTypography::default(),
+            font_picker: None,
             draft_plugin_settings: PluginSettings::default(),
             assistant_panel: None,
             toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
             sidebar_motion: Motion::settled(0.0),
             menu_motion: Motion::settled(0.0),
-            settings_motion: Motion::settled(0.0),
+            settings_motion: Motion::settled_with_curve(
+                0.0,
+                SETTINGS_MOTION_DURATION,
+                MotionCurve::EnterExit,
+            ),
             last_motion_tick: None,
             expanded_toc: HashSet::new(),
         };
@@ -3829,6 +4279,33 @@ mod tests {
         ui.reveal_toolbar(now + TOOLBAR_HIDE_DELAY / 2);
         assert!(ui.toolbar_hide_at.is_none());
         assert!((ui.toolbar_motion.target - 1.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn cjk_font_candidates_keep_readest_defaults_and_filter_latin_families() {
+        let available: Arc<[String]> = [
+            "Arial".to_owned(),
+            "LXGW WenKai".to_owned(),
+            "Microsoft YaHei UI".to_owned(),
+        ]
+        .into();
+
+        let candidates = font_candidates(FontPickerKind::Cjk, &available);
+
+        assert_eq!(candidates[0], "LXGW WenKai GB Screen");
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|family| family.as_str() == "LXGW WenKai")
+                .count(),
+            1
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|family| family == "Microsoft YaHei UI")
+        );
+        assert!(!candidates.iter().any(|family| family == "Arial"));
     }
 
     #[test]

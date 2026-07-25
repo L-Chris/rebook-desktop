@@ -1,5 +1,6 @@
 //! Renderer-independent pagination for normalized reading IR.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ use rebook_publication::{
     Block, BookSource, ImageStyle, Inline, PublicationError, Rgba, Section, SourceRange,
     TextAlignment, TextBlock, TextBlockKind, TextStyle,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const COLUMN_GAP: f32 = 36.0;
@@ -35,10 +37,9 @@ impl LayoutViewport {
 }
 
 /// User-controlled values that invalidate pagination.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReaderStyle {
-    pub font_size: f32,
-    pub font_family: ReaderFontFamily,
+    pub typography: ReaderTypography,
     pub horizontal_margin: f32,
     pub vertical_margin: f32,
     pub spread: SpreadMode,
@@ -46,33 +47,118 @@ pub struct ReaderStyle {
     pub background: Rgba,
 }
 
-/// Semantic font family selected by the reader.
-///
-/// Native platforms resolve these through their installed system fonts, matching
-/// the generic family model used by rebook's browser renderer.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ReaderFontFamily {
+/// Generic family used for ordinary reading text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReaderDefaultFont {
     #[default]
     Serif,
     SansSerif,
-    Monospace,
-    MicrosoftYaHei,
-    SimSun,
-    KaiTi,
 }
 
-impl ReaderFontFamily {
+/// Readest-compatible native typography preferences.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReaderTypography {
+    pub default_font: ReaderDefaultFont,
+    pub default_cjk_font: String,
+    pub serif_font: String,
+    pub sans_serif_font: String,
+    pub monospace_font: String,
+    pub font_size: f32,
+    pub minimum_font_size: f32,
+    pub font_weight: u16,
+}
+
+impl ReaderTypography {
+    /// Repairs persisted or externally supplied settings before layout uses them.
+    pub fn normalize(&mut self) {
+        let defaults = Self::default();
+        normalize_family(&mut self.default_cjk_font, &defaults.default_cjk_font);
+        normalize_family(&mut self.serif_font, &defaults.serif_font);
+        normalize_family(&mut self.sans_serif_font, &defaults.sans_serif_font);
+        normalize_family(&mut self.monospace_font, &defaults.monospace_font);
+        self.minimum_font_size = finite_clamp(self.minimum_font_size, 1.0, 120.0, 8.0);
+        self.font_size = finite_clamp(self.font_size, self.minimum_font_size, 120.0, 16.0);
+        self.font_weight = self.font_weight.clamp(100, 900).div_ceil(100) * 100;
+    }
+
     #[must_use]
-    pub const fn css_stack(self) -> &'static str {
-        match self {
-            Self::Serif => "serif",
-            Self::SansSerif => "sans-serif",
-            Self::Monospace => "monospace",
-            Self::MicrosoftYaHei => {
-                "'Microsoft YaHei', 'Microsoft YaHei UI', 'PingFang SC', sans-serif"
-            }
-            Self::SimSun => "SimSun, 'Songti SC', 'Noto Serif CJK SC', serif",
-            Self::KaiTi => "KaiTi, STKaiti, 'Noto Serif CJK SC', serif",
+    pub fn default_stack(&self) -> String {
+        match self.default_font {
+            ReaderDefaultFont::Serif => self.serif_stack(),
+            ReaderDefaultFont::SansSerif => self.sans_serif_stack(),
+        }
+    }
+
+    #[must_use]
+    pub fn serif_stack(&self) -> String {
+        font_stack(
+            [
+                self.serif_font.as_str(),
+                self.default_cjk_font.as_str(),
+                "LXGW WenKai GB Screen",
+                "LXGW WenKai",
+                "Noto Serif SC",
+                "Source Han Serif SC",
+                "Songti SC",
+                "SimSun",
+                "Georgia",
+                "Times New Roman",
+            ],
+            "serif",
+        )
+    }
+
+    #[must_use]
+    pub fn sans_serif_stack(&self) -> String {
+        font_stack(
+            [
+                self.sans_serif_font.as_str(),
+                self.default_cjk_font.as_str(),
+                "LXGW WenKai GB Screen",
+                "LXGW WenKai",
+                "Noto Sans SC",
+                "Source Han Sans SC",
+                "PingFang SC",
+                "Microsoft YaHei",
+                "Roboto",
+                "Arial",
+            ],
+            "sans-serif",
+        )
+    }
+
+    #[must_use]
+    pub fn monospace_stack(&self) -> String {
+        font_stack(
+            [
+                self.monospace_font.as_str(),
+                "Fira Code",
+                "Consolas",
+                self.default_cjk_font.as_str(),
+                "LXGW WenKai GB Screen",
+                "LXGW WenKai",
+                "SFMono-Regular",
+                "Menlo",
+                "Courier New",
+            ],
+            "monospace",
+        )
+    }
+}
+
+impl Default for ReaderTypography {
+    fn default() -> Self {
+        Self {
+            default_font: ReaderDefaultFont::Serif,
+            default_cjk_font: "LXGW WenKai GB Screen".into(),
+            serif_font: "Bitter".into(),
+            sans_serif_font: "Roboto".into(),
+            monospace_font: "Consolas".into(),
+            font_size: 16.0,
+            minimum_font_size: 8.0,
+            font_weight: 400,
         }
     }
 }
@@ -100,8 +186,7 @@ impl SpreadMode {
 impl Default for ReaderStyle {
     fn default() -> Self {
         Self {
-            font_size: 16.0,
-            font_family: ReaderFontFamily::default(),
+            typography: ReaderTypography::default(),
             horizontal_margin: 44.0,
             vertical_margin: 44.0,
             spread: SpreadMode::Double,
@@ -116,12 +201,47 @@ impl Default for ReaderStyle {
     }
 }
 
+fn normalize_family(value: &mut String, fallback: &str) {
+    *value = value.trim().to_owned();
+    if value.is_empty() {
+        value.push_str(fallback);
+    }
+}
+
+fn finite_clamp(value: f32, minimum: f32, maximum: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(minimum, maximum)
+    } else {
+        fallback.clamp(minimum, maximum)
+    }
+}
+
+fn font_stack<'a>(families: impl IntoIterator<Item = &'a str>, generic: &str) -> String {
+    let mut seen = HashSet::new();
+    let mut stack = families
+        .into_iter()
+        .map(str::trim)
+        .filter(|family| !family.is_empty())
+        .filter(|family| seen.insert(family.to_ascii_lowercase()))
+        .map(quote_font_family)
+        .collect::<Vec<_>>();
+    stack.push(generic.to_owned());
+    stack.join(", ")
+}
+
+fn quote_font_family(family: &str) -> String {
+    format!("\"{}\"", family.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// Brush carried through Parley without coupling layout to a paint backend.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TextBrush {
     pub color: Rgba,
     pub underline: bool,
 }
+
+/// Shared font bytes registered in both the native reader and the Xilem UI.
+pub type ReaderFontBlob = parley::fontique::Blob<u8>;
 
 /// One immutable paginated section.
 pub struct SectionLayout {
@@ -204,12 +324,32 @@ impl LayoutEngine {
         }
     }
 
+    pub fn with_fonts(fonts: impl IntoIterator<Item = ReaderFontBlob>) -> Self {
+        let mut engine = Self::new();
+        for font in fonts {
+            engine.font_context.collection.register_fonts(font, None);
+        }
+        engine
+    }
+
+    pub fn available_font_families(&mut self) -> Vec<String> {
+        let mut families = self
+            .font_context
+            .collection
+            .family_names()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        families.sort_by_key(|family| family.to_lowercase());
+        families.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        families
+    }
+
     pub fn layout_section(
         &mut self,
         source: &dyn BookSource,
         section: &Section,
         viewport: LayoutViewport,
-        reader_style: ReaderStyle,
+        reader_style: &ReaderStyle,
     ) -> Result<SectionLayout, LayoutError> {
         self.layout_blocks(source, &section.blocks, viewport, reader_style)
     }
@@ -222,7 +362,7 @@ impl LayoutEngine {
         source: &dyn BookSource,
         blocks: &[Block],
         viewport: LayoutViewport,
-        reader_style: ReaderStyle,
+        reader_style: &ReaderStyle,
     ) -> Result<SectionLayout, LayoutError> {
         self.layout_fragments(source, &[blocks], viewport, reader_style)
     }
@@ -239,7 +379,7 @@ impl LayoutEngine {
         source: &dyn BookSource,
         fragments: &[&[Block]],
         viewport: LayoutViewport,
-        reader_style: ReaderStyle,
+        reader_style: &ReaderStyle,
     ) -> Result<SectionLayout, LayoutError> {
         let page_width = viewport.width as f32;
         let page_height = viewport.height as f32;
@@ -283,18 +423,27 @@ impl LayoutEngine {
     fn shape_text(
         &mut self,
         block: &TextBlock,
-        reader_style: ReaderStyle,
+        reader_style: &ReaderStyle,
         content_width: f32,
     ) -> PreparedText {
         let (text, spans, source_text_start) = flatten_text(block, reader_style.foreground);
         let available_width = (content_width - block.style.indent).max(40.0);
+        let typography = &reader_style.typography;
+        let font_stack = if block.kind == TextBlockKind::Preformatted {
+            typography.monospace_stack()
+        } else {
+            typography.default_stack()
+        };
         let mut builder =
             self.layout_context
                 .ranged_builder(&mut self.font_context, &text, 1.0, false);
         builder.push_default(StyleProperty::FontFamily(FontFamily::from(
-            reader_style.font_family.css_stack(),
+            font_stack.as_str(),
         )));
-        builder.push_default(StyleProperty::FontSize(reader_style.font_size));
+        builder.push_default(StyleProperty::FontSize(typography.font_size));
+        builder.push_default(StyleProperty::FontWeight(FontWeight::new(f32::from(
+            typography.font_weight,
+        ))));
         builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(
             block.style.line_height,
         )));
@@ -304,7 +453,8 @@ impl LayoutEngine {
         }));
 
         for span in spans {
-            let size = reader_style.font_size * span.style.size_scale.clamp(0.5, 3.0);
+            let size = (typography.font_size * span.style.size_scale.clamp(0.5, 3.0))
+                .max(typography.minimum_font_size);
             builder.push(StyleProperty::FontSize(size), span.range.clone());
             builder.push(
                 StyleProperty::Brush(TextBrush {
@@ -315,7 +465,9 @@ impl LayoutEngine {
             );
             if span.style.bold {
                 builder.push(
-                    StyleProperty::FontWeight(FontWeight::BOLD),
+                    StyleProperty::FontWeight(FontWeight::new(
+                        f32::from(typography.font_weight).max(FontWeight::BOLD.value()),
+                    )),
                     span.range.clone(),
                 );
             }
@@ -350,7 +502,7 @@ impl LayoutEngine {
 fn resolve_page_geometry(
     page_width: f32,
     page_height: f32,
-    reader_style: ReaderStyle,
+    reader_style: &ReaderStyle,
 ) -> PageGeometry {
     let horizontal_margin = reader_style
         .horizontal_margin
@@ -659,18 +811,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reader_font_families_expose_generic_and_named_fallback_stacks() {
-        assert_eq!(ReaderStyle::default().font_family, ReaderFontFamily::Serif);
-        assert_eq!(ReaderFontFamily::Serif.css_stack(), "serif");
-        assert_eq!(ReaderFontFamily::SansSerif.css_stack(), "sans-serif");
-        assert_eq!(ReaderFontFamily::Monospace.css_stack(), "monospace");
+    fn reader_typography_matches_readest_defaults_and_builds_cjk_stacks() {
+        let typography = ReaderTypography::default();
+        assert_eq!(typography.default_font, ReaderDefaultFont::Serif);
+        assert_eq!(typography.default_cjk_font, "LXGW WenKai GB Screen");
+        assert_eq!(typography.serif_font, "Bitter");
+        assert_eq!(typography.sans_serif_font, "Roboto");
+        assert_eq!(typography.monospace_font, "Consolas");
+        assert!((typography.font_size - 16.0).abs() < f32::EPSILON);
+        assert!((typography.minimum_font_size - 8.0).abs() < f32::EPSILON);
+        assert_eq!(typography.font_weight, 400);
+        assert!(typography.serif_stack().contains("\"Bitter\""));
+        assert!(typography.serif_stack().contains("\"SimSun\""));
+        assert!(typography.serif_stack().ends_with("serif"));
         assert!(
-            ReaderFontFamily::MicrosoftYaHei
-                .css_stack()
-                .contains("Microsoft YaHei")
+            typography
+                .sans_serif_stack()
+                .contains("\"Microsoft YaHei\"")
         );
-        assert!(ReaderFontFamily::SimSun.css_stack().ends_with("serif"));
-        assert!(ReaderFontFamily::KaiTi.css_stack().ends_with("serif"));
+        assert!(typography.sans_serif_stack().ends_with("sans-serif"));
+        assert!(typography.monospace_stack().ends_with("monospace"));
+    }
+
+    #[test]
+    fn reader_typography_normalizes_persisted_values() {
+        let mut typography = ReaderTypography {
+            default_cjk_font: "  ".into(),
+            serif_font: "  Georgia  ".into(),
+            sans_serif_font: String::new(),
+            monospace_font: String::new(),
+            font_size: f32::NAN,
+            minimum_font_size: -4.0,
+            font_weight: 455,
+            ..ReaderTypography::default()
+        };
+        typography.normalize();
+        assert_eq!(typography.default_cjk_font, "LXGW WenKai GB Screen");
+        assert_eq!(typography.serif_font, "Georgia");
+        assert_eq!(typography.sans_serif_font, "Roboto");
+        assert_eq!(typography.monospace_font, "Consolas");
+        assert!((typography.font_size - 16.0).abs() < f32::EPSILON);
+        assert!((typography.minimum_font_size - 1.0).abs() < f32::EPSILON);
+        assert_eq!(typography.font_weight, 500);
     }
 
     #[test]
@@ -680,7 +862,7 @@ mod tests {
         let single = resolve_page_geometry(
             viewport_width,
             page_height,
-            ReaderStyle {
+            &ReaderStyle {
                 spread: SpreadMode::Single,
                 ..ReaderStyle::default()
             },
@@ -692,7 +874,7 @@ mod tests {
         let double = resolve_page_geometry(
             viewport_width,
             page_height,
-            ReaderStyle {
+            &ReaderStyle {
                 spread: SpreadMode::Double,
                 ..ReaderStyle::default()
             },
@@ -755,7 +937,7 @@ mod tests {
                 &source,
                 &section,
                 LayoutViewport::new(600, 400).unwrap(),
-                ReaderStyle::default(),
+                &ReaderStyle::default(),
             )
             .unwrap();
         assert!(layout.pages.len() > 1);
@@ -793,7 +975,7 @@ mod tests {
                 &source,
                 &section,
                 viewport,
-                ReaderStyle {
+                &ReaderStyle {
                     spread: SpreadMode::Single,
                     ..ReaderStyle::default()
                 },
@@ -804,7 +986,7 @@ mod tests {
                 &source,
                 &section,
                 viewport,
-                ReaderStyle {
+                &ReaderStyle {
                     spread: SpreadMode::Double,
                     ..ReaderStyle::default()
                 },

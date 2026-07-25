@@ -3303,6 +3303,7 @@ dependencies = [
  "image",
  "parley 0.10.0",
  "rebook-publication",
+ "serde",
  "thiserror 2.0.19",
 ]
 
