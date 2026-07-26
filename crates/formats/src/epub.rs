@@ -11,7 +11,7 @@ use quick_xml::events::Event;
 use rebook_html::parse_section;
 use rebook_publication::{
     Book, BookSource, Metadata, PublicationError, PublicationId, PublicationUrl, RenditionLayout,
-    Resource, Section, SpineItem, SpineItemId, TocEntry,
+    Resource, Section, SpineItem, SpineItemId, TocEntry, promote_single_toc_root,
 };
 use roxmltree::{Document, Node};
 use sha2::{Digest, Sha256};
@@ -104,7 +104,8 @@ impl EpubPublication {
         }
 
         let reading_order = build_reading_order(&package_model)?;
-        let table_of_contents = parse_navigation(&archive, &package_model)?;
+        let table_of_contents =
+            promote_single_toc_root(parse_navigation(&archive, &package_model)?);
         let digest = Sha256::digest(bytes.as_ref());
         let id = PublicationId::new(format!("{digest:x}"))?;
 
@@ -1315,7 +1316,9 @@ impl EpubError {
 mod tests {
     use std::io::{Cursor, Write};
 
-    use rebook_publication::{Block, BookSource, PublicationUrl, RenditionLayout};
+    use rebook_publication::{
+        Block, BookSource, PublicationUrl, RenditionLayout, TocEntry, promote_single_toc_root,
+    };
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
@@ -1323,6 +1326,59 @@ mod tests {
         EpubError, EpubLimits, EpubOpenOptions, EpubPublication, ZIP_CENTRAL_HEADER_SIGNATURE,
         ZIP_CENTRAL_HEADER_SIZE, ZIP_SIGNATURE_SIZE, read_u16,
     };
+
+    #[test]
+    fn promotes_a_single_root_without_flattening_deeper_sections() {
+        let entries = vec![TocEntry {
+            label: "  STRUCTURED   Writing ".into(),
+            href: Some(PublicationUrl::parse("index.xhtml").unwrap()),
+            children: vec![
+                TocEntry {
+                    label: "Preface".into(),
+                    href: Some(PublicationUrl::parse("preface.xhtml").unwrap()),
+                    children: Vec::new(),
+                },
+                TocEntry {
+                    label: "Introduction".into(),
+                    href: Some(PublicationUrl::parse("intro.xhtml").unwrap()),
+                    children: vec![TocEntry {
+                        label: "Rhetoric".into(),
+                        href: None,
+                        children: Vec::new(),
+                    }],
+                },
+            ],
+        }];
+
+        let promoted = promote_single_toc_root(entries);
+
+        assert_eq!(promoted.len(), 2);
+        assert_eq!(promoted[0].label, "Preface");
+        assert_eq!(promoted[1].label, "Introduction");
+        assert_eq!(promoted[1].children[0].label, "Rhetoric");
+    }
+
+    #[test]
+    fn keeps_multiple_top_level_entries() {
+        let entries = vec![
+            TocEntry {
+                label: "Part One".into(),
+                href: None,
+                children: Vec::new(),
+            },
+            TocEntry {
+                label: "Part Two".into(),
+                href: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let retained = promote_single_toc_root(entries);
+
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].label, "Part One");
+        assert_eq!(retained[1].label, "Part Two");
+    }
 
     #[test]
     fn opens_epub3_navigation_and_lazy_resources() {

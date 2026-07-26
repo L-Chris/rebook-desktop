@@ -4,7 +4,7 @@ use std::sync::Arc;
 use rebook_html::parse_section;
 use rebook_publication::{
     Block, Book, BookSource, ImageBlock, ImageStyle, Metadata, PublicationError, PublicationId,
-    PublicationUrl, Resource, Section, SpineItem, SpineItemId, TocEntry,
+    PublicationUrl, Resource, Section, SpineItem, SpineItemId, TocEntry, promote_single_toc_root,
 };
 
 use crate::{BookFormat, FormatError, conversion_error};
@@ -91,6 +91,7 @@ impl DirectBookSource {
                 .map(parse_toc_entry)
                 .collect::<Result<Vec<_>, _>>()?
         };
+        let table_of_contents = promote_single_toc_root(table_of_contents);
         let cover = book
             .cover_path
             .as_deref()
@@ -209,6 +210,50 @@ mod tests {
     use rebook_publication::{BookSource, RenditionLayout};
 
     use super::*;
+
+    #[test]
+    fn direct_source_promotes_a_single_toc_root() {
+        let source = DirectBookSource::open(
+            SourceBook {
+                id: "wrapped-toc-test".into(),
+                metadata: Metadata {
+                    title: "Sample Book".into(),
+                    authors: Vec::new(),
+                    languages: Vec::new(),
+                    layout: RenditionLayout::PrePaginated,
+                },
+                sections: vec![SourceSection {
+                    title: "Page 1".into(),
+                    content: SectionContent::Html("<p>Page 1</p>".into()),
+                    linear: true,
+                }],
+                table_of_contents: vec![SourceTocEntry {
+                    label: "目 录".into(),
+                    href: "Text/section-1.xhtml".into(),
+                    children: vec![
+                        SourceTocEntry {
+                            label: "Preface".into(),
+                            href: "Text/section-1.xhtml#preface".into(),
+                            children: Vec::new(),
+                        },
+                        SourceTocEntry {
+                            label: "Chapter One".into(),
+                            href: "Text/section-1.xhtml#chapter-one".into(),
+                            children: Vec::new(),
+                        },
+                    ],
+                }],
+                resources: Vec::new(),
+                cover_path: None,
+            },
+            BookFormat::Pdf,
+        )
+        .unwrap();
+
+        assert_eq!(source.book().table_of_contents.len(), 2);
+        assert_eq!(source.book().table_of_contents[0].label, "Preface");
+        assert_eq!(source.book().table_of_contents[1].label, "Chapter One");
+    }
 
     #[test]
     fn direct_source_parses_lazy_html_toc_fragments_and_resources() {

@@ -222,6 +222,18 @@ pub struct TocEntry {
     pub children: Vec<Self>,
 }
 
+/// Promotes the children of a single top-level TOC entry by one level.
+///
+/// This is a structural presentation rule: a sole parent adds no distinction
+/// at the first navigation level. It deliberately does not inspect labels or
+/// recursively flatten deeper groups.
+pub fn promote_single_toc_root(mut entries: Vec<TocEntry>) -> Vec<TocEntry> {
+    if entries.len() == 1 && !entries[0].children.is_empty() {
+        return entries.pop().map_or_else(Vec::new, |root| root.children);
+    }
+    entries
+}
+
 /// Fully loaded resource returned through the publication boundary.
 #[derive(Debug, Clone)]
 pub struct Resource {
@@ -231,6 +243,20 @@ pub struct Resource {
     pub media_type: String,
     /// Immutable uncompressed bytes.
     pub bytes: Arc<[u8]>,
+}
+
+/// Decoded RGBA image supplied by formats that already rasterize their pages.
+///
+/// This lets fixed-layout formats avoid encoding a temporary image only for the
+/// layout engine to decode it immediately afterwards.
+#[derive(Debug, Clone)]
+pub struct RasterResource {
+    /// Pixel width.
+    pub width: u32,
+    /// Pixel height.
+    pub height: u32,
+    /// Immutable row-major RGBA8 pixels.
+    pub pixels: Arc<[u8]>,
 }
 
 /// Format-neutral description returned before individual sections are parsed.
@@ -500,6 +526,13 @@ pub trait BookSource: Send + Sync {
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError>;
     /// Loads a referenced resource subject to format-specific budgets.
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError>;
+    /// Returns an already decoded image when the format can provide one cheaply.
+    fn raster_resource(
+        &self,
+        _href: &PublicationUrl,
+    ) -> Result<Option<RasterResource>, PublicationError> {
+        Ok(None)
+    }
 }
 
 /// Source position shared by DOM, semantic blocks, and layout fragments.

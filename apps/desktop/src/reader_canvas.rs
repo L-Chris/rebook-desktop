@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tracing::{Span, trace_span};
 use xilem::core::{MessageContext, MessageResult, Mut, View, ViewMarker};
 use xilem::masonry::accesskit::{Node, Role};
-use xilem::masonry::core::keyboard::{Key, KeyState, NamedKey};
+use xilem::masonry::core::keyboard::{Key, KeyState, Modifiers, NamedKey};
 use xilem::masonry::core::{
     AccessCtx, AccessEvent, BoxConstraints, ChildrenIds, CursorIcon, EventCtx, LayoutCtx, PaintCtx,
     PointerButton, PointerButtonEvent, PointerEvent, PointerScrollEvent, PointerUpdate,
@@ -164,6 +164,7 @@ impl ReaderCanvas {
 pub enum ReaderCanvasAction {
     SizeChanged,
     ToolbarVisibility(bool),
+    OpenSearch,
     PreviousPage,
     NextPage,
     SelectionStart { x: f32, y: f32 },
@@ -271,7 +272,7 @@ impl Widget for ReaderCanvas {
         if event.state != KeyState::Down || event.repeat {
             return;
         }
-        let action = page_action_for_key(&event.key);
+        let action = reader_action_for_key(&event.key, event.modifiers);
         if let Some(action) = action {
             ctx.submit_action::<Self::Action>(action);
             ctx.set_handled();
@@ -340,7 +341,12 @@ fn toolbar_visible_at_y(y: f64) -> bool {
     y.is_finite() && (0.0..=TOOLBAR_REVEAL_HEIGHT).contains(&y)
 }
 
-fn page_action_for_key(key: &Key) -> Option<ReaderCanvasAction> {
+fn reader_action_for_key(key: &Key, modifiers: Modifiers) -> Option<ReaderCanvasAction> {
+    if modifiers.ctrl()
+        && matches!(key, Key::Character(character) if character.eq_ignore_ascii_case("f"))
+    {
+        return Some(ReaderCanvasAction::OpenSearch);
+    }
     match key {
         Key::Named(NamedKey::ArrowLeft) => Some(ReaderCanvasAction::PreviousPage),
         Key::Named(NamedKey::ArrowRight) => Some(ReaderCanvasAction::NextPage),
@@ -376,14 +382,33 @@ mod tests {
     #[test]
     fn horizontal_arrows_map_to_page_turns() {
         assert_eq!(
-            page_action_for_key(&Key::Named(NamedKey::ArrowLeft)),
+            reader_action_for_key(&Key::Named(NamedKey::ArrowLeft), Modifiers::empty()),
             Some(ReaderCanvasAction::PreviousPage)
         );
         assert_eq!(
-            page_action_for_key(&Key::Named(NamedKey::ArrowRight)),
+            reader_action_for_key(&Key::Named(NamedKey::ArrowRight), Modifiers::empty()),
             Some(ReaderCanvasAction::NextPage)
         );
-        assert_eq!(page_action_for_key(&Key::Named(NamedKey::ArrowUp)), None);
+        assert_eq!(
+            reader_action_for_key(&Key::Named(NamedKey::ArrowUp), Modifiers::empty()),
+            None
+        );
+    }
+
+    #[test]
+    fn control_f_opens_reader_search() {
+        assert_eq!(
+            reader_action_for_key(&Key::Character("f".into()), Modifiers::CONTROL),
+            Some(ReaderCanvasAction::OpenSearch)
+        );
+        assert_eq!(
+            reader_action_for_key(&Key::Character("F".into()), Modifiers::CONTROL),
+            Some(ReaderCanvasAction::OpenSearch)
+        );
+        assert_eq!(
+            reader_action_for_key(&Key::Character("f".into()), Modifiers::empty()),
+            None
+        );
     }
 
     #[test]

@@ -16,8 +16,8 @@ use kurbo::{Affine, BezPath, Point, Rect, Shape};
 use lopdf::{Document, TocType, decode_text_string};
 use rebook_publication::{
     Block, Book, BookSource, FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan, Metadata,
-    PublicationError, PublicationUrl, RenditionLayout, Resource, Section, SourceAnchor,
-    SourceRange,
+    PublicationError, PublicationUrl, RasterResource, RenditionLayout, Resource, Section,
+    SourceAnchor, SourceRange,
 };
 use sha2::{Digest, Sha256};
 
@@ -34,7 +34,7 @@ const CJK_FALLBACK_FONT: &[u8] = include_bytes!("../../../assets/fonts/LXGWWenKa
 
 pub(crate) struct PdfPublication {
     descriptor: DirectBookSource,
-    bytes: Arc<Vec<u8>>,
+    pdf: Arc<Pdf>,
     page_count: usize,
     cache: Mutex<PdfResourceCache>,
 }
@@ -44,13 +44,17 @@ struct PdfResourceCache {
     cover: Option<Arc<[u8]>>,
     pages: HashMap<usize, Arc<[u8]>>,
     page_lru: VecDeque<usize>,
+    rasters: HashMap<usize, RasterResource>,
+    raster_lru: VecDeque<usize>,
     text_layers: HashMap<usize, FixedPageTextLayer>,
 }
 
 pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<PdfPublication, FormatError> {
     let bytes = Arc::new(bytes.to_vec());
-    let pdf = Pdf::new(Arc::clone(&bytes))
-        .map_err(|error| conversion_error(BookFormat::Pdf, format_args!("{error:?}")))?;
+    let pdf = Arc::new(
+        Pdf::new(Arc::clone(&bytes))
+            .map_err(|error| conversion_error(BookFormat::Pdf, format_args!("{error:?}")))?,
+    );
     let page_count = pdf.pages().len();
     if page_count == 0 {
         return Err(conversion_error(
@@ -104,7 +108,7 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<PdfPublication, Form
 
     Ok(PdfPublication {
         descriptor,
-        bytes,
+        pdf,
         page_count,
         cache: Mutex::new(PdfResourceCache::default()),
     })
@@ -146,6 +150,20 @@ impl BookSource for PdfPublication {
             bytes,
         })
     }
+
+    fn raster_resource(
+        &self,
+        href: &PublicationUrl,
+    ) -> Result<Option<RasterResource>, PublicationError> {
+        let path = href.resource_url();
+        if path.path() == COVER_PATH {
+            return Ok(None);
+        }
+        let page_index = page_index_from_path(path.path())
+            .filter(|index| *index < self.page_count)
+            .ok_or_else(|| PublicationError::ResourceNotFound(href.to_string()))?;
+        self.page_raster(page_index).map(Some)
+    }
 }
 
 impl PdfPublication {
@@ -162,8 +180,7 @@ impl PdfPublication {
     }
 
     fn extract_page_text(&self, page_index: usize) -> Result<FixedPageTextLayer, PublicationError> {
-        let pdf = Pdf::new(Arc::clone(&self.bytes)).map_err(pdf_render_error)?;
-        let page = pdf.pages().get(page_index).ok_or_else(|| {
+        let page = self.pdf.pages().get(page_index).ok_or_else(|| {
             PublicationError::ResourceNotFound(format!("PDF page {}", page_index + 1))
         })?;
         let (width, height) = page.render_dimensions();
@@ -181,23 +198,33 @@ impl PdfPublication {
     }
 
     fn cover_resource(&self) -> Result<Arc<[u8]>, PublicationError> {
-        let mut cache = self.lock_cache()?;
-        if let Some(cover) = &cache.cover {
-            return Ok(Arc::clone(cover));
+        let cached = { self.lock_cache()?.cover.clone() };
+        if let Some(cover) = cached {
+            return Ok(cover);
         }
-        let cover: Arc<[u8]> = self.render_page(0, COVER_MAX_DIMENSION)?.into();
+        let cover: Arc<[u8]> = self.render_page_png(0, COVER_MAX_DIMENSION)?.into();
+        let mut cache = self.lock_cache()?;
+        if let Some(cached) = &cache.cover {
+            return Ok(Arc::clone(cached));
+        }
         cache.cover = Some(Arc::clone(&cover));
         Ok(cover)
     }
 
     fn page_resource(&self, page_index: usize) -> Result<Arc<[u8]>, PublicationError> {
-        let mut cache = self.lock_cache()?;
-        if let Some(page) = cache.pages.get(&page_index).cloned() {
+        let cached = { self.lock_cache()?.pages.get(&page_index).cloned() };
+        if let Some(page) = cached {
+            let mut cache = self.lock_cache()?;
             touch_page(&mut cache.page_lru, page_index);
             return Ok(page);
         }
 
-        let page: Arc<[u8]> = self.render_page(page_index, PAGE_MAX_DIMENSION)?.into();
+        let page: Arc<[u8]> = self.render_page_png(page_index, PAGE_MAX_DIMENSION)?.into();
+        let mut cache = self.lock_cache()?;
+        if let Some(cached) = cache.pages.get(&page_index).cloned() {
+            touch_page(&mut cache.page_lru, page_index);
+            return Ok(cached);
+        }
         cache.pages.insert(page_index, Arc::clone(&page));
         touch_page(&mut cache.page_lru, page_index);
         while cache.pages.len() > PAGE_CACHE_CAPACITY {
@@ -209,26 +236,55 @@ impl PdfPublication {
         Ok(page)
     }
 
+    fn page_raster(&self, page_index: usize) -> Result<RasterResource, PublicationError> {
+        let cached = { self.lock_cache()?.rasters.get(&page_index).cloned() };
+        if let Some(raster) = cached {
+            let mut cache = self.lock_cache()?;
+            touch_page(&mut cache.raster_lru, page_index);
+            return Ok(raster);
+        }
+
+        let pixmap = self.render_page_pixmap(page_index, PAGE_MAX_DIMENSION)?;
+        let raster = RasterResource {
+            width: u32::from(pixmap.width()),
+            height: u32::from(pixmap.height()),
+            pixels: pixmap.data_as_u8_slice().to_vec().into(),
+        };
+        let mut cache = self.lock_cache()?;
+        if let Some(cached) = cache.rasters.get(&page_index).cloned() {
+            touch_page(&mut cache.raster_lru, page_index);
+            return Ok(cached);
+        }
+        cache.rasters.insert(page_index, raster.clone());
+        touch_page(&mut cache.raster_lru, page_index);
+        while cache.rasters.len() > PAGE_CACHE_CAPACITY {
+            let Some(evicted) = cache.raster_lru.pop_front() else {
+                break;
+            };
+            cache.rasters.remove(&evicted);
+        }
+        Ok(raster)
+    }
+
     fn lock_cache(&self) -> Result<std::sync::MutexGuard<'_, PdfResourceCache>, PublicationError> {
         self.cache.lock().map_err(|_| {
             PublicationError::InvalidPublication("PDF raster cache is unavailable".into())
         })
     }
 
-    fn render_page(
+    fn render_page_pixmap(
         &self,
         page_index: usize,
         max_dimension: f32,
-    ) -> Result<Vec<u8>, PublicationError> {
-        let pdf = Pdf::new(Arc::clone(&self.bytes)).map_err(pdf_render_error)?;
-        let page = pdf.pages().get(page_index).ok_or_else(|| {
+    ) -> Result<hayro::vello_cpu::Pixmap, PublicationError> {
+        let page = self.pdf.pages().get(page_index).ok_or_else(|| {
             PublicationError::ResourceNotFound(format!("PDF page {}", page_index + 1))
         })?;
         let (width, height) = page.render_dimensions();
         let scale = (max_dimension / width.max(height).max(1.0)).min(MAX_RENDER_SCALE);
         let cache = RenderCache::new();
         let interpreter_settings = interpreter_settings();
-        let pixmap = hayro::render(
+        Ok(hayro::render(
             page,
             &cache,
             &interpreter_settings,
@@ -238,8 +294,17 @@ impl PdfPublication {
                 bg_color: WHITE,
                 ..RenderSettings::default()
             },
-        );
-        pixmap.into_png().map_err(pdf_render_error)
+        ))
+    }
+
+    fn render_page_png(
+        &self,
+        page_index: usize,
+        max_dimension: f32,
+    ) -> Result<Vec<u8>, PublicationError> {
+        self.render_page_pixmap(page_index, max_dimension)?
+            .into_png()
+            .map_err(pdf_render_error)
     }
 }
 
@@ -403,10 +468,10 @@ fn fallback_glyph_rect(glyph: &Glyph<'_>, transform: Affine) -> Rect {
     transformed_bounds(
         transform,
         [
-            Point::new(0.0, -800.0),
-            Point::new(advance, -800.0),
-            Point::new(0.0, 200.0),
-            Point::new(advance, 200.0),
+            Point::new(0.0, -200.0),
+            Point::new(advance, -200.0),
+            Point::new(0.0, 800.0),
+            Point::new(advance, 800.0),
         ],
     )
 }
@@ -625,11 +690,23 @@ mod tests {
         assert!(text_layer.text.contains("Hello PDF"));
         assert_eq!(text_layer.spans.len(), "Hello PDF".chars().count());
         assert_eq!(image.source.as_ref().unwrap().end.text_offset, 9);
+        let first_span = &text_layer.spans[0];
+        let baseline_y = 80.0;
+        assert!(first_span.rect.y < baseline_y);
+        assert!(first_span.rect.y + first_span.rect.height > baseline_y);
+        assert!(first_span.rect.y + first_span.rect.height / 2.0 < baseline_y);
 
         let page = publication.resource(&image.href).unwrap();
         assert!(page.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         let cached = publication.resource(&image.href).unwrap();
         assert!(Arc::ptr_eq(&page.bytes, &cached.bytes));
+        let raster = publication.raster_resource(&image.href).unwrap().unwrap();
+        let cached_raster = publication.raster_resource(&image.href).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&raster.pixels, &cached_raster.pixels));
+        assert_eq!(
+            raster.pixels.len(),
+            raster.width as usize * raster.height as usize * 4
+        );
         let cover = publication
             .resource(publication.book().cover.as_ref().unwrap())
             .unwrap();

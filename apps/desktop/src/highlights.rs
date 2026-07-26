@@ -1,61 +1,21 @@
 use std::fs;
 use std::io;
+use std::path::Path;
+#[cfg(test)]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
-use rebook_publication::{Rgba, SourceRange};
+use rebook_publication::SourceRange;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-const STORE_VERSION: u32 = 1;
-const STORE_FILE: &str = "highlights.json";
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+use crate::sync::{SyncSettings, SyncStore};
 
-pub type HighlightResult<T> = Result<T, Box<dyn std::error::Error>>;
+const LEGACY_STORE_VERSION: u32 = 1;
+const LEGACY_STORE_FILE: &str = "highlights.json";
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HighlightColor {
-    #[default]
-    Yellow,
-    Green,
-    Blue,
-    Pink,
-}
-
-impl HighlightColor {
-    pub const ALL: [Self; 4] = [Self::Yellow, Self::Green, Self::Blue, Self::Pink];
-
-    pub const fn rgba(self) -> Rgba {
-        match self {
-            Self::Yellow => Rgba {
-                red: 250,
-                green: 204,
-                blue: 21,
-                alpha: 92,
-            },
-            Self::Green => Rgba {
-                red: 74,
-                green: 222,
-                blue: 128,
-                alpha: 80,
-            },
-            Self::Blue => Rgba {
-                red: 96,
-                green: 165,
-                blue: 250,
-                alpha: 82,
-            },
-            Self::Pink => Rgba {
-                red: 244,
-                green: 114,
-                blue: 182,
-                alpha: 78,
-            },
-        }
-    }
-}
+pub type HighlightResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredHighlight {
@@ -63,37 +23,27 @@ pub struct StoredHighlight {
     pub book_id: String,
     pub ranges: Vec<SourceRange>,
     pub quote: String,
-    pub color: HighlightColor,
     pub created_at: u64,
 }
 
 impl StoredHighlight {
-    pub fn new(
-        book_id: String,
-        ranges: Vec<SourceRange>,
-        quote: String,
-        color: HighlightColor,
-    ) -> Self {
-        let created_at = unix_timestamp_millis();
-        let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    pub fn new(book_id: String, ranges: Vec<SourceRange>, quote: String) -> Self {
         Self {
-            id: format!("{}-{created_at}-{sequence}", std::process::id()),
+            id: Uuid::new_v4().to_string(),
             book_id,
             ranges,
             quote,
-            color,
-            created_at,
+            created_at: unix_timestamp_millis(),
         }
     }
 }
 
 pub struct HighlightStore {
-    path: PathBuf,
-    highlights: Vec<StoredHighlight>,
+    store: SyncStore,
 }
 
 #[derive(Default, Serialize, Deserialize)]
-struct StoredHighlights {
+struct LegacyStoredHighlights {
     version: u32,
     #[serde(default)]
     highlights: Vec<StoredHighlight>,
@@ -103,78 +53,77 @@ impl HighlightStore {
     pub fn load_default() -> HighlightResult<Self> {
         let project = ProjectDirs::from("com", "Rebook", "Rebook")
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法确定高亮数据目录"))?;
-        Self::load_from(project.data_local_dir().join(STORE_FILE))
+        let settings = SyncSettings::load_default()?;
+        let store = SyncStore::open_default(settings.device_id)?;
+        migrate_legacy(&store, &project.data_local_dir().join(LEGACY_STORE_FILE))?;
+        Ok(Self { store })
     }
 
+    #[cfg(test)]
     fn load_from(path: PathBuf) -> HighlightResult<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let stored = if path.exists() {
-            serde_json::from_slice::<StoredHighlights>(&fs::read(&path)?)?
-        } else {
-            StoredHighlights {
-                version: STORE_VERSION,
-                highlights: Vec::new(),
-            }
-        };
-        if stored.version != STORE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("不支持的高亮数据版本：{}", stored.version),
-            )
-            .into());
-        }
-        Ok(Self {
-            path,
-            highlights: stored.highlights,
-        })
+        let store = SyncStore::open_at(path, "test-device")?;
+        Ok(Self { store })
     }
 
     pub fn for_book(&self, book_id: &str) -> Vec<StoredHighlight> {
-        let mut highlights = self
-            .highlights
-            .iter()
-            .filter(|highlight| highlight.book_id == book_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        highlights.sort_by_key(|highlight| std::cmp::Reverse(highlight.created_at));
-        highlights
+        self.store.annotations_for_book(book_id).map_or_else(
+            |error| {
+                tracing::warn!(%error, "failed to load highlights from sync store");
+                Vec::new()
+            },
+            |annotations| {
+                annotations
+                    .into_iter()
+                    .map(|annotation| StoredHighlight {
+                        id: annotation.id,
+                        book_id: annotation.book_id,
+                        ranges: annotation.ranges,
+                        quote: annotation.quote,
+                        created_at: annotation.created_at,
+                    })
+                    .collect()
+            },
+        )
     }
 
     pub fn insert(&mut self, highlight: StoredHighlight) -> HighlightResult<()> {
-        self.highlights.push(highlight);
-        if let Err(error) = self.persist() {
-            self.highlights.pop();
-            return Err(error);
-        }
+        self.store.create_annotation(
+            highlight.id,
+            highlight.book_id,
+            highlight.ranges,
+            highlight.quote,
+            highlight.created_at,
+        )?;
         Ok(())
     }
 
     pub fn remove(&mut self, id: &str) -> HighlightResult<bool> {
-        let Some(index) = self
-            .highlights
-            .iter()
-            .position(|highlight| highlight.id == id)
-        else {
-            return Ok(false);
-        };
-        let removed = self.highlights.remove(index);
-        if let Err(error) = self.persist() {
-            self.highlights.insert(index, removed);
-            return Err(error);
-        }
-        Ok(true)
+        self.store.delete_annotation(id)
     }
+}
 
-    fn persist(&self) -> HighlightResult<()> {
-        let stored = StoredHighlights {
-            version: STORE_VERSION,
-            highlights: self.highlights.clone(),
-        };
-        fs::write(&self.path, serde_json::to_vec_pretty(&stored)?)?;
-        Ok(())
+fn migrate_legacy(store: &SyncStore, path: &Path) -> HighlightResult<()> {
+    if !path.exists() {
+        return Ok(());
     }
+    let legacy: LegacyStoredHighlights = serde_json::from_slice(&fs::read(path)?)?;
+    if legacy.version != LEGACY_STORE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("不支持的高亮数据版本：{}", legacy.version),
+        )
+        .into());
+    }
+    for highlight in legacy.highlights {
+        store.import_legacy_annotation(
+            highlight.id,
+            highlight.book_id,
+            highlight.ranges,
+            highlight.quote,
+            highlight.created_at,
+        )?;
+    }
+    Ok(())
 }
 
 fn unix_timestamp_millis() -> u64 {
@@ -194,7 +143,7 @@ mod tests {
     #[test]
     fn highlights_round_trip_and_are_scoped_by_book() {
         let path = std::env::temp_dir().join(format!(
-            "rebook-highlights-{}-{}.json",
+            "rebook-highlights-{}-{}.sqlite3",
             std::process::id(),
             unix_timestamp_millis()
         ));
@@ -211,12 +160,7 @@ mod tests {
                 text_offset: 6,
             },
         };
-        let highlight = StoredHighlight::new(
-            "book-a".into(),
-            vec![range],
-            "text".into(),
-            HighlightColor::Yellow,
-        );
+        let highlight = StoredHighlight::new("book-a".into(), vec![range], "text".into());
         let id = highlight.id.clone();
         store.insert(highlight).unwrap();
 

@@ -5,14 +5,15 @@ use rebook_publication::{Block, BookSource, TextBlock, TextBlockKind, TocEntry};
 use reqwest::Client;
 use serde_json::{Value, json};
 
-use super::PluginSettings;
 use super::rewrite::BlockRewrite;
 use super::search::{search_book, section_text, text_block_text};
+use super::{AiProvider, BlockTranslation, PluginSettings, TranslationBlockInput};
 
 const MAX_TOOL_STEPS: usize = 4;
 const MAX_HISTORY_TURNS: usize = 12;
 const MAX_CURRENT_CONTEXT_CHARS: usize = 8_000;
 const MAX_TRANSLATION_CHARS: usize = 12_000;
+const MAX_TRANSLATION_ATTEMPTS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatRole {
@@ -49,7 +50,7 @@ pub async fn chat_with_book(
     question: String,
     current_section: usize,
 ) -> Result<ChatResponse, String> {
-    settings.validate_ai()?;
+    let (provider, model) = settings.chat_endpoint()?;
     let current_text = section_text(source.as_ref(), current_section)
         .map(|text| clip_text(&text, MAX_CURRENT_CONTEXT_CHARS))
         .unwrap_or_default();
@@ -72,14 +73,7 @@ pub async fn chat_with_book(
     let tools = book_tools();
     let mut rewrites = Vec::new();
     for _ in 0..MAX_TOOL_STEPS {
-        let message = request_completion(
-            &client,
-            &settings,
-            &settings.chat_model,
-            &messages,
-            Some(&tools),
-        )
-        .await?;
+        let message = request_completion(&client, provider, model, &messages, Some(&tools)).await?;
         let tool_calls = message
             .get("tool_calls")
             .and_then(Value::as_array)
@@ -125,43 +119,141 @@ pub async fn chat_with_book(
     Err("AI 工具调用次数过多，请缩小问题范围后重试".into())
 }
 
-pub async fn translate_text(settings: PluginSettings, text: String) -> Result<String, String> {
-    settings.validate_ai()?;
-    let text = text.trim();
-    if text.is_empty() {
-        return Err("请先选择需要翻译的文字".into());
+pub async fn translate_blocks(
+    settings: PluginSettings,
+    blocks: Vec<TranslationBlockInput>,
+) -> Result<Vec<BlockTranslation>, String> {
+    let (provider, model) = settings.translation_endpoint()?;
+    if blocks.is_empty() {
+        return Ok(Vec::new());
     }
-    let text = clip_text(text, MAX_TRANSLATION_CHARS);
-    let messages = vec![
-        json!({
-            "role": "system",
-            "content": format!(
-                "你是一名专业图书翻译。请将用户提供的原文忠实、准确、自然地翻译为{}。保留段落结构、专有名词和语气；只返回译文，不要补充说明。",
-                settings.target_language.trim()
-            ),
-        }),
-        json!({ "role": "user", "content": text }),
-    ];
     let client = Client::builder()
         .timeout(Duration::from_secs(90))
         .build()
         .map_err(|error| format!("创建翻译客户端失败：{error}"))?;
-    let message = request_completion(
-        &client,
-        &settings,
-        &settings.translation_model,
-        &messages,
-        None,
-    )
-    .await?;
-    message_content(&message)
-        .filter(|content| !content.trim().is_empty())
-        .ok_or_else(|| "翻译服务返回了空内容".into())
+    let batches = translation_batches(blocks, MAX_TRANSLATION_CHARS);
+    let mut translations = Vec::new();
+    for batch in batches {
+        translations.extend(
+            translate_block_batch(
+                &client,
+                provider,
+                model,
+                settings.target_language.trim(),
+                &batch,
+            )
+            .await?,
+        );
+    }
+    Ok(translations)
+}
+
+async fn translate_block_batch(
+    client: &Client,
+    provider: &AiProvider,
+    model: &str,
+    target_language: &str,
+    blocks: &[TranslationBlockInput],
+) -> Result<Vec<BlockTranslation>, String> {
+    let keys = (0..blocks.len())
+        .map(|index| index.to_string())
+        .collect::<Vec<_>>();
+    let input = keys
+        .iter()
+        .zip(blocks)
+        .map(|(key, block)| (key.clone(), Value::String(block.text.clone())))
+        .collect::<serde_json::Map<_, _>>();
+    let mut last_error = None;
+    for _ in 0..MAX_TRANSLATION_ATTEMPTS {
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": format!(
+                    "你是一名专业图书翻译。请把输入 JSON 对象中的每个值翻译为{target_language}，忠实保留原文语气、专有名词与段落结构。只返回一个 JSON 对象，必须保留完全相同的键，每个值只能是对应译文字符串。"
+                ),
+            }),
+            json!({ "role": "user", "content": Value::Object(input.clone()).to_string() }),
+        ];
+        let message = request_completion(client, provider, model, &messages, None).await?;
+        let content = message_content(&message)
+            .filter(|content| !content.trim().is_empty())
+            .ok_or_else(|| "翻译服务返回了空内容".to_owned())?;
+        match parse_translation_object(&content, &keys) {
+            Ok(values) => {
+                return Ok(blocks
+                    .iter()
+                    .zip(values)
+                    .map(|(block, text)| BlockTranslation {
+                        block_index: block.block_index,
+                        text,
+                    })
+                    .collect());
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "翻译结果格式无效".to_owned()))
+}
+
+fn translation_batches(
+    blocks: Vec<TranslationBlockInput>,
+    max_chars: usize,
+) -> Vec<Vec<TranslationBlockInput>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_chars = 0;
+    for mut block in blocks {
+        let char_count = block.text.chars().count();
+        if char_count > max_chars {
+            block.text = clip_text(&block.text, max_chars);
+        }
+        let char_count = block.text.chars().count();
+        if !current.is_empty() && current_chars + char_count > max_chars {
+            batches.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current_chars += char_count;
+        current.push(block);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+fn parse_translation_object(content: &str, keys: &[String]) -> Result<Vec<String>, String> {
+    let trimmed = content.trim();
+    let candidate = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .or_else(|| {
+            let start = trimmed.find('{')?;
+            let end = trimmed.rfind('}')?;
+            (start <= end).then(|| &trimmed[start..=end])
+        })
+        .unwrap_or(trimmed);
+    let output: Value = serde_json::from_str(candidate)
+        .map_err(|error| format!("翻译结果不是有效 JSON：{error}"))?;
+    let output = output
+        .as_object()
+        .ok_or_else(|| "翻译结果必须是 JSON 对象".to_owned())?;
+    keys.iter()
+        .map(|key| {
+            output
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("翻译结果缺少正文块 {key}"))
+        })
+        .collect()
 }
 
 async fn request_completion(
     client: &Client,
-    settings: &PluginSettings,
+    provider: &AiProvider,
     model: &str,
     messages: &[Value],
     tools: Option<&Value>,
@@ -176,8 +268,8 @@ async fn request_completion(
         body["tool_choice"] = Value::String("auto".into());
     }
     let response = client
-        .post(chat_completions_url(&settings.base_url))
-        .bearer_auth(settings.api_key.trim())
+        .post(chat_completions_url(&provider.base_url))
+        .bearer_auth(provider.api_key.trim())
         .json(&body)
         .send()
         .await
@@ -637,6 +729,37 @@ mod tests {
     fn clipping_never_splits_utf8_text() {
         assert_eq!(clip_text("系统思考", 2), "系统\n…（内容已截断）");
         assert_eq!(clip_text("short", 8), "short");
+    }
+
+    #[test]
+    fn translation_batches_preserve_block_identity() {
+        let blocks = vec![
+            TranslationBlockInput {
+                block_index: 2,
+                text: "abcd".into(),
+            },
+            TranslationBlockInput {
+                block_index: 7,
+                text: "efgh".into(),
+            },
+        ];
+
+        let batches = translation_batches(blocks, 6);
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0][0].block_index, 2);
+        assert_eq!(batches[1][0].block_index, 7);
+    }
+
+    #[test]
+    fn translation_json_accepts_fenced_output_and_keeps_key_order() {
+        let output = parse_translation_object(
+            "```json\n{\"1\":\"第二段\",\"0\":\"第一段\"}\n```",
+            &["0".into(), "1".into()],
+        )
+        .unwrap();
+
+        assert_eq!(output, vec!["第一段", "第二段"]);
     }
 
     #[test]

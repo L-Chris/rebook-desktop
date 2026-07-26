@@ -76,57 +76,99 @@ impl ReadingIrParser {
 
     fn parse_children(&mut self, parent: Node<'_, '_>) -> Result<(), HtmlError> {
         for node in parent.children() {
-            if !node.is_element() {
+            if node.is_element() {
+                self.parse_node(node)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_block_container(&mut self, container: Node<'_, '_>) -> Result<(), HtmlError> {
+        let mut style = self.styles.block_style(container, BlockStyle::default());
+        style.indent = 0.0;
+        let text_style = self
+            .styles
+            .text_style_for_block(container, TextBlockKind::Paragraph);
+        let mut collector = InlineCollector::new(false);
+
+        for child in container.children() {
+            if child.is_element()
+                && is_block_boundary(child.tag_name().name().to_ascii_lowercase().as_str())
+            {
+                self.push_collected_text_block(
+                    TextBlockKind::Paragraph,
+                    style,
+                    std::mem::replace(&mut collector, InlineCollector::new(false)),
+                );
+                self.parse_node(child)?;
                 continue;
             }
-            let name = node.tag_name().name().to_ascii_lowercase();
-            if matches!(name.as_str(), "script" | "style" | "head" | "nav") {
-                continue;
+            if child.is_element() {
+                self.queue_node_anchors(child);
+                self.queue_descendant_anchors(child);
             }
-            self.queue_node_anchors(node);
-            match name.as_str() {
-                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                    let level = name[1..].parse::<u8>().unwrap_or(1);
-                    let mut style = self.styles.block_style(
-                        node,
-                        BlockStyle {
-                            margin_before: 32.0,
-                            margin_after: 8.0,
-                            indent: 0.0,
-                            line_height: 1.3,
-                            ..BlockStyle::default()
-                        },
-                    );
-                    style.indent = 0.0;
-                    self.push_text_block(node, TextBlockKind::Heading(level), style)?;
-                }
-                "p" => {
-                    let mut style = self.styles.block_style(node, BlockStyle::default());
-                    style.indent = 0.0;
-                    self.push_text_block(node, TextBlockKind::Paragraph, style)?;
-                }
-                "blockquote" => {
-                    let mut style = self.styles.block_style(node, BlockStyle::default());
-                    style.indent += 24.0;
-                    self.push_text_block(node, TextBlockKind::Blockquote, style)?;
-                }
-                "pre" => {
-                    let style = self.styles.block_style(
-                        node,
-                        BlockStyle {
-                            line_height: 1.35,
-                            ..BlockStyle::default()
-                        },
-                    );
-                    self.push_text_block(node, TextBlockKind::Preformatted, style)?;
-                }
-                "ul" => self.parse_list(node, false)?,
-                "ol" => self.parse_list(node, true)?,
-                "img" | "image" => self.push_image(node)?,
-                "hr" => self.blocks.push(Block::Separator),
-                "br" => self.blocks.push(Block::PageBreak),
-                _ => self.parse_children(node)?,
+            collect_inline_node(
+                child,
+                text_style,
+                None,
+                &self.section_href,
+                &self.styles,
+                &mut collector,
+            );
+        }
+        self.push_collected_text_block(TextBlockKind::Paragraph, style, collector);
+        Ok(())
+    }
+
+    fn parse_node(&mut self, node: Node<'_, '_>) -> Result<(), HtmlError> {
+        let name = node.tag_name().name().to_ascii_lowercase();
+        if matches!(name.as_str(), "script" | "style" | "head" | "nav") {
+            return Ok(());
+        }
+        self.queue_node_anchors(node);
+        match name.as_str() {
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                let level = name[1..].parse::<u8>().unwrap_or(1);
+                let mut style = self.styles.block_style(
+                    node,
+                    BlockStyle {
+                        margin_before: 32.0,
+                        margin_after: 8.0,
+                        indent: 0.0,
+                        line_height: 1.3,
+                        ..BlockStyle::default()
+                    },
+                );
+                style.indent = 0.0;
+                self.push_text_block(node, TextBlockKind::Heading(level), style)?;
             }
+            "p" => {
+                let mut style = self.styles.block_style(node, BlockStyle::default());
+                style.indent = 0.0;
+                self.push_text_block(node, TextBlockKind::Paragraph, style)?;
+            }
+            "blockquote" => {
+                let mut style = self.styles.block_style(node, BlockStyle::default());
+                style.indent += 24.0;
+                self.push_text_block(node, TextBlockKind::Blockquote, style)?;
+            }
+            "pre" => {
+                let style = self.styles.block_style(
+                    node,
+                    BlockStyle {
+                        line_height: 1.35,
+                        ..BlockStyle::default()
+                    },
+                );
+                self.push_text_block(node, TextBlockKind::Preformatted, style)?;
+            }
+            name if is_generic_block_container(name) => self.parse_block_container(node)?,
+            "ul" => self.parse_list(node, false)?,
+            "ol" => self.parse_list(node, true)?,
+            "img" | "image" => self.push_image(node)?,
+            "hr" => self.blocks.push(Block::Separator),
+            "br" => self.blocks.push(Block::PageBreak),
+            _ => self.parse_children(node)?,
         }
         Ok(())
     }
@@ -194,6 +236,35 @@ impl ReadingIrParser {
             self.push_image(image)?;
         }
         Ok(())
+    }
+
+    fn push_collected_text_block(
+        &mut self,
+        kind: TextBlockKind,
+        style: BlockStyle,
+        mut collector: InlineCollector,
+    ) {
+        collector.finish();
+        let text_len = collector
+            .content
+            .iter()
+            .map(|inline| match inline {
+                Inline::Text(run) => run.text.chars().count() as u64,
+                Inline::Break => 1,
+            })
+            .sum();
+        if text_len == 0 {
+            return;
+        }
+        let node_id = self.allocate_node();
+        let source = self.source_range(&node_id, text_len);
+        self.bind_pending_anchors(&source.start);
+        self.blocks.push(Block::Text(TextBlock {
+            kind,
+            content: collector.content,
+            style,
+            source: Some(source),
+        }));
     }
 
     fn push_image(&mut self, node: Node<'_, '_>) -> Result<(), HtmlError> {
@@ -344,46 +415,99 @@ fn collect_inline(
     collector: &mut InlineCollector,
 ) {
     for child in node.children() {
-        if child.is_text() {
-            collector.push_text(child.text().unwrap_or_default(), inherited, link.cloned());
-            continue;
-        }
-        if !child.is_element() {
-            continue;
-        }
-        let name = child.tag_name().name().to_ascii_lowercase();
-        if name == "br" {
-            collector.push_break();
-            continue;
-        }
-        if matches!(name.as_str(), "img" | "script" | "style") {
-            continue;
-        }
-
-        let mut style = inherited;
-        match name.as_str() {
-            "strong" | "b" => style.bold = true,
-            "em" | "i" | "cite" => style.italic = true,
-            "u" => style.underline = true,
-            "small" => style.size_scale *= 0.85,
-            "big" => style.size_scale *= 1.2,
-            _ => {}
-        }
-        styles.apply_text_node(child, &mut style, inherited.size_scale);
-        if name == "a" {
-            let resolved = attribute_local(child, "href").and_then(|href| base.resolve(href).ok());
-            collect_inline(
-                child,
-                style,
-                resolved.as_ref().or(link),
-                base,
-                styles,
-                collector,
-            );
-        } else {
-            collect_inline(child, style, link, base, styles, collector);
-        }
+        collect_inline_node(child, inherited, link, base, styles, collector);
     }
+}
+
+fn collect_inline_node(
+    node: Node<'_, '_>,
+    inherited: TextStyle,
+    link: Option<&PublicationUrl>,
+    base: &PublicationUrl,
+    styles: &StyleSheet,
+    collector: &mut InlineCollector,
+) {
+    if node.is_text() {
+        collector.push_text(node.text().unwrap_or_default(), inherited, link.cloned());
+        return;
+    }
+    if !node.is_element() {
+        return;
+    }
+    let name = node.tag_name().name().to_ascii_lowercase();
+    if name == "br" {
+        collector.push_break();
+        return;
+    }
+    if matches!(name.as_str(), "img" | "script" | "style") {
+        return;
+    }
+
+    let mut style = inherited;
+    match name.as_str() {
+        "strong" | "b" => style.bold = true,
+        "em" | "i" | "cite" => style.italic = true,
+        "u" => style.underline = true,
+        "small" => style.size_scale *= 0.85,
+        "big" => style.size_scale *= 1.2,
+        _ => {}
+    }
+    styles.apply_text_node(node, &mut style, inherited.size_scale);
+    if name == "a" {
+        let resolved = attribute_local(node, "href").and_then(|href| base.resolve(href).ok());
+        collect_inline(
+            node,
+            style,
+            resolved.as_ref().or(link),
+            base,
+            styles,
+            collector,
+        );
+    } else {
+        collect_inline(node, style, link, base, styles, collector);
+    }
+}
+
+fn is_generic_block_container(name: &str) -> bool {
+    matches!(
+        name,
+        "address"
+            | "article"
+            | "aside"
+            | "center"
+            | "dd"
+            | "div"
+            | "dt"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "header"
+            | "li"
+            | "main"
+            | "section"
+    )
+}
+
+fn is_block_boundary(name: &str) -> bool {
+    is_generic_block_container(name)
+        || matches!(
+            name,
+            "blockquote"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "hr"
+                | "img"
+                | "image"
+                | "nav"
+                | "ol"
+                | "p"
+                | "pre"
+                | "ul"
+        )
 }
 
 #[derive(Default)]
@@ -1006,6 +1130,60 @@ mod tests {
         assert_eq!(anchors.get("chapter-start"), Some(&"n0"));
         assert_eq!(anchors.get("heading"), Some(&"n0"));
         assert_eq!(anchors.get("inside-paragraph"), Some(&"n1"));
+    }
+
+    #[test]
+    fn parses_nested_generic_block_containers_without_flattening_or_duplication() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("contents").unwrap(),
+            href: PublicationUrl::parse("Text/contents.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <div id="title">目录</div>
+            <div id="chapter"><a id="chapter-link">第一章</a>
+                <div id="item"><a id="item-link">◎故事的力量</a></div>
+            </div>
+            <div id="mixed">开头<p id="paragraph">正文</p>结尾</div>
+        </body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let texts = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(
+                    block
+                        .content
+                        .iter()
+                        .filter_map(|inline| match inline {
+                            Inline::Text(run) => Some(run.text.as_str()),
+                            Inline::Break => None,
+                        })
+                        .collect::<String>(),
+                ),
+                Block::Image(_) | Block::Separator | Block::PageBreak => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            ["目录", "第一章", "◎故事的力量", "开头", "正文", "结尾"]
+        );
+
+        let anchors = section
+            .anchors
+            .iter()
+            .map(|anchor| (anchor.fragment.as_str(), anchor.source.node.as_str()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(anchors.get("title"), Some(&"n0"));
+        assert_eq!(anchors.get("chapter"), Some(&"n1"));
+        assert_eq!(anchors.get("chapter-link"), Some(&"n1"));
+        assert_eq!(anchors.get("item"), Some(&"n2"));
+        assert_eq!(anchors.get("item-link"), Some(&"n2"));
+        assert_eq!(anchors.get("mixed"), Some(&"n3"));
+        assert_eq!(anchors.get("paragraph"), Some(&"n4"));
     }
 
     fn assert_close(actual: f32, expected: f32) {

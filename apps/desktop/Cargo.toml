@@ -5,14 +5,19 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 
 [dependencies]
 anyrender.workspace = true
 directories.workspace = true
 image.workspace = true
+keyring.workspace = true
 kurbo.workspace = true
 lucide-icons.workspace = true
 peniko.workspace = true
+quick-xml.workspace = true
 regex.workspace = true
 rebook-formats = { path = "../../crates/formats" }
 rebook-layout = { path = "../../crates/layout" }
@@ -21,10 +26,12 @@ rebook-reader = { path = "../../crates/reader" }
 rebook-renderer = { path = "../../crates/renderer" }
 reqwest.workspace = true
 rfd.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 xilem.workspace = true
 
 [lints]

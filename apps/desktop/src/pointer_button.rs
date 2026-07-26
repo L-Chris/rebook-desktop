@@ -37,6 +37,7 @@ pub(crate) fn button<State, Action, V: WidgetView<State, Action>>(
             _ => MessageResult::Nop,
         },
         disabled: false,
+        accessibility_label: None,
     }
 }
 
@@ -46,6 +47,15 @@ pub(crate) struct PointerButtonView<F, V> {
     child: V,
     callback: F,
     disabled: bool,
+    accessibility_label: Option<String>,
+}
+
+impl<F, V> PointerButtonView<F, V> {
+    /// Gives icon-only buttons a readable platform accessibility name.
+    pub(crate) fn accessibility_label(mut self, label: impl Into<String>) -> Self {
+        self.accessibility_label = Some(label.into());
+        self
+    }
 }
 
 const BUTTON_CONTENT_VIEW_ID: ViewId = ViewId::new(0);
@@ -65,7 +75,10 @@ where
             View::<State, Action, _>::build(&self.child, ctx, app_state)
         });
         let element = ctx.with_action_widget(|ctx| {
-            let mut pod = ctx.create_pod(PointerButtonWidget::new(child.new_widget));
+            let mut pod = ctx.create_pod(PointerButtonWidget::new(
+                child.new_widget,
+                self.accessibility_label.clone(),
+            ));
             pod.new_widget.options.disabled = self.disabled;
             pod
         });
@@ -82,6 +95,13 @@ where
     ) {
         if prev.disabled != self.disabled {
             element.ctx.set_disabled(self.disabled);
+        }
+        if prev.accessibility_label != self.accessibility_label {
+            element
+                .widget
+                .accessibility_label
+                .clone_from(&self.accessibility_label);
+            element.ctx.request_accessibility_update();
         }
         ctx.with_id(BUTTON_CONTENT_VIEW_ID, |ctx| {
             View::<State, Action, _>::rebuild(
@@ -144,12 +164,14 @@ where
 
 pub(crate) struct PointerButtonWidget {
     child: WidgetPod<dyn Widget>,
+    accessibility_label: Option<String>,
 }
 
 impl PointerButtonWidget {
-    fn new(child: NewWidget<impl Widget + ?Sized>) -> Self {
+    fn new(child: NewWidget<impl Widget + ?Sized>, accessibility_label: Option<String>) -> Self {
         Self {
             child: child.erased().to_pod(),
+            accessibility_label,
         }
     }
 
@@ -324,6 +346,9 @@ impl Widget for PointerButtonWidget {
         node: &mut Node,
     ) {
         node.add_action(xilem::masonry::accesskit::Action::Click);
+        if let Some(label) = &self.accessibility_label {
+            node.set_label(label.clone());
+        }
     }
 
     fn children_ids(&self) -> ChildrenIds {

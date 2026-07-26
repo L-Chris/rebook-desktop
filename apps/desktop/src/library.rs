@@ -4,9 +4,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
-use rebook_formats::{BookFormat, open_bytes};
+use rebook_formats::open_bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::sync::RemoteBookDownload;
 
 const LIBRARY_VERSION: u32 = 1;
 const MANIFEST_FILE: &str = "library.json";
@@ -21,7 +23,6 @@ pub struct LibraryBook {
     pub title: String,
     pub authors: Vec<String>,
     pub file_name: String,
-    pub format: BookFormat,
     pub path: PathBuf,
     pub cover_bytes: Option<Vec<u8>>,
     pub added_at: u64,
@@ -97,16 +98,6 @@ impl LocalLibrary {
                     id: book.id,
                     title: book.title,
                     authors: book.authors,
-                    format: BookFormat::from_file_name(&book.file_name)
-                        .or_else(|| {
-                            BookFormat::from_file_name(
-                                root.join(BOOKS_DIRECTORY)
-                                    .join(&book.storage_name)
-                                    .to_string_lossy()
-                                    .as_ref(),
-                            )
-                        })
-                        .unwrap_or(BookFormat::Epub),
                     file_name: book.file_name,
                     path: root.join(BOOKS_DIRECTORY).join(book.storage_name),
                     cover_bytes,
@@ -132,6 +123,65 @@ impl LocalLibrary {
             }
         }
         Ok(summary)
+    }
+
+    pub fn import_remote(&mut self, remote: RemoteBookDownload) -> LibraryResult<bool> {
+        if self
+            .books
+            .iter()
+            .any(|book| book.id == remote.manifest.book_id)
+        {
+            return Ok(false);
+        }
+        let digest = format!("{:x}", Sha256::digest(&remote.content));
+        if digest != remote.manifest.book_id || digest != remote.manifest.content_sha256 {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "远端书籍内容哈希与清单不一致").into(),
+            );
+        }
+        let publication = open_bytes(remote.content.clone(), &remote.manifest.file_name)?;
+        let metadata = &publication.book().metadata;
+        let title = if remote.manifest.title.trim().is_empty() {
+            metadata.title.trim().to_owned()
+        } else {
+            remote.manifest.title.trim().to_owned()
+        };
+        let authors = if remote.manifest.authors.is_empty() {
+            metadata.authors.clone()
+        } else {
+            remote.manifest.authors.clone()
+        };
+        let storage_name = format!(
+            "{}.{}",
+            remote.manifest.book_id,
+            publication.format().storage_extension()
+        );
+        let cover_bytes = remote
+            .cover
+            .or_else(|| publication.cover_bytes().map(<[u8]>::to_vec));
+        let cover_name = cover_bytes
+            .as_ref()
+            .map(|_| format!("{}.cover", remote.manifest.book_id));
+        fs::write(
+            self.root.join(BOOKS_DIRECTORY).join(&storage_name),
+            remote.content,
+        )?;
+        if let (Some(name), Some(cover)) = (&cover_name, &cover_bytes) {
+            fs::write(self.root.join(COVERS_DIRECTORY).join(name), cover)?;
+        }
+        self.books.push(LibraryBook {
+            id: remote.manifest.book_id,
+            title,
+            authors,
+            file_name: remote.manifest.file_name,
+            path: self.root.join(BOOKS_DIRECTORY).join(storage_name),
+            cover_bytes,
+            added_at: remote.manifest.added_at,
+        });
+        self.books
+            .sort_by_key(|book| std::cmp::Reverse(book.added_at));
+        self.persist()?;
+        Ok(true)
     }
 
     fn import_file(&mut self, source_path: &Path) -> LibraryResult<bool> {
@@ -172,7 +222,6 @@ impl LocalLibrary {
                 title,
                 authors: metadata.authors.clone(),
                 file_name,
-                format,
                 path: self.root.join(BOOKS_DIRECTORY).join(storage_name),
                 cover_bytes,
                 added_at: unix_timestamp_millis(),
@@ -287,7 +336,6 @@ mod tests {
             title: "第一本书".into(),
             authors: vec!["作者".into()],
             file_name: "source.epub".into(),
-            format: BookFormat::Epub,
             path: managed_path,
             cover_bytes: None,
             added_at: 42,
@@ -314,7 +362,6 @@ mod tests {
             title: "Managed".into(),
             authors: Vec::new(),
             file_name: "original.epub".into(),
-            format: BookFormat::Epub,
             path: managed_path.clone(),
             cover_bytes: None,
             added_at: 1,

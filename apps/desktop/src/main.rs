@@ -1,5 +1,8 @@
 //! Native e-book reader: parser -> reading IR -> page layout -> display list -> Xilem/Vello.
 
+mod design;
+mod dialog;
+mod feedback;
 mod fonts;
 mod highlights;
 mod library;
@@ -7,6 +10,8 @@ mod plugins;
 mod pointer_button;
 mod preferences;
 mod reader_canvas;
+mod shelf_width_probe;
+mod sync;
 mod vello_bridge;
 
 use std::borrow::Cow;
@@ -18,13 +23,21 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use highlights::{HighlightColor, HighlightStore, StoredHighlight};
+use design::{
+    CONTENT_GAP, CONTENT_PADDING_HORIZONTAL, CONTENT_PADDING_VERTICAL, CONTROL_HEIGHT,
+    CONTROL_HEIGHT_COMPACT, DIALOG_FOOTER_HEIGHT, DIALOG_HEADER_HEIGHT, RADIUS_DIALOG,
+    RADIUS_LARGE, RADIUS_MEDIUM, RADIUS_SMALL, SETTINGS_ROW_HEIGHT,
+};
+use dialog::confirmation_dialog;
+use feedback::{NoticeTone, dismissible_notice, notice_card};
+use highlights::{HighlightStore, StoredHighlight};
 use library::{LibraryBook, LocalLibrary};
 use lucide_icons::{Icon, LUCIDE_FONT_BYTES};
 use plugins::{
-    BUILTIN_PLUGINS, BookSearchResult, ChatCommand, ChatCommandResolution, ChatResponse, ChatRole,
-    ChatTurn, PluginSettings, RewriteBookSource, chat_command_suggestions, chat_with_book,
-    resolve_chat_command, search_book, translate_text,
+    AiProvider, BUILTIN_PLUGINS, BlockTranslation, BookSearchResult, ChatCommand,
+    ChatCommandResolution, ChatResponse, ChatRole, ChatTurn, PluginSettings, RewriteBookSource,
+    TranslationBlockInput, TranslationBookSource, TranslationMode, chat_command_suggestions,
+    chat_with_book, resolve_chat_command, search_book, translate_blocks,
 };
 use pointer_button::button;
 use reader_canvas::{ReaderCanvasAction, reader_canvas};
@@ -35,6 +48,8 @@ use rebook_reader::{
     NavigationOutcome, PageDirection, ReaderSelection, ReaderSession, ReaderSnapshot,
     ReaderTextHit, TocViewItem,
 };
+use shelf_width_probe::shelf_width_probe;
+use sync::{LocalSyncBook, SyncReport, SyncSettings, SyncStore, run_sync};
 use vello_bridge::XilemVelloScene;
 use xilem::core::{fork, map_state};
 use xilem::masonry::kurbo::Size;
@@ -58,22 +73,28 @@ const TOOLBAR_HEIGHT: f64 = 44.0;
 const PROGRESS_HEIGHT: f64 = 4.0;
 const TOC_WIDTH: f64 = 240.0;
 const ASSISTANT_PANEL_WIDTH: f64 = 340.0;
-const SETTINGS_WIDTH: f64 = 640.0;
-const SETTINGS_HEIGHT: f64 = 460.0;
+const SETTINGS_WIDTH: f64 = 660.0;
+const SETTINGS_HEIGHT: f64 = 500.0;
 const SHELF_CARD_WIDTH: f64 = 144.0;
 const SHELF_COVER_HEIGHT: f64 = 216.0;
-const SHELF_COLUMNS: usize = 4;
+const SHELF_CARD_GAP: f64 = 24.0;
+const SHELF_ROW_GAP: f64 = 28.0;
 const SHELF_TITLE_MAX_DISPLAY_UNITS: usize = 18;
+const SIDEBAR_TITLE_LINE_DISPLAY_UNITS: usize = 20;
+const SIDEBAR_TITLE_MAX_LINES: usize = 2;
+const SIDEBAR_AUTHOR_MAX_DISPLAY_UNITS: usize = 22;
 const PAGE_SCENE_CACHE_CAPACITY: usize = 32;
+const PDF_PAGE_SCENE_CACHE_CAPACITY: usize = 4;
 const MOTION_DURATION: Duration = Duration::from_millis(180);
 const TOOLBAR_MOTION_DURATION: Duration = Duration::from_millis(200);
 const SETTINGS_MOTION_DURATION: Duration = Duration::from_millis(200);
 const TOOLBAR_HIDE_DELAY: Duration = Duration::from_millis(500);
+const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 const MOTION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const SIDEBAR_SCRIM_ALPHA: f32 = 0.28;
 const MODAL_SCRIM_ALPHA: f32 = 0.35;
 const MOTION_EPSILON: f32 = 0.001;
-const SELECTION_TOOLBAR_WIDTH: f64 = 276.0;
+const SELECTION_TOOLBAR_WIDTH: f64 = 90.0;
 const SELECTION_TOOLBAR_HEIGHT: f64 = 46.0;
 const SELECTION_TOOLBAR_GAP: f64 = 10.0;
 
@@ -89,6 +110,11 @@ const UI_BORDER: Color = Color::from_rgb8(0xdd, 0xe5, 0xee);
 const UI_ACCENT: Color = Color::from_rgb8(0x0f, 0x76, 0x6e);
 const UI_ACCENT_SOFT: Color = Color::from_rgb8(0xe2, 0xf3, 0xf1);
 const UI_ACCENT_BORDER: Color = Color::from_rgb8(0xba, 0xe6, 0xe1);
+const ANNOTATION_MARK_COLOR: Color = Color::from_rgba8(96, 165, 250, 72);
+const ANNOTATION_SWATCH_COLOR: Color = Color::from_rgb8(96, 165, 250);
+const SEARCH_MARK_COLOR: Color = Color::from_rgba8(250, 204, 21, 89);
+const ASSISTANT_MARK_COLOR: Color = Color::from_rgba8(245, 158, 11, 56);
+const TEXT_SELECTION_COLOR: Color = Color::from_rgba8(96, 165, 250, 89);
 const UI_FONT_STACK: &str = "'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', 'Segoe UI Symbol', sans-serif";
 
 fn main() -> ExitCode {
@@ -129,7 +155,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn open_reader(
     path: &Path,
     reader_fonts: Arc<[Blob<u8>]>,
-) -> Result<DesktopReader, Box<dyn std::error::Error>> {
+    shelf_metadata: Option<BookDisplayMetadata>,
+) -> Result<DesktopReader, Box<dyn std::error::Error + Send + Sync>> {
     let started = Instant::now();
     let publication = open_publication_file(path)?;
     let format = publication.format();
@@ -138,14 +165,23 @@ fn open_reader(
         .and_then(|bytes| decode_cover(bytes).ok());
     let canonical_source = publication.source();
     let book_id = canonical_source.book().id.to_string();
+    let display_metadata = resolve_book_display_metadata(
+        shelf_metadata,
+        &canonical_source.book().metadata.title,
+        &canonical_source.book().metadata.authors,
+    );
     let rewrite_source = Arc::new(RewriteBookSource::new(canonical_source));
-    let source: Arc<dyn BookSource> = rewrite_source.clone();
-    let highlight_store = HighlightStore::load_default()?;
-    let highlights = highlight_store.for_book(&book_id);
     let plugin_settings = PluginSettings::load_default().unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to load plugin settings; using defaults");
         PluginSettings::default()
     });
+    let translation_source = Arc::new(TranslationBookSource::new(
+        rewrite_source.clone(),
+        plugin_settings.translation_mode,
+    ));
+    let source: Arc<dyn BookSource> = translation_source.clone();
+    let highlight_store = HighlightStore::load_default()?;
+    let highlights = highlight_store.for_book(&book_id);
     let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
     let typography = preferences::load_reader_typography().unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to load reader typography; using defaults");
@@ -157,6 +193,19 @@ fn open_reader(
     };
     let mut reader =
         ReaderSession::open_with_fonts(Arc::clone(&source), viewport, style, reader_fonts)?;
+    let progress_store = SyncSettings::load_default()
+        .and_then(|settings| SyncStore::open_default(settings.device_id))
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to open reading progress store");
+            error
+        })
+        .ok();
+    if let Some(store) = &progress_store
+        && let Some(progress) = store.load_progress(&book_id)?
+        && let Err(error) = reader.restore_locator(&progress.locator)
+    {
+        tracing::warn!(%error, "failed to restore durable reading locator");
+    }
     let available_font_families = reader.available_font_families().into();
     tracing::debug!(
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
@@ -167,11 +216,14 @@ fn open_reader(
         DesktopReaderResources {
             source,
             rewrite_source,
+            translation_source,
             cover,
             format,
             book_id,
+            display_metadata,
             highlight_store,
             highlights,
+            progress_store,
             plugin_settings,
             available_font_families,
         },
@@ -181,6 +233,32 @@ fn open_reader(
 enum LaunchMode {
     Shelf,
     Open(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BookDisplayMetadata {
+    title: String,
+    authors: Vec<String>,
+}
+
+impl From<&LibraryBook> for BookDisplayMetadata {
+    fn from(book: &LibraryBook) -> Self {
+        Self {
+            title: book.title.clone(),
+            authors: book.authors.clone(),
+        }
+    }
+}
+
+fn resolve_book_display_metadata(
+    shelf_metadata: Option<BookDisplayMetadata>,
+    parsed_title: &str,
+    parsed_authors: &[String],
+) -> BookDisplayMetadata {
+    shelf_metadata.unwrap_or_else(|| BookDisplayMetadata {
+        title: parsed_title.to_owned(),
+        authors: parsed_authors.to_vec(),
+    })
 }
 
 fn parse_arguments() -> Result<LaunchMode, Box<dyn std::error::Error>> {
@@ -203,27 +281,94 @@ struct DesktopApp {
     shelf: ShelfState,
     reader: Option<DesktopReader>,
     reader_fonts: Arc<[Blob<u8>]>,
+    sync: SyncUiState,
 }
 
 struct ShelfState {
     library: LocalLibrary,
     covers: HashMap<String, ImageData>,
+    grid_width: f64,
     query: String,
     notice: Option<String>,
     error: Option<String>,
+    remove_confirmation: Option<ShelfRemoveConfirmation>,
+}
+
+struct SyncUiState {
+    settings: SyncSettings,
+    password: String,
+    draft_settings: SyncSettings,
+    draft_password: String,
+    dialog_open: bool,
+    pending: Option<SyncTaskRequest>,
+    status: String,
+    next_request_id: u64,
+}
+
+#[derive(Clone)]
+struct SyncTaskRequest {
+    id: u64,
+    settings: SyncSettings,
+    password: String,
+    books: Vec<LocalSyncBook>,
+}
+
+#[derive(Debug)]
+struct SyncTaskMessage {
+    id: u64,
+    result: Result<SyncReport, String>,
+}
+
+#[derive(Clone, Debug)]
+struct ShelfRemoveConfirmation {
+    id: String,
+    title: String,
 }
 
 impl DesktopApp {
     fn new(library: LocalLibrary, reader_fonts: Arc<[Blob<u8>]>) -> Self {
+        let (settings, settings_error) = match SyncSettings::load_default() {
+            Ok(settings) => (settings, None),
+            Err(error) => (
+                SyncSettings::new_device(),
+                Some(format!("加载 WebDAV 同步设置失败：{error}")),
+            ),
+        };
+        let (password, password_error) = match settings.load_password() {
+            Ok(password) => (password, None),
+            Err(error) => (
+                String::new(),
+                Some(format!("读取 Windows 凭据失败：{error}")),
+            ),
+        };
+        let mut shelf = ShelfState::new(library);
+        shelf.error = settings_error.or(password_error);
         Self {
-            shelf: ShelfState::new(library),
+            shelf,
             reader: None,
             reader_fonts,
+            sync: SyncUiState {
+                draft_settings: settings.clone(),
+                draft_password: password.clone(),
+                settings,
+                password,
+                dialog_open: false,
+                pending: None,
+                status: String::new(),
+                next_request_id: 1,
+            },
         }
     }
 
     fn open_book(&mut self, path: &Path) {
-        match open_reader(path, Arc::clone(&self.reader_fonts)) {
+        let shelf_metadata = self
+            .shelf
+            .library
+            .books()
+            .iter()
+            .find(|book| book.path.as_path() == path)
+            .map(BookDisplayMetadata::from);
+        match open_reader(path, Arc::clone(&self.reader_fonts), shelf_metadata) {
             Ok(reader) => {
                 self.reader = Some(reader);
                 self.shelf.error = None;
@@ -255,12 +400,144 @@ impl DesktopApp {
     fn remove_book(&mut self, id: &str) {
         match self.shelf.library.remove(id) {
             Ok(true) => {
+                if let Ok(store) = SyncStore::open_default(self.sync.settings.device_id.clone())
+                    && let Err(error) = store.set_book_present(id, false)
+                {
+                    tracing::warn!(%error, "failed to persist local book removal tombstone");
+                }
                 self.shelf.covers.remove(id);
                 self.shelf.notice = Some("已从本地书架移除".into());
                 self.shelf.error = None;
             }
             Ok(false) => self.shelf.error = Some("书籍已不在本地书架中".into()),
             Err(error) => self.shelf.error = Some(format!("移除失败：{error}")),
+        }
+    }
+
+    fn request_remove_book(&mut self, id: String, title: String) {
+        self.shelf.remove_confirmation = Some(ShelfRemoveConfirmation { id, title });
+    }
+
+    fn cancel_remove_book(&mut self) {
+        self.shelf.remove_confirmation = None;
+    }
+
+    fn confirm_remove_book(&mut self) {
+        let Some(confirmation) = self.shelf.remove_confirmation.take() else {
+            return;
+        };
+        self.remove_book(&confirmation.id);
+    }
+
+    fn open_sync_settings(&mut self) {
+        self.sync.draft_settings.clone_from(&self.sync.settings);
+        self.sync.draft_password.clear();
+        self.sync.dialog_open = true;
+    }
+
+    fn close_sync_settings(&mut self) {
+        self.sync.dialog_open = false;
+    }
+
+    fn apply_sync_settings(&mut self) {
+        let mut settings = self.sync.draft_settings.clone();
+        settings.normalize();
+        if settings.enabled
+            && let Err(error) = settings.validate()
+        {
+            self.shelf.error = Some(format!("同步设置无效：{error}"));
+            return;
+        }
+        if let Err(error) = settings.save_default() {
+            self.shelf.error = Some(format!("保存同步设置失败：{error}"));
+            return;
+        }
+        if !self.sync.draft_password.is_empty() {
+            if let Err(error) = settings.save_password(&self.sync.draft_password) {
+                self.shelf.error = Some(format!("保存 Windows 凭据失败：{error}"));
+                return;
+            }
+            self.sync.password.clone_from(&self.sync.draft_password);
+        }
+        self.sync.settings = settings;
+        self.sync.dialog_open = false;
+        self.shelf.error = None;
+        self.start_sync();
+    }
+
+    fn start_sync(&mut self) {
+        if self.sync.pending.is_some() || !self.sync.settings.enabled {
+            return;
+        }
+        if let Err(error) = self.sync.settings.validate() {
+            self.shelf.error = Some(format!("无法开始同步：{error}"));
+            return;
+        }
+        if self.sync.password.is_empty() {
+            self.shelf.error = Some("无法开始同步：请先填写 WebDAV 密码".into());
+            return;
+        }
+        let id = self.sync.next_request_id;
+        self.sync.next_request_id = self.sync.next_request_id.wrapping_add(1);
+        self.sync.status = "正在同步书籍与阅读数据…".into();
+        self.sync.pending = Some(SyncTaskRequest {
+            id,
+            settings: self.sync.settings.clone(),
+            password: self.sync.password.clone(),
+            books: self
+                .shelf
+                .library
+                .books()
+                .iter()
+                .map(|book| LocalSyncBook {
+                    id: book.id.clone(),
+                    title: book.title.clone(),
+                    authors: book.authors.clone(),
+                    file_name: book.file_name.clone(),
+                    path: book.path.clone(),
+                    cover_bytes: book.cover_bytes.clone(),
+                    added_at: book.added_at,
+                })
+                .collect(),
+        });
+        self.shelf.error = None;
+    }
+
+    fn complete_sync(&mut self, message: SyncTaskMessage) {
+        if self.sync.pending.as_ref().map(|request| request.id) != Some(message.id) {
+            return;
+        }
+        self.sync.pending = None;
+        match message.result {
+            Ok(mut report) => {
+                let mut imported = 0;
+                for download in report.downloads.drain(..) {
+                    match self.shelf.library.import_remote(download) {
+                        Ok(true) => imported += 1,
+                        Ok(false) => {}
+                        Err(error) => {
+                            self.shelf.error = Some(format!("导入同步书籍失败：{error}"));
+                            return;
+                        }
+                    }
+                }
+                if imported > 0 {
+                    self.shelf.refresh_covers();
+                }
+                self.sync.status = format!(
+                    "同步完成：上传 {} 本，下载 {} 本，更新 {} 条进度，合并 {} 条批注",
+                    report.uploaded_books,
+                    imported,
+                    report.updated_progress,
+                    report.merged_annotations
+                );
+                self.shelf.notice = Some(self.sync.status.clone());
+                self.shelf.error = None;
+            }
+            Err(error) => {
+                self.sync.status.clear();
+                self.shelf.error = Some(format!("WebDAV 同步失败：{error}"));
+            }
         }
     }
 }
@@ -270,9 +547,11 @@ impl ShelfState {
         let mut state = Self {
             library,
             covers: HashMap::new(),
+            grid_width: f64::from(INITIAL_WIDTH) - 56.0,
             query: String::new(),
             notice: None,
             error: None,
+            remove_confirmation: None,
         };
         state.refresh_covers();
         state
@@ -297,16 +576,20 @@ struct DesktopReader {
     reader: ReaderSession,
     source: Arc<dyn BookSource>,
     rewrite_source: Arc<RewriteBookSource>,
+    translation_source: Arc<TranslationBookSource>,
     snapshot: ReaderSnapshot,
     cover: Option<ImageData>,
     format: BookFormat,
     book_id: String,
+    display_metadata: BookDisplayMetadata,
     highlight_store: HighlightStore,
     highlights: Vec<StoredHighlight>,
+    progress_store: Option<SyncStore>,
     selection_anchor: Option<ReaderTextHit>,
     selection: Option<ReaderSelection>,
+    selection_toolbar_visible: bool,
     selected_highlight_id: Option<String>,
-    focused_range: Option<SourceRange>,
+    focused_mark: Option<FocusedMark>,
     plugin_settings: PluginSettings,
     available_font_families: Arc<[String]>,
     search: SearchUiState,
@@ -324,11 +607,14 @@ struct DesktopReader {
 struct DesktopReaderResources {
     source: Arc<dyn BookSource>,
     rewrite_source: Arc<RewriteBookSource>,
+    translation_source: Arc<TranslationBookSource>,
     cover: Option<ImageData>,
     format: BookFormat,
     book_id: String,
+    display_metadata: BookDisplayMetadata,
     highlight_store: HighlightStore,
     highlights: Vec<StoredHighlight>,
+    progress_store: Option<SyncStore>,
     plugin_settings: PluginSettings,
     available_font_families: Arc<[String]>,
 }
@@ -344,6 +630,47 @@ struct SearchTaskRequest {
 struct SearchTaskMessage {
     id: u64,
     result: Result<Vec<BookSearchResult>, String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusedMarkKind {
+    Search,
+    Assistant,
+}
+
+#[derive(Clone, Debug)]
+struct FocusedMark {
+    ranges: Vec<SourceRange>,
+    kind: FocusedMarkKind,
+}
+
+impl FocusedMark {
+    fn search(range: SourceRange) -> Self {
+        Self {
+            ranges: vec![range],
+            kind: FocusedMarkKind::Search,
+        }
+    }
+
+    fn assistant(ranges: Vec<SourceRange>) -> Self {
+        Self {
+            ranges,
+            kind: FocusedMarkKind::Assistant,
+        }
+    }
+
+    fn color(&self) -> Color {
+        match self.kind {
+            FocusedMarkKind::Search => SEARCH_MARK_COLOR,
+            FocusedMarkKind::Assistant => ASSISTANT_MARK_COLOR,
+        }
+    }
+
+    fn search_range(&self) -> Option<&SourceRange> {
+        (self.kind == FocusedMarkKind::Search)
+            .then(|| self.ranges.first())
+            .flatten()
+    }
 }
 
 #[derive(Default)]
@@ -383,24 +710,45 @@ struct ChatUiState {
 #[derive(Clone)]
 struct TranslationTaskRequest {
     id: u64,
+    section_index: usize,
     settings: PluginSettings,
-    text: String,
+    blocks: Vec<TranslationBlockInput>,
 }
 
 #[derive(Debug)]
 struct TranslationTaskMessage {
     id: u64,
-    result: Result<String, String>,
+    section_index: usize,
+    result: Result<Vec<BlockTranslation>, String>,
 }
 
 #[derive(Default)]
 struct TranslationUiState {
-    source_text: String,
-    translated_text: String,
-    source_range: Option<SourceRange>,
+    enabled: bool,
     error: Option<String>,
+    dismiss_at: Option<Instant>,
     pending: Option<TranslationTaskRequest>,
     next_request_id: u64,
+}
+
+impl TranslationUiState {
+    fn show_error(&mut self, error: String, now: Instant) {
+        self.error = Some(error);
+        self.dismiss_at = Some(now + NOTICE_AUTO_DISMISS_DELAY);
+    }
+
+    fn clear_error(&mut self) {
+        self.error = None;
+        self.dismiss_at = None;
+    }
+
+    fn dismiss_if_due(&mut self, now: Instant) -> bool {
+        if self.dismiss_at.is_none_or(|deadline| now < deadline) {
+            return false;
+        }
+        self.clear_error();
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -422,6 +770,9 @@ enum SettingsTab {
     #[default]
     Reading,
     Font,
+    Ai,
+    AiChat,
+    Translation,
     Plugins,
 }
 
@@ -455,7 +806,6 @@ enum SidebarTab {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AssistantPanel {
     Chat,
-    Translation,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -599,11 +949,14 @@ impl DesktopReader {
         let DesktopReaderResources {
             source,
             rewrite_source,
+            translation_source,
             cover,
             format,
             book_id,
+            display_metadata,
             highlight_store,
             highlights,
+            progress_store,
             plugin_settings,
             available_font_families,
         } = resources;
@@ -618,16 +971,20 @@ impl DesktopReader {
             reader,
             source,
             rewrite_source,
+            translation_source,
             snapshot,
             cover,
             format,
             book_id,
+            display_metadata,
             highlight_store,
             highlights,
+            progress_store,
             selection_anchor: None,
             selection: None,
+            selection_toolbar_visible: false,
             selected_highlight_id: None,
-            focused_range: None,
+            focused_mark: None,
             search: SearchUiState::default(),
             chat: ChatUiState::default(),
             translation: TranslationUiState::default(),
@@ -667,10 +1024,12 @@ impl DesktopReader {
     }
 
     fn request_exit(&mut self) {
+        self.persist_progress();
         self.exit_requested = true;
     }
 
     fn begin_text_selection(&mut self, x: f32, y: f32) {
+        self.selection_toolbar_visible = false;
         match self.reader.hit_test_current_spread(x, y, true) {
             Ok(anchor) => {
                 self.selection_anchor = anchor;
@@ -710,9 +1069,11 @@ impl DesktopReader {
             if self.selection.is_none() {
                 self.selection_anchor = None;
             }
+            self.selection_toolbar_visible = self.selection.is_some();
             return;
         }
 
+        self.selection_toolbar_visible = false;
         self.selection_anchor = None;
         self.selection = None;
         self.invalidate_page_scenes();
@@ -738,22 +1099,19 @@ impl DesktopReader {
     }
 
     fn cancel_text_selection(&mut self) {
+        self.selection_toolbar_visible = false;
         self.selection_anchor = None;
         if self.selection.take().is_some() {
             self.invalidate_page_scenes();
         }
     }
 
-    fn create_highlight(&mut self, color: HighlightColor) {
+    fn create_highlight(&mut self) {
         let Some(selection) = self.selection.clone() else {
             return;
         };
-        let highlight = StoredHighlight::new(
-            self.book_id.clone(),
-            selection.ranges,
-            selection.text,
-            color,
-        );
+        let highlight =
+            StoredHighlight::new(self.book_id.clone(), selection.ranges, selection.text);
         match self.highlight_store.insert(highlight.clone()) {
             Ok(()) => {
                 self.highlights.insert(0, highlight);
@@ -800,6 +1158,7 @@ impl DesktopReader {
                 self.selection = None;
                 self.invalidate_page_scenes();
                 self.prefetch();
+                self.queue_current_section_translation();
                 self.error = None;
             }
             Err(error) => self.error = Some(format!("高亮跳转失败：{error}")),
@@ -828,7 +1187,7 @@ impl DesktopReader {
         self.search.next_request_id = self.search.next_request_id.wrapping_add(1);
         self.search.status = "正在搜索…".into();
         self.search.results.clear();
-        self.focused_range = None;
+        self.focused_mark = None;
         self.search.pending = Some(SearchTaskRequest {
             id,
             source: Arc::clone(&self.source),
@@ -862,12 +1221,13 @@ impl DesktopReader {
         match self.reader.go_to_source(&result.range.start) {
             Ok(navigation) => {
                 self.install_snapshot(navigation.snapshot);
-                self.focused_range = Some(result.range.clone());
+                self.focused_mark = Some(FocusedMark::search(result.range.clone()));
                 self.selection_anchor = None;
                 self.selection = None;
                 self.selected_highlight_id = None;
                 self.invalidate_page_scenes();
                 self.prefetch();
+                self.queue_current_section_translation();
                 self.error = None;
             }
             Err(error) => self.search.status = format!("搜索结果跳转失败：{error}"),
@@ -936,13 +1296,14 @@ impl DesktopReader {
             "请结合当前段落和章节语境解释选中的内容。说明它的直接含义、在本段中的作用，以及理解它所需的背景；不要脱离原文进行无依据推测。\n\n选中文字：\n{}",
             selection.text.trim()
         );
+        self.focused_mark = Some(FocusedMark::assistant(selection.ranges.clone()));
         self.cancel_text_selection();
         self.ui.assistant_panel = Some(AssistantPanel::Chat);
         self.queue_chat(question, None);
     }
 
     fn queue_chat(&mut self, question: String, display_content: Option<String>) {
-        if let Err(error) = self.plugin_settings.validate_ai() {
+        if let Err(error) = self.plugin_settings.chat_endpoint() {
             self.chat.error = Some(error);
             self.ui.assistant_panel = Some(AssistantPanel::Chat);
             return;
@@ -987,7 +1348,7 @@ impl DesktopReader {
                             self.selection_anchor = None;
                             self.selection = None;
                             self.selected_highlight_id = None;
-                            self.focused_range = None;
+                            self.focused_mark = None;
                             self.invalidate_page_scenes();
                             self.prefetch();
                         }
@@ -1021,66 +1382,77 @@ impl DesktopReader {
         }
     }
 
-    fn translate_selection(&mut self) {
-        let Some(selection) = self.selection.clone() else {
-            return;
-        };
-        if let Err(error) = self.plugin_settings.validate_ai() {
-            self.translation.error = Some(error);
-            self.ui.assistant_panel = Some(AssistantPanel::Translation);
-            return;
-        }
-        if self.translation.pending.is_some() {
-            return;
-        }
-        let text = selection.text.trim().to_owned();
-        let id = self.translation.next_request_id;
-        self.translation.next_request_id = self.translation.next_request_id.wrapping_add(1);
-        self.translation.source_text.clone_from(&text);
-        self.translation.translated_text.clear();
-        self.translation.source_range = selection.ranges.first().cloned();
-        self.translation.error = None;
-        self.translation.pending = Some(TranslationTaskRequest {
-            id,
-            settings: self.plugin_settings.clone(),
-            text,
-        });
+    fn toggle_translation(&mut self) {
         self.cancel_text_selection();
-        self.ui.assistant_panel = Some(AssistantPanel::Translation);
-    }
-
-    fn retry_translation(&mut self) {
-        if self.translation.pending.is_some() || self.translation.source_text.trim().is_empty() {
+        self.translation.clear_error();
+        if self.translation.enabled {
+            self.translation.enabled = false;
+            self.translation.pending = None;
+            if let Err(error) = self.translation_source.set_enabled(false) {
+                self.translation.show_error(error, Instant::now());
+                return;
+            }
+            self.refresh_translation_view();
             return;
         }
-        if let Err(error) = self.plugin_settings.validate_ai() {
-            self.translation.error = Some(error);
+
+        if let Err(error) = self.plugin_settings.translation_endpoint() {
+            self.translation.show_error(error.clone(), Instant::now());
+            self.error = Some(error);
+            return;
+        }
+        if let Err(error) = self
+            .translation_source
+            .set_mode(self.plugin_settings.translation_mode)
+            .and_then(|()| self.translation_source.set_enabled(true))
+        {
+            self.translation.show_error(error, Instant::now());
+            return;
+        }
+        self.translation.enabled = true;
+        if self
+            .translation_source
+            .has_section(self.snapshot.location.section_index)
+        {
+            self.refresh_translation_view();
+        }
+        self.queue_current_section_translation();
+    }
+
+    fn dismiss_translation_notice(&mut self) {
+        self.translation.clear_error();
+    }
+
+    fn queue_current_section_translation(&mut self) {
+        if !self.translation.enabled || self.translation.pending.is_some() {
+            return;
+        }
+        let section_index = self.snapshot.location.section_index;
+        if self.translation_source.has_section(section_index) {
+            return;
+        }
+        let blocks = match self.translation_source.translatable_blocks(section_index) {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                self.translation.show_error(error, Instant::now());
+                return;
+            }
+        };
+        if blocks.is_empty() {
+            if let Err(error) = self.translation_source.store_section(section_index, &[]) {
+                self.translation.show_error(error, Instant::now());
+            }
             return;
         }
         let id = self.translation.next_request_id;
         self.translation.next_request_id = self.translation.next_request_id.wrapping_add(1);
-        self.translation.error = None;
+        self.translation.clear_error();
         self.translation.pending = Some(TranslationTaskRequest {
             id,
+            section_index,
             settings: self.plugin_settings.clone(),
-            text: self.translation.source_text.clone(),
+            blocks,
         });
-    }
-
-    fn go_to_translation_source(&mut self) {
-        let Some(range) = self.translation.source_range.clone() else {
-            return;
-        };
-        match self.reader.go_to_source(&range.start) {
-            Ok(navigation) => {
-                self.install_snapshot(navigation.snapshot);
-                self.focused_range = Some(range);
-                self.invalidate_page_scenes();
-                self.prefetch();
-                self.error = None;
-            }
-            Err(error) => self.translation.error = Some(format!("原文定位失败：{error}")),
-        }
     }
 
     fn complete_translation(&mut self, message: TranslationTaskMessage) {
@@ -1089,11 +1461,42 @@ impl DesktopReader {
         }
         self.translation.pending = None;
         match message.result {
-            Ok(content) => {
-                self.translation.translated_text = content;
-                self.translation.error = None;
+            Ok(translations) => {
+                if let Err(error) = self
+                    .translation_source
+                    .store_section(message.section_index, &translations)
+                {
+                    self.translation.show_error(error, Instant::now());
+                    return;
+                }
+                self.translation.clear_error();
+                if self.translation.enabled
+                    && self.snapshot.location.section_index == message.section_index
+                {
+                    self.refresh_translation_view();
+                }
+                self.queue_current_section_translation();
             }
-            Err(error) => self.translation.error = Some(error),
+            Err(error) => {
+                self.error = Some(format!("翻译正文失败：{error}"));
+                self.translation.show_error(error, Instant::now());
+            }
+        }
+    }
+
+    fn refresh_translation_view(&mut self) {
+        match self.reader.refresh_source() {
+            Ok(snapshot) => {
+                self.install_snapshot(snapshot);
+                self.selection_anchor = None;
+                self.selection = None;
+                self.selected_highlight_id = None;
+                self.invalidate_page_scenes();
+                self.prefetch();
+            }
+            Err(error) => self
+                .translation
+                .show_error(format!("刷新翻译正文失败：{error}"), Instant::now()),
         }
     }
 
@@ -1117,6 +1520,9 @@ impl DesktopReader {
                 if moved && (section_changed || segment_changed) {
                     self.prefetch();
                 }
+                if moved {
+                    self.queue_current_section_translation();
+                }
             }
             Err(error) => self.error = Some(format!("翻页失败：{error}")),
         }
@@ -1135,7 +1541,13 @@ impl DesktopReader {
     }
 
     fn apply_settings(&mut self) {
-        let plugin_settings = self.ui.draft_plugin_settings.clone();
+        let mut plugin_settings = self.ui.draft_plugin_settings.clone();
+        plugin_settings.normalize();
+        let translation_backend_changed = self.plugin_settings.translation_provider
+            != plugin_settings.translation_provider
+            || self.plugin_settings.translation_model != plugin_settings.translation_model
+            || self.plugin_settings.target_language != plugin_settings.target_language
+            || self.plugin_settings.providers != plugin_settings.providers;
         if let Err(error) = plugin_settings.save_default() {
             self.error = Some(format!("保存插件设置失败：{error}"));
             return;
@@ -1149,16 +1561,35 @@ impl DesktopReader {
         let mut style = self.reader.style();
         style.spread = self.ui.draft_spread;
         style.typography = typography;
+        if let Err(error) = self
+            .translation_source
+            .set_mode(plugin_settings.translation_mode)
+            .and_then(|()| {
+                if translation_backend_changed {
+                    self.translation_source.clear()
+                } else {
+                    Ok(())
+                }
+            })
+        {
+            self.error = Some(format!("应用翻译设置失败：{error}"));
+            return;
+        }
         let result = self.reader.set_style(style);
         match result {
             Ok(snapshot) => {
                 self.plugin_settings = plugin_settings;
+                self.translation.clear_error();
                 self.install_snapshot(snapshot);
                 self.selection_anchor = None;
                 self.selection = None;
                 self.close_overlay();
                 self.invalidate_page_scenes();
                 self.prefetch();
+                if translation_backend_changed {
+                    self.translation.pending = None;
+                }
+                self.queue_current_section_translation();
             }
             Err(error) => self.error = Some(format!("应用阅读设置失败：{error}")),
         }
@@ -1175,6 +1606,7 @@ impl DesktopReader {
                 self.bump_scene_revision();
                 self.error = None;
                 self.prefetch();
+                self.queue_current_section_translation();
             }
             Err(error) => self.error = Some(format!("目录跳转失败：{error}")),
         }
@@ -1226,6 +1658,17 @@ impl DesktopReader {
             .expanded_toc
             .extend(snapshot.active_toc_path.iter().cloned());
         self.snapshot = snapshot;
+        self.persist_progress();
+    }
+
+    fn persist_progress(&self) {
+        let Some(store) = &self.progress_store else {
+            return;
+        };
+        let locator = self.reader.current_locator();
+        if let Err(error) = store.save_progress(&self.book_id, &locator) {
+            tracing::warn!(%error, book_id = %self.book_id, "failed to persist reading progress");
+        }
     }
 
     fn page_scene(&mut self) -> Arc<Scene> {
@@ -1250,15 +1693,15 @@ impl DesktopReader {
                         spread.primary.paint_source_ranges(
                             &mut bridge,
                             &highlight.ranges,
-                            ui_color(highlight.color.rgba()),
+                            ANNOTATION_MARK_COLOR,
                             0.0,
                         );
                     }
-                    if let Some(range) = &self.focused_range {
+                    if let Some(mark) = &self.focused_mark {
                         spread.primary.paint_source_ranges(
                             &mut bridge,
-                            std::slice::from_ref(range),
-                            Color::from_rgba8(59, 130, 246, 96),
+                            &mark.ranges,
+                            mark.color(),
                             0.0,
                         );
                     }
@@ -1266,7 +1709,7 @@ impl DesktopReader {
                         spread.primary.paint_source_ranges(
                             &mut bridge,
                             &selection.ranges,
-                            Color::from_rgba8(96, 165, 250, 88),
+                            TEXT_SELECTION_COLOR,
                             0.0,
                         );
                     }
@@ -1277,15 +1720,15 @@ impl DesktopReader {
                             secondary.paint_source_ranges(
                                 &mut bridge,
                                 &highlight.ranges,
-                                ui_color(highlight.color.rgba()),
+                                ANNOTATION_MARK_COLOR,
                                 spread.secondary_offset_x,
                             );
                         }
-                        if let Some(range) = &self.focused_range {
+                        if let Some(mark) = &self.focused_mark {
                             secondary.paint_source_ranges(
                                 &mut bridge,
-                                std::slice::from_ref(range),
-                                Color::from_rgba8(59, 130, 246, 96),
+                                &mark.ranges,
+                                mark.color(),
                                 spread.secondary_offset_x,
                             );
                         }
@@ -1293,7 +1736,7 @@ impl DesktopReader {
                             secondary.paint_source_ranges(
                                 &mut bridge,
                                 &selection.ranges,
-                                Color::from_rgba8(96, 165, 250, 88),
+                                TEXT_SELECTION_COLOR,
                                 spread.secondary_offset_x,
                             );
                         }
@@ -1310,7 +1753,11 @@ impl DesktopReader {
         let scene = Arc::new(scene);
         self.page_scenes.insert(key, Arc::clone(&scene));
         self.touch_page_scene(key);
-        while self.page_scenes.len() > PAGE_SCENE_CACHE_CAPACITY {
+        let cache_capacity = match self.format {
+            BookFormat::Pdf => PDF_PAGE_SCENE_CACHE_CAPACITY,
+            _ => PAGE_SCENE_CACHE_CAPACITY,
+        };
+        while self.page_scenes.len() > cache_capacity {
             let Some(oldest) = self.page_scene_lru.pop_front() else {
                 break;
             };
@@ -1426,6 +1873,7 @@ impl DesktopReader {
         self.ui.sidebar_motion.advance(delta);
         self.ui.menu_motion.advance(delta);
         self.ui.settings_motion.advance(delta);
+        self.translation.dismiss_if_due(now);
 
         if sidebar_was_animating && !self.ui.sidebar_motion.is_animating() {
             // Reader layout is deliberately held stable during the slide. Trigger one
@@ -1445,6 +1893,7 @@ fn root_view(state: &mut DesktopApp) -> Box<AnyWidgetView<DesktopApp>> {
         .is_some_and(|reader| reader.exit_requested)
     {
         state.reader = None;
+        state.start_sync();
     }
 
     if let Some(reader) = state.reader.as_mut() {
@@ -1454,8 +1903,50 @@ fn root_view(state: &mut DesktopApp) -> Box<AnyWidgetView<DesktopApp>> {
         })
         .boxed()
     } else {
-        shelf_view(state).boxed()
+        shelf_app_view(state).boxed()
     }
+}
+
+fn shelf_app_view(state: &mut DesktopApp) -> impl WidgetView<DesktopApp> + use<> {
+    let pending = state.sync.pending.clone();
+    let auto_sync = state.sync.settings.enabled;
+    let interval = Duration::from_secs(u64::from(state.sync.settings.interval_minutes.max(1)) * 60);
+    let view = fork(
+        shelf_view(state),
+        pending.map(|request| {
+            task_raw(
+                move |proxy| {
+                    let request = request.clone();
+                    async move {
+                        let id = request.id;
+                        let result = run_sync(request.settings, request.password, request.books)
+                            .await
+                            .map_err(|error| error.to_string());
+                        let _ = proxy.message(SyncTaskMessage { id, result });
+                    }
+                },
+                DesktopApp::complete_sync,
+            )
+        }),
+    );
+    fork(
+        view,
+        auto_sync.then(|| {
+            task_raw(
+                move |proxy| async move {
+                    let mut timer = xilem::tokio::time::interval(interval);
+                    timer.set_missed_tick_behavior(xilem::tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        timer.tick().await;
+                        if proxy.message(()).is_err() {
+                            break;
+                        }
+                    }
+                },
+                |state: &mut DesktopApp, ()| state.start_sync(),
+            )
+        }),
+    )
 }
 
 fn shelf_view(state: &mut DesktopApp) -> impl WidgetView<DesktopApp> + use<> {
@@ -1469,26 +1960,7 @@ fn shelf_view(state: &mut DesktopApp) -> impl WidgetView<DesktopApp> + use<> {
         .cloned()
         .collect::<Vec<_>>();
     let book_count = state.shelf.library.books().len();
-    let notice = state.shelf.notice.clone().map(|message| {
-        sized_box(label(message).text_size(13.0).color(UI_ACCENT))
-            .expand_width()
-            .background_color(UI_ACCENT_SOFT)
-            .border(UI_ACCENT_BORDER, 1.0)
-            .corner_radius(10.0)
-            .padding(Padding::from_vh(10.0, 14.0))
-    });
-    let error = state.shelf.error.clone().map(|message| {
-        sized_box(
-            label(message)
-                .text_size(13.0)
-                .color(Color::from_rgb8(0xb4, 0x23, 0x18)),
-        )
-        .expand_width()
-        .background_color(Color::from_rgb8(0xfe, 0xf3, 0xf2))
-        .border(Color::from_rgb8(0xfe, 0xcd, 0xca), 1.0)
-        .corner_radius(10.0)
-        .padding(Padding::from_vh(10.0, 14.0))
-    });
+    let feedback_layer = shelf_feedback_notice(state).alignment(UnitPoint::TOP_RIGHT);
     let content: Box<AnyWidgetView<DesktopApp>> = if books.is_empty() && !query.is_empty() {
         sized_box(
             flex_col((
@@ -1502,28 +1974,82 @@ fn shelf_view(state: &mut DesktopApp) -> impl WidgetView<DesktopApp> + use<> {
         .expand_width()
         .boxed()
     } else {
-        shelf_grid(state, books, query.is_empty()).boxed()
+        shelf_grid(state, books, query.is_empty(), state.shelf.grid_width).boxed()
     };
 
-    sized_box(
+    let shelf = sized_box(
         flex_col((
-            shelf_toolbar(state.shelf.query.clone(), book_count),
+            shelf_toolbar(
+                state.shelf.query.clone(),
+                book_count,
+                state.sync.settings.enabled,
+                state.sync.pending.is_some(),
+            ),
             divider_for_app(),
             portal(
-                flex_col((notice, error, content))
-                    .gap(12.px())
-                    .cross_axis_alignment(CrossAxisAlignment::Fill)
-                    .padding(Padding::from_vh(24.0, 28.0)),
+                sized_box(zstack((
+                    content.alignment(UnitPoint::TOP_LEFT),
+                    shelf_width_probe(|state: &mut DesktopApp, width| {
+                        state.shelf.grid_width = width;
+                    }),
+                )))
+                .expand_width()
+                .padding(Padding::from_vh(24.0, 28.0)),
             )
             .flex(1.0),
         ))
         .cross_axis_alignment(CrossAxisAlignment::Fill),
     )
     .expand()
-    .background_color(UI_BACKGROUND)
+    .background_color(UI_BACKGROUND);
+    let remove_dialog: Box<AnyWidgetView<DesktopApp>> =
+        state.shelf.remove_confirmation.clone().map_or_else(
+            || sized_box(label("")).width(0.px()).height(0.px()).boxed(),
+            |confirmation| {
+                confirmation_dialog(
+                    "从书架移除",
+                    format!(
+                        "确定要移除《{}》吗？本地书架中的副本将被删除。",
+                        confirmation.title
+                    ),
+                    "移除",
+                    DesktopApp::cancel_remove_book,
+                    DesktopApp::confirm_remove_book,
+                )
+                .boxed()
+            },
+        );
+    let sync_dialog: Box<AnyWidgetView<DesktopApp>> = if state.sync.dialog_open {
+        shelf_sync_dialog(state).boxed()
+    } else {
+        sized_box(label("")).width(0.px()).height(0.px()).boxed()
+    };
+    sized_box(zstack((shelf, feedback_layer, remove_dialog, sync_dialog))).expand()
 }
 
-fn shelf_toolbar(query: String, book_count: usize) -> impl WidgetView<DesktopApp> {
+fn shelf_feedback_notice(state: &DesktopApp) -> Box<AnyWidgetView<DesktopApp>> {
+    let content: Box<AnyWidgetView<DesktopApp>> = if let Some(message) = &state.shelf.error {
+        notice_card(NoticeTone::Error, "操作失败", message.clone()).boxed()
+    } else if let Some(message) = &state.shelf.notice {
+        notice_card(NoticeTone::Success, "操作完成", message.clone()).boxed()
+    } else if state.sync.pending.is_some() {
+        notice_card(NoticeTone::Info, "WebDAV 同步", state.sync.status.clone()).boxed()
+    } else {
+        return sized_box(label("")).width(0.px()).height(0.px()).boxed();
+    };
+
+    sized_box(content)
+        .width(380.px())
+        .transform(Affine::translate((-16.0, 76.0)))
+        .boxed()
+}
+
+fn shelf_toolbar(
+    query: String,
+    book_count: usize,
+    sync_enabled: bool,
+    syncing: bool,
+) -> impl WidgetView<DesktopApp> {
     let search = sized_box(
         flex_row((
             icon_label_for_app(Icon::Search, 16.0, UI_MUTED),
@@ -1532,6 +2058,7 @@ fn shelf_toolbar(query: String, book_count: usize) -> impl WidgetView<DesktopApp
             })
             .placeholder(format!("搜索 {book_count} 本书"))
             .text_color(UI_TEXT)
+            .caret_color(UI_ACCENT)
             .background_color(Color::TRANSPARENT)
             .border_color(Color::TRANSPARENT)
             .border_width(0.0)
@@ -1556,6 +2083,17 @@ fn shelf_toolbar(query: String, book_count: usize) -> impl WidgetView<DesktopApp
                 .width(1.px())
                 .height(24.px())
                 .background_color(UI_BORDER),
+            shelf_icon_button(Icon::CloudCog, DesktopApp::open_sync_settings),
+            sync_enabled.then(|| {
+                shelf_icon_button(
+                    if syncing {
+                        Icon::CloudDownload
+                    } else {
+                        Icon::CloudSync
+                    },
+                    DesktopApp::start_sync,
+                )
+            }),
             shelf_icon_button(Icon::Plus, import_with_dialog),
         ))
         .gap(12.px())
@@ -1567,10 +2105,237 @@ fn shelf_toolbar(query: String, book_count: usize) -> impl WidgetView<DesktopApp
     .padding(Padding::horizontal(20.0))
 }
 
+#[allow(clippy::too_many_lines)]
+fn shelf_sync_dialog(state: &DesktopApp) -> impl WidgetView<DesktopApp> + use<> {
+    let enabled = state.sync.draft_settings.enabled;
+    let base_url = state.sync.draft_settings.base_url.clone();
+    let username = state.sync.draft_settings.username.clone();
+    let password = state.sync.draft_password.clone();
+    let device_name = state.sync.draft_settings.device_name.clone();
+    let toggle = sized_box(
+        button(
+            flex_row((
+                label(if enabled { "已启用" } else { "未启用" })
+                    .font(UI_FONT_STACK)
+                    .text_size(12.5)
+                    .color(if enabled { UI_ACCENT } else { UI_TEXT_SOFT }),
+                FlexSpacer::Flex(1.0),
+                sized_box(zstack((
+                    sized_box(label(""))
+                        .width(32.px())
+                        .height(18.px())
+                        .background_color(if enabled { UI_ACCENT } else { UI_BORDER })
+                        .corner_radius(9.0),
+                    sized_box(label(""))
+                        .width(14.px())
+                        .height(14.px())
+                        .background_color(UI_SURFACE)
+                        .corner_radius(7.0)
+                        .alignment(if enabled {
+                            UnitPoint::RIGHT
+                        } else {
+                            UnitPoint::LEFT
+                        }),
+                )))
+                .width(32.px())
+                .height(18.px()),
+            )),
+            |state: &mut DesktopApp| {
+                state.sync.draft_settings.enabled = !state.sync.draft_settings.enabled;
+            },
+        )
+        .background_color(UI_SURFACE)
+        .active_background_color(UI_SURFACE_MUTED)
+        .border_color(UI_BORDER)
+        .hovered_border_color(UI_ACCENT_BORDER)
+        .corner_radius(RADIUS_SMALL)
+        .padding(Padding::from_vh(6.0, 10.0)),
+    )
+    .height(CONTROL_HEIGHT.px())
+    .expand_width();
+
+    let panel = sized_box(
+        flex_col((
+            sized_box(
+                flex_row((
+                    flex_row((
+                        icon_label_for_app(Icon::CloudCog, 17.0, UI_ACCENT),
+                        label("WebDAV 同步")
+                            .font(UI_FONT_STACK)
+                            .text_size(15.0)
+                            .weight(FontWeight::BOLD)
+                            .color(UI_TEXT),
+                    ))
+                    .gap(9.px())
+                    .cross_axis_alignment(CrossAxisAlignment::Center),
+                    FlexSpacer::Flex(1.0),
+                    shelf_icon_button(Icon::X, DesktopApp::close_sync_settings),
+                ))
+                .cross_axis_alignment(CrossAxisAlignment::Center),
+            )
+            .height(DIALOG_HEADER_HEIGHT.px())
+            .expand_width()
+            .padding(Padding::horizontal(CONTENT_PADDING_HORIZONTAL)),
+            divider_for_app(),
+            flex_col((
+                label("桌面端会直接连接 WebDAV；密码只保存到 Windows 凭据管理器。")
+                    .font(UI_FONT_STACK)
+                    .text_size(11.5)
+                    .color(UI_MUTED),
+                sync_settings_row("自动同步", toggle.boxed()),
+                sync_text_input_row(
+                    "WebDAV 地址",
+                    base_url,
+                    "https://dav.example.com/path",
+                    |state, value| {
+                        state.sync.draft_settings.base_url = value;
+                    },
+                ),
+                sync_text_input_row("用户名", username, "WebDAV 用户名", |state, value| {
+                    state.sync.draft_settings.username = value;
+                }),
+                sync_text_input_row(
+                    "密码",
+                    password,
+                    if state.sync.password.is_empty() {
+                        "应用专用密码"
+                    } else {
+                        "已保存；留空不修改"
+                    },
+                    |state, value| {
+                        state.sync.draft_password = value;
+                    },
+                ),
+                sync_text_input_row(
+                    "设备名称",
+                    device_name,
+                    "这台电脑",
+                    |state, value| {
+                        state.sync.draft_settings.device_name = value;
+                    },
+                ),
+            ))
+            .gap(CONTENT_GAP.px())
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .padding(Padding::from_vh(
+                CONTENT_PADDING_VERTICAL,
+                CONTENT_PADDING_HORIZONTAL,
+            ))
+            .flex(1.0),
+            divider_for_app(),
+            sized_box(
+                flex_row((
+                    FlexSpacer::Flex(1.0),
+                    sized_box(
+                        button(
+                            label("取消")
+                                .font(UI_FONT_STACK)
+                                .text_size(12.5)
+                                .color(UI_TEXT_SOFT),
+                            DesktopApp::close_sync_settings,
+                        )
+                        .background_color(UI_SURFACE)
+                        .active_background_color(UI_SURFACE_MUTED)
+                        .border_color(UI_BORDER)
+                        .corner_radius(RADIUS_SMALL)
+                        .padding(Padding::from_vh(5.0, 12.0)),
+                    )
+                    .height(CONTROL_HEIGHT.px()),
+                    sized_box(
+                        button(
+                            label("保存并同步")
+                                .font(UI_FONT_STACK)
+                                .text_size(12.5)
+                                .weight(FontWeight::BOLD)
+                                .color(UI_SURFACE),
+                            DesktopApp::apply_sync_settings,
+                        )
+                        .background_color(UI_ACCENT)
+                        .active_background_color(UI_TEXT)
+                        .border_color(UI_ACCENT)
+                        .corner_radius(RADIUS_SMALL)
+                        .padding(Padding::from_vh(5.0, 12.0)),
+                    )
+                    .height(CONTROL_HEIGHT.px()),
+                ))
+                .gap(8.px())
+                .cross_axis_alignment(CrossAxisAlignment::Center),
+            )
+            .height(DIALOG_FOOTER_HEIGHT.px())
+            .expand_width()
+            .padding(Padding::horizontal(CONTENT_PADDING_HORIZONTAL)),
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Fill)
+        .must_fill_major_axis(true),
+    )
+    .width(560.px())
+    .height(390.px())
+    .background_color(UI_SURFACE)
+    .border(UI_BORDER, 1.0)
+    .corner_radius(RADIUS_DIALOG);
+
+    sized_box(zstack((
+        sized_box(
+            button(label(""), DesktopApp::close_sync_settings)
+                .background_color(Color::TRANSPARENT)
+                .active_background_color(Color::TRANSPARENT)
+                .border_color(Color::TRANSPARENT)
+                .hovered_border_color(Color::TRANSPARENT)
+                .border_width(0.0)
+                .padding(0.0),
+        )
+        .expand()
+        .background_color(Color::from_rgba8(31, 45, 61, 89)),
+        panel,
+    )))
+    .expand()
+}
+
+fn sync_settings_row(
+    label_text: &'static str,
+    control: Box<AnyWidgetView<DesktopApp>>,
+) -> impl WidgetView<DesktopApp> {
+    flex_row((
+        sized_box(
+            label(label_text)
+                .font(UI_FONT_STACK)
+                .text_size(12.5)
+                .color(UI_TEXT_SOFT),
+        )
+        .width(116.px()),
+        control.flex(1.0),
+    ))
+    .gap(12.px())
+    .cross_axis_alignment(CrossAxisAlignment::Center)
+}
+
+fn sync_text_input_row(
+    label_text: &'static str,
+    value: String,
+    placeholder: &'static str,
+    callback: impl Fn(&mut DesktopApp, String) + Send + Sync + 'static,
+) -> impl WidgetView<DesktopApp> {
+    let input = sized_box(
+        text_input(value, callback)
+            .placeholder(placeholder)
+            .text_color(UI_TEXT)
+            .caret_color(UI_ACCENT)
+            .background_color(UI_SURFACE_MUTED)
+            .border_color(UI_BORDER)
+            .border_width(1.0)
+            .corner_radius(RADIUS_SMALL)
+            .padding(Padding::from_vh(5.0, 10.0)),
+    )
+    .height(CONTROL_HEIGHT.px())
+    .expand_width();
+    sync_settings_row(label_text, input.boxed())
+}
+
 fn shelf_grid(
     state: &DesktopApp,
     books: Vec<LibraryBook>,
     include_import: bool,
+    available_width: f64,
 ) -> impl WidgetView<DesktopApp> + use<> {
     let mut cards = books
         .into_iter()
@@ -1583,14 +2348,15 @@ fn shelf_grid(
         cards.push(import_card().boxed());
     }
 
+    let columns = shelf_column_count(available_width);
     let mut rows = Vec::new();
     let mut cards = cards.into_iter();
     loop {
-        let mut row = cards.by_ref().take(SHELF_COLUMNS).collect::<Vec<_>>();
+        let mut row = cards.by_ref().take(columns).collect::<Vec<_>>();
         if row.is_empty() {
             break;
         }
-        while row.len() < SHELF_COLUMNS {
+        while row.len() < columns {
             row.push(
                 sized_box(label(""))
                     .width(SHELF_CARD_WIDTH.px())
@@ -1600,14 +2366,24 @@ fn shelf_grid(
         }
         rows.push(
             flex_row(row)
-                .gap(24.px())
+                .gap(SHELF_CARD_GAP.px())
                 .cross_axis_alignment(CrossAxisAlignment::Start),
         );
     }
 
     flex_col(rows)
-        .gap(28.px())
+        .gap(SHELF_ROW_GAP.px())
         .cross_axis_alignment(CrossAxisAlignment::Start)
+}
+
+fn shelf_column_count(available_width: f64) -> usize {
+    let mut columns = 1;
+    let mut occupied_width = SHELF_CARD_WIDTH;
+    while occupied_width + SHELF_CARD_GAP + SHELF_CARD_WIDTH <= available_width {
+        columns += 1;
+        occupied_width += SHELF_CARD_GAP + SHELF_CARD_WIDTH;
+    }
+    columns
 }
 
 fn shelf_book_card(book: &LibraryBook, cover: Option<ImageData>) -> impl WidgetView<DesktopApp> {
@@ -1658,7 +2434,7 @@ fn shelf_book_card(book: &LibraryBook, cover: Option<ImageData>) -> impl WidgetV
             )
             .height(24.px())
             .expand_width(),
-            shelf_book_status(available, book.format),
+            shelf_book_status(available),
         ))
         .gap(7.px())
         .cross_axis_alignment(CrossAxisAlignment::Fill),
@@ -1700,19 +2476,10 @@ fn shelf_remove_button(id: String, title: String) -> impl WidgetView<DesktopApp>
         button(
             icon_label_for_app(Icon::Trash2, 14.0, Color::WHITE),
             move |state: &mut DesktopApp| {
-                let confirmed = rfd::MessageDialog::new()
-                    .set_title("从书架移除")
-                    .set_description(format!(
-                        "确定要移除《{title}》吗？本地书架中的副本将被删除。"
-                    ))
-                    .set_level(rfd::MessageLevel::Warning)
-                    .set_buttons(rfd::MessageButtons::YesNo)
-                    .show();
-                if confirmed == rfd::MessageDialogResult::Yes {
-                    state.remove_book(&id);
-                }
+                state.request_remove_book(id.clone(), title.clone());
             },
         )
+        .accessibility_label("从书架移除")
         .background_color(Color::from_rgba8(31, 45, 61, 205))
         .active_background_color(Color::from_rgb8(0xb4, 0x23, 0x18))
         .border_color(Color::TRANSPARENT)
@@ -1725,7 +2492,7 @@ fn shelf_remove_button(id: String, title: String) -> impl WidgetView<DesktopApp>
     .transform(Affine::translate((-8.0, 8.0)))
 }
 
-fn shelf_book_status(available: bool, format: BookFormat) -> impl WidgetView<DesktopApp> {
+fn shelf_book_status(available: bool) -> impl WidgetView<DesktopApp> {
     let (icon, text, color) = if available {
         (Icon::HardDrive, "本地", UI_MUTED)
     } else {
@@ -1738,8 +2505,6 @@ fn shelf_book_status(available: bool, format: BookFormat) -> impl WidgetView<Des
     flex_row((
         icon_label_for_app(icon, 12.0, color),
         label(text).text_size(11.5).color(color),
-        FlexSpacer::Flex(1.0),
-        label(format.label()).text_size(11.5).color(UI_MUTED),
     ))
     .gap(5.px())
     .cross_axis_alignment(CrossAxisAlignment::Center)
@@ -1854,6 +2619,40 @@ fn ellipsize_display_text(text: &str, max_units: usize) -> String {
     format!("{}…", &text[..end])
 }
 
+fn wrap_display_text(text: &str, line_units: usize, max_lines: usize) -> String {
+    if line_units == 0 || max_lines == 0 {
+        return String::new();
+    }
+
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = ellipsize_display_text(&normalized, line_units.saturating_mul(max_lines));
+    let mut lines = Vec::with_capacity(max_lines);
+    let mut current = String::new();
+    let mut used_units = 0;
+
+    for character in text.chars() {
+        let character_units = shelf_title_character_units(character);
+        if !current.is_empty() && used_units + character_units > line_units {
+            lines.push(current.trim_end().to_owned());
+            if lines.len() == max_lines {
+                break;
+            }
+            current.clear();
+            used_units = 0;
+            if character.is_whitespace() {
+                continue;
+            }
+        }
+        used_units += character_units;
+        current.push(character);
+    }
+
+    if lines.len() < max_lines && !current.is_empty() {
+        lines.push(current.trim_end().to_owned());
+    }
+    lines.join("\n")
+}
+
 fn shelf_title_character_units(character: char) -> usize {
     if character.is_ascii() { 1 } else { 2 }
 }
@@ -1875,7 +2674,7 @@ fn cover_color(id: &str) -> Color {
 }
 
 fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
-    let animations_running = state.ui.needs_motion_tick();
+    let animations_running = state.ui.needs_motion_tick() || state.translation.dismiss_at.is_some();
     let search_request = state.search.pending.clone();
     let chat_request = state.chat.pending.clone();
     let translation_request = state.translation.pending.clone();
@@ -1951,8 +2750,13 @@ fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopReader> + use<>
                     let request = request.clone();
                     async move {
                         let id = request.id;
-                        let result = translate_text(request.settings, request.text).await;
-                        let _ = proxy.message(TranslationTaskMessage { id, result });
+                        let section_index = request.section_index;
+                        let result = translate_blocks(request.settings, request.blocks).await;
+                        let _ = proxy.message(TranslationTaskMessage {
+                            id,
+                            section_index,
+                            result,
+                        });
                     }
                 },
                 DesktopReader::complete_translation,
@@ -2022,7 +2826,7 @@ fn reader_workspace(
 ) -> impl WidgetView<DesktopReader> + use<> {
     let (title, reader_background) = {
         (
-            state.reader.book().metadata.title.clone(),
+            state.display_metadata.title.clone(),
             ui_color(state.reader.style().background),
         )
     };
@@ -2040,6 +2844,7 @@ fn reader_workspace(
             title,
             state.ui.sidebar_open,
             menu_open,
+            state.translation.enabled,
             state.ui.assistant_panel,
             reader_background,
         ))
@@ -2074,8 +2879,14 @@ fn reader_workspace(
         sized_box(label("")).width(0.px()).height(0.px()).boxed()
     };
     let menu_layer = menu_content.alignment(UnitPoint::TOP_RIGHT);
-    let selection_layer = selection_toolbar(state.selection.as_ref(), state.canvas_size)
-        .alignment(UnitPoint::TOP_LEFT);
+    let visible_selection = if state.selection_toolbar_visible {
+        state.selection.as_ref()
+    } else {
+        None
+    };
+    let selection_layer =
+        selection_toolbar(visible_selection, state.canvas_size).alignment(UnitPoint::TOP_LEFT);
+    let translation_status_layer = translation_status_notice(state).alignment(UnitPoint::TOP_RIGHT);
     let pages = sized_box(flex_col((
         reader_view(state.scene_revision, reader_background).flex(1.0),
         progress_bar(progress),
@@ -2085,12 +2896,38 @@ fn reader_workspace(
     sized_box(zstack((
         pages,
         selection_layer,
+        translation_status_layer,
         menu_scrim,
         toolbar_layer,
         menu_layer,
     )))
     .expand()
     .background_color(reader_background)
+}
+
+fn translation_status_notice(state: &DesktopReader) -> Box<AnyWidgetView<DesktopReader>> {
+    let content: Box<AnyWidgetView<DesktopReader>> = if state.translation.pending.is_some() {
+        notice_card(
+            NoticeTone::Info,
+            "正在翻译",
+            "当前章节完成后会自动刷新正文。",
+        )
+        .boxed()
+    } else if let Some(error) = &state.translation.error {
+        dismissible_notice(
+            NoticeTone::Error,
+            "无法完成翻译",
+            error.clone(),
+            DesktopReader::dismiss_translation_notice,
+        )
+        .boxed()
+    } else {
+        return sized_box(label("")).width(0.px()).height(0.px()).boxed();
+    };
+    sized_box(content)
+        .width(356.px())
+        .transform(Affine::translate((-16.0, TOOLBAR_HEIGHT + 12.0)))
+        .boxed()
 }
 
 fn reader_view(scene_revision: u64, reader_background: Color) -> impl WidgetView<DesktopReader> {
@@ -2104,6 +2941,7 @@ fn reader_view(scene_revision: u64, reader_background: Color) -> impl WidgetView
             ReaderCanvasAction::ToolbarVisibility(visible) => {
                 state.set_toolbar_hovered(visible);
             }
+            ReaderCanvasAction::OpenSearch => state.open_search(),
             ReaderCanvasAction::PreviousPage if !state.ui.overlay_visible() => {
                 state.turn_page(PageDirection::Previous);
             }
@@ -2160,32 +2998,14 @@ fn selection_toolbar(
         (selection_bottom + SELECTION_TOOLBAR_GAP)
             .min((canvas_height - SELECTION_TOOLBAR_HEIGHT - 8.0).max(8.0))
     };
-    let color_buttons = HighlightColor::ALL
-        .into_iter()
-        .map(|color| highlight_color_button(color).boxed())
-        .collect::<Vec<_>>();
-
     let toolbar = sized_box(
         flex_row((
-            icon_label(Icon::Highlighter, 16.0, UI_MUTED),
-            flex_row(color_buttons)
-                .gap(6.px())
-                .cross_axis_alignment(CrossAxisAlignment::Center),
-            sized_box(label(""))
-                .width(1.px())
-                .height(22.px())
-                .background_color(UI_BORDER),
-            icon_button(Icon::Languages, false, DesktopReader::translate_selection),
+            icon_button(Icon::Highlighter, false, DesktopReader::create_highlight),
             icon_button(
                 Icon::MessageCircleQuestion,
                 false,
                 DesktopReader::explain_selection,
             ),
-            sized_box(label(""))
-                .width(1.px())
-                .height(22.px())
-                .background_color(UI_BORDER),
-            icon_button(Icon::X, false, DesktopReader::cancel_text_selection),
         ))
         .gap(8.px())
         .cross_axis_alignment(CrossAxisAlignment::Center)
@@ -2213,25 +3033,6 @@ fn selection_toolbar(
         0.px()
     })
     .transform(Affine::translate((left, top)))
-}
-
-fn highlight_color_button(color: HighlightColor) -> impl WidgetView<DesktopReader> {
-    let rgba = color.rgba();
-    let swatch = Color::from_rgb8(rgba.red, rgba.green, rgba.blue);
-    sized_box(
-        button(label(""), move |state: &mut DesktopReader| {
-            state.create_highlight(color);
-        })
-        .background_color(swatch)
-        .active_background_color(swatch.with_alpha(0.72))
-        .border_color(Color::from_rgba8(31, 45, 61, 36))
-        .hovered_border_color(UI_TEXT_SOFT)
-        .border_width(1.0)
-        .corner_radius(8.0)
-        .padding(0.0),
-    )
-    .width(26.px())
-    .height(26.px())
 }
 
 fn toc_view(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
@@ -2280,7 +3081,7 @@ fn toc_view(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     sized_box(
         flex_col((
             sidebar_toolbar(state.ui.sidebar_pinned, state.ui.sidebar_tab),
-            sidebar_book_summary(cover, title, author, format),
+            sidebar_book_summary(cover, &title, &author, format),
             divider(),
             panel.flex(1.0),
         ))
@@ -2322,7 +3123,11 @@ fn search_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<>
     let query = state.search.query.clone();
     let busy = state.search.pending.is_some();
     let status = state.search.status.clone();
-    let active_range = state.focused_range.clone();
+    let active_range = state
+        .focused_mark
+        .as_ref()
+        .and_then(FocusedMark::search_range)
+        .cloned();
     let rows = state
         .search
         .results
@@ -2369,6 +3174,7 @@ fn search_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<>
             })
             .placeholder("搜索全文…")
             .text_color(UI_TEXT)
+            .caret_color(UI_ACCENT)
             .background_color(Color::TRANSPARENT)
             .border_color(Color::TRANSPARENT)
             .border_width(0.0)
@@ -2509,7 +3315,6 @@ fn highlight_row_view(
 ) -> impl WidgetView<DesktopReader> + use<> {
     let navigate_id = highlight.id.clone();
     let remove_id = highlight.id;
-    let color = highlight.color;
     let quote = ellipsize_display_text(&highlight.quote.replace(['\r', '\n'], " "), 76);
     let background = if selected { UI_ACCENT_SOFT } else { UI_SURFACE };
     let border = if selected {
@@ -2522,7 +3327,7 @@ fn highlight_row_view(
             sized_box(label(""))
                 .width(4.px())
                 .expand_height()
-                .background_color(highlight_swatch_color(color))
+                .background_color(ANNOTATION_SWATCH_COLOR)
                 .corner_radius(3.0),
             button(
                 flex_col((
@@ -2573,42 +3378,50 @@ fn highlight_row_view(
     .corner_radius(10.0)
 }
 
-fn highlight_swatch_color(color: HighlightColor) -> Color {
-    let rgba = color.rgba();
-    Color::from_rgb8(rgba.red, rgba.green, rgba.blue)
-}
-
 fn sidebar_book_metadata(state: &DesktopReader) -> (String, String) {
-    let title = state.reader.book().metadata.title.clone();
-    let author = if state.reader.book().metadata.authors.is_empty() {
+    let title = state.display_metadata.title.clone();
+    let author = if state.display_metadata.authors.is_empty() {
         "未知作者".to_owned()
     } else {
-        state.reader.book().metadata.authors.join(" / ")
+        state.display_metadata.authors.join(" / ")
     };
     (title, author)
 }
 
 fn sidebar_book_summary(
     cover: Option<ImageData>,
-    title: String,
-    author: String,
+    title: &str,
+    author: &str,
     format: BookFormat,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<DesktopReader> + use<> {
+    let title = wrap_display_text(
+        title,
+        SIDEBAR_TITLE_LINE_DISPLAY_UNITS,
+        SIDEBAR_TITLE_MAX_LINES,
+    );
+    let author = ellipsize_display_text(
+        &author.split_whitespace().collect::<Vec<_>>().join(" "),
+        SIDEBAR_AUTHOR_MAX_DISPLAY_UNITS,
+    );
     flex_row((
         sidebar_book_cover(cover, format),
         flex_col((
             prose(title)
                 .text_size(13.5)
                 .weight(FontWeight::BOLD)
-                .text_color(UI_TEXT),
-            label(author).text_size(11.5).color(UI_MUTED),
+                .text_color(UI_TEXT)
+                .line_break_mode(LineBreaking::Clip),
+            label(author)
+                .text_size(11.5)
+                .color(UI_MUTED)
+                .line_break_mode(LineBreaking::Clip),
         ))
         .gap(4.px())
         .cross_axis_alignment(CrossAxisAlignment::Start)
         .flex(1.0),
     ))
     .gap(12.px())
-    .cross_axis_alignment(CrossAxisAlignment::Center)
+    .cross_axis_alignment(CrossAxisAlignment::Start)
     .padding(Padding::from_vh(14.0, 4.0))
 }
 
@@ -2740,16 +3553,7 @@ fn toc_row_view(
 }
 
 fn assistant_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
-    let content: Box<AnyWidgetView<DesktopReader>> = match state.ui.assistant_panel {
-        Some(AssistantPanel::Chat) => chat_panel(state).boxed(),
-        Some(AssistantPanel::Translation) => translation_panel(state).boxed(),
-        None => sized_box(label("")).width(0.px()).height(0.px()).boxed(),
-    };
-    sized_box(content)
-        .width(ASSISTANT_PANEL_WIDTH.px())
-        .expand_height()
-        .background_color(UI_SIDEBAR)
-        .border(UI_BORDER, 1.0)
+    chat_panel(state)
 }
 
 fn chat_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
@@ -2800,32 +3604,37 @@ fn chat_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     };
     let error: Box<AnyWidgetView<DesktopReader>> = state.chat.error.as_ref().map_or_else(
         || sized_box(label("")).width(0.px()).height(0.px()).boxed(),
-        |error| {
-            sized_box(
-                prose(error.clone())
-                    .text_size(11.5)
-                    .text_color(Color::from_rgb8(0xb9, 0x1c, 0x1c)),
-            )
-            .background_color(Color::from_rgb8(0xfe, 0xf2, 0xf2))
-            .border(Color::from_rgb8(0xfe, 0xca, 0xca), 1.0)
-            .corner_radius(8.0)
-            .padding(Padding::from_vh(7.0, 9.0))
-            .boxed()
-        },
+        |error| notice_card(NoticeTone::Error, "AI 请求失败", error.clone()).boxed(),
     );
     let command_menu = chat_command_menu(&input, busy);
     let composer = chat_composer(input, busy);
-
-    flex_col((
+    let conversation_layer = flex_col((
         assistant_panel_header(Icon::MessageCircle, "AI 对话", true),
         divider(),
         conversation.flex(1.0),
-        error,
-        command_menu,
-        composer,
+        sized_box(label("")).height(48.px()),
     ))
+    .must_fill_major_axis(true)
     .gap(8.px())
     .cross_axis_alignment(CrossAxisAlignment::Fill)
+    .alignment(UnitPoint::TOP_LEFT);
+    let composer_layer = sized_box(
+        flex_col((error, command_menu, composer))
+            .gap(8.px())
+            .cross_axis_alignment(CrossAxisAlignment::Fill),
+    )
+    .expand_width()
+    .alignment(UnitPoint::BOTTOM);
+
+    sized_box(zstack((
+        sized_box(label("")).expand(),
+        conversation_layer,
+        composer_layer,
+    )))
+    .width(ASSISTANT_PANEL_WIDTH.px())
+    .expand_height()
+    .background_color(UI_SIDEBAR)
+    .border(UI_BORDER, 1.0)
     .padding(Padding::from_vh(6.0, 10.0))
 }
 
@@ -2842,7 +3651,7 @@ fn chat_command_menu(input: &str, busy: bool) -> Box<AnyWidgetView<DesktopReader
         .cross_axis_alignment(CrossAxisAlignment::Fill)
         .background_color(UI_SURFACE)
         .border(UI_BORDER, 1.0)
-        .corner_radius(10.0)
+        .corner_radius(RADIUS_MEDIUM)
         .padding(4.0)
         .boxed()
 }
@@ -2859,6 +3668,7 @@ fn chat_composer(input: String, busy: bool) -> impl WidgetView<DesktopReader> + 
             })
             .placeholder("询问这本书，或输入 / 使用技能…")
             .text_color(UI_TEXT)
+            .caret_color(UI_ACCENT)
             .background_color(Color::TRANSPARENT)
             .border_color(Color::TRANSPARENT)
             .border_width(0.0)
@@ -2869,10 +3679,10 @@ fn chat_composer(input: String, busy: bool) -> impl WidgetView<DesktopReader> + 
         .gap(6.px())
         .cross_axis_alignment(CrossAxisAlignment::Center),
     )
-    .height(44.px())
+    .height(40.px())
     .background_color(UI_SURFACE)
     .border(UI_BORDER, 1.0)
-    .corner_radius(12.0)
+    .corner_radius(RADIUS_MEDIUM)
     .padding(Padding::horizontal(8.0))
 }
 
@@ -2897,7 +3707,7 @@ fn chat_message_row(turn: ChatTurn) -> impl WidgetView<DesktopReader> + use<> {
     .expand_width()
     .background_color(background)
     .border(border, 1.0)
-    .corner_radius(10.0)
+    .corner_radius(RADIUS_MEDIUM)
     .padding(Padding::from_vh(9.0, 10.0))
 }
 
@@ -2932,114 +3742,6 @@ fn chat_command_suggestion_row(command: ChatCommand) -> impl WidgetView<DesktopR
     .expand_width()
 }
 
-fn translation_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
-    let busy = state.translation.pending.is_some();
-    let source_text = state.translation.source_text.clone();
-    let has_source = !source_text.is_empty();
-    let translated_text = state.translation.translated_text.clone();
-    let target_language = state.plugin_settings.target_language.clone();
-    let content: Box<AnyWidgetView<DesktopReader>> = if has_source {
-        portal(
-            flex_col((
-                translation_text_card("原文", source_text, UI_SURFACE_MUTED),
-                translation_text_card(
-                    &format!("译文 · {target_language}"),
-                    if busy {
-                        "正在翻译…".into()
-                    } else if translated_text.is_empty() {
-                        "尚无译文".into()
-                    } else {
-                        translated_text
-                    },
-                    UI_SURFACE,
-                ),
-            ))
-            .gap(10.px())
-            .cross_axis_alignment(CrossAxisAlignment::Fill)
-            .padding(12.0),
-        )
-        .boxed()
-    } else {
-        flex_col((
-            icon_label(Icon::Languages, 28.0, UI_MUTED),
-            label("选择正文后开始翻译")
-                .font(UI_FONT_STACK)
-                .text_size(13.0)
-                .weight(FontWeight::BOLD)
-                .color(UI_TEXT_SOFT),
-            prose("拖选一段文字，然后点击浮动工具栏中的翻译按钮。原文不会被修改。")
-                .text_size(12.0)
-                .text_color(UI_MUTED),
-        ))
-        .gap(8.px())
-        .cross_axis_alignment(CrossAxisAlignment::Center)
-        .main_axis_alignment(MainAxisAlignment::Center)
-        .padding(24.0)
-        .boxed()
-    };
-    let error: Box<AnyWidgetView<DesktopReader>> = state.translation.error.as_ref().map_or_else(
-        || sized_box(label("")).width(0.px()).height(0.px()).boxed(),
-        |error| {
-            sized_box(
-                prose(error.clone())
-                    .text_size(11.5)
-                    .text_color(Color::from_rgb8(0xb9, 0x1c, 0x1c)),
-            )
-            .background_color(Color::from_rgb8(0xfe, 0xf2, 0xf2))
-            .border(Color::from_rgb8(0xfe, 0xca, 0xca), 1.0)
-            .corner_radius(8.0)
-            .padding(Padding::from_vh(7.0, 9.0))
-            .boxed()
-        },
-    );
-    let actions: Box<AnyWidgetView<DesktopReader>> = if has_source {
-        flex_row((
-            secondary_action_button("定位原文", DesktopReader::go_to_translation_source),
-            FlexSpacer::Flex(1.0),
-            secondary_action_button(
-                if busy { "翻译中…" } else { "重新翻译" },
-                DesktopReader::retry_translation,
-            ),
-        ))
-        .gap(8.px())
-        .cross_axis_alignment(CrossAxisAlignment::Center)
-        .boxed()
-    } else {
-        sized_box(label("")).width(0.px()).height(0.px()).boxed()
-    };
-    flex_col((
-        assistant_panel_header(Icon::Languages, "翻译", false),
-        divider(),
-        content.flex(1.0),
-        error,
-        actions,
-    ))
-    .gap(8.px())
-    .cross_axis_alignment(CrossAxisAlignment::Fill)
-    .padding(Padding::from_vh(6.0, 10.0))
-}
-
-fn translation_text_card(
-    title: &str,
-    text: String,
-    background: Color,
-) -> impl WidgetView<DesktopReader> + use<> {
-    flex_col((
-        label(title.to_owned())
-            .font(UI_FONT_STACK)
-            .text_size(11.0)
-            .weight(FontWeight::BOLD)
-            .color(UI_MUTED),
-        prose(text).text_size(12.5).text_color(UI_TEXT_SOFT),
-    ))
-    .gap(6.px())
-    .cross_axis_alignment(CrossAxisAlignment::Start)
-    .background_color(background)
-    .border(UI_BORDER, 1.0)
-    .corner_radius(10.0)
-    .padding(Padding::from_vh(10.0, 11.0))
-}
-
 fn assistant_panel_header(
     icon: Icon,
     title: &'static str,
@@ -3069,6 +3771,7 @@ fn reader_toolbar(
     title: String,
     toc_open: bool,
     menu_open: bool,
+    translation_enabled: bool,
     assistant_panel: Option<AssistantPanel>,
     reader_background: Color,
 ) -> impl WidgetView<DesktopReader> {
@@ -3081,21 +3784,22 @@ fn reader_toolbar(
         .boxed()
     };
     flex_row((
-        left,
+        flex_row((
+            left,
+            icon_button(
+                Icon::Languages,
+                translation_enabled,
+                DesktopReader::toggle_translation,
+            ),
+        ))
+        .gap(8.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
         FlexSpacer::Flex(1.0),
         label(title)
             .text_size(13.5)
             .weight(FontWeight::BOLD)
             .color(UI_TEXT),
         FlexSpacer::Flex(1.0),
-        icon_button(Icon::Search, false, DesktopReader::open_search),
-        icon_button(
-            Icon::Languages,
-            assistant_panel == Some(AssistantPanel::Translation),
-            |state: &mut DesktopReader| {
-                state.toggle_assistant_panel(AssistantPanel::Translation);
-            },
-        ),
         icon_button(
             Icon::MessageCircle,
             assistant_panel == Some(AssistantPanel::Chat),
@@ -3224,7 +3928,7 @@ fn settings_overlay(
             .height(SETTINGS_HEIGHT.px())
             .background_color(UI_SURFACE)
             .border(UI_BORDER, 1.0)
-            .corner_radius(18.0)
+            .corner_radius(RADIUS_DIALOG)
             .transform(dialog_transform),
     )))
     .expand()
@@ -3242,6 +3946,9 @@ fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + u
     let title = match tab {
         SettingsTab::Reading => "阅读",
         SettingsTab::Font => font_picker.map_or("字体", FontPickerKind::title),
+        SettingsTab::Ai => "AI",
+        SettingsTab::AiChat => "AI Chat",
+        SettingsTab::Translation => "翻译",
         SettingsTab::Plugins => "插件",
     };
     let body: Box<AnyWidgetView<DesktopReader>> = match tab {
@@ -3252,9 +3959,12 @@ fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + u
             }
             None => font_settings_content(typography).boxed(),
         },
-        SettingsTab::Plugins => {
-            plugin_settings_content(state.ui.draft_plugin_settings.clone()).boxed()
+        SettingsTab::Ai => ai_settings_content(state.ui.draft_plugin_settings.clone()).boxed(),
+        SettingsTab::AiChat => ai_chat_settings_content(&state.ui.draft_plugin_settings).boxed(),
+        SettingsTab::Translation => {
+            translation_settings_content(&state.ui.draft_plugin_settings).boxed()
         }
+        SettingsTab::Plugins => plugin_settings_content().boxed(),
     };
 
     flex_row((
@@ -3262,9 +3972,9 @@ fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + u
             sized_box(label(""))
                 .expand()
                 .background_color(UI_SURFACE_MUTED)
-                .corner_radius(17.0),
+                .corner_radius(RADIUS_LARGE),
             sized_box(label(""))
-                .width(18.px())
+                .width(RADIUS_DIALOG.px())
                 .expand_height()
                 .background_color(UI_SURFACE_MUTED)
                 .alignment(UnitPoint::RIGHT),
@@ -3280,32 +3990,25 @@ fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + u
                     ))
                     .gap(9.px())
                     .cross_axis_alignment(CrossAxisAlignment::Center)
-                    .padding(Padding::from_vh(12.0, 10.0)),
+                    .padding(Padding::from_vh(9.0, 8.0)),
                     settings_tab_button("阅读", SettingsTab::Reading, tab),
                     settings_tab_button("字体", SettingsTab::Font, tab),
+                    settings_tab_button("AI", SettingsTab::Ai, tab),
+                    settings_tab_button("AI Chat", SettingsTab::AiChat, tab),
+                    settings_tab_button("翻译", SettingsTab::Translation, tab),
                     settings_tab_button("插件", SettingsTab::Plugins, tab),
                     FlexSpacer::Flex(1.0),
                 ))
-                .gap(4.px())
+                .gap(3.px())
                 .cross_axis_alignment(CrossAxisAlignment::Fill)
-                .padding(10.0),
+                .padding(8.0),
             )
             .expand(),
         )))
-        .width(146.px())
+        .width(136.px())
         .expand_height(),
         flex_col((
-            flex_row((
-                label(title)
-                    .font(UI_FONT_STACK)
-                    .text_size(16.0)
-                    .weight(FontWeight::BOLD)
-                    .color(UI_TEXT),
-                FlexSpacer::Flex(1.0),
-                icon_button(Icon::X, false, DesktopReader::close_overlay),
-            ))
-            .cross_axis_alignment(CrossAxisAlignment::Center)
-            .padding(Padding::from_vh(10.0, 16.0)),
+            settings_dialog_header(title),
             divider(),
             body.flex(1.0),
             divider(),
@@ -3318,12 +4021,30 @@ fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + u
                 .gap(8.px())
                 .cross_axis_alignment(CrossAxisAlignment::Center),
             )
-            .height(56.px())
+            .height(DIALOG_FOOTER_HEIGHT.px())
             .expand_width()
-            .padding(Padding::horizontal(16.0)),
+            .padding(Padding::horizontal(CONTENT_PADDING_HORIZONTAL)),
         ))
+        .must_fill_major_axis(true)
         .flex(1.0),
     ))
+}
+
+fn settings_dialog_header(title: &'static str) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        flex_row((
+            label(title)
+                .font(UI_FONT_STACK)
+                .text_size(15.0)
+                .weight(FontWeight::BOLD)
+                .color(UI_TEXT),
+            FlexSpacer::Flex(1.0),
+            icon_button(Icon::X, false, DesktopReader::close_overlay),
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(DIALOG_HEADER_HEIGHT.px())
+    .padding(Padding::horizontal(CONTENT_PADDING_HORIZONTAL))
 }
 
 fn settings_tab_button(
@@ -3363,10 +4084,10 @@ fn settings_tab_button(
             Color::TRANSPARENT
         })
         .hovered_border_color(UI_BORDER)
-        .corner_radius(8.0)
-        .padding(Padding::horizontal(12.0)),
+        .corner_radius(RADIUS_SMALL)
+        .padding(Padding::horizontal(10.0)),
     )
-    .height(38.px())
+    .height(CONTROL_HEIGHT.px())
     .expand_width()
 }
 
@@ -3384,11 +4105,14 @@ fn reading_settings_content(spread: SpreadMode) -> impl WidgetView<DesktopReader
         )))
         .background_color(UI_SURFACE)
         .border(UI_BORDER, 1.0)
-        .corner_radius(12.0),
+        .corner_radius(RADIUS_MEDIUM),
     ))
-    .gap(10.px())
+    .gap(CONTENT_GAP.px())
     .cross_axis_alignment(CrossAxisAlignment::Fill)
-    .padding(Padding::from_vh(18.0, 20.0))
+    .padding(Padding::from_vh(
+        CONTENT_PADDING_VERTICAL,
+        CONTENT_PADDING_HORIZONTAL,
+    ))
 }
 
 fn font_settings_content(typography: &ReaderTypography) -> impl WidgetView<DesktopReader> + use<> {
@@ -3417,7 +4141,7 @@ fn font_settings_content(typography: &ReaderTypography) -> impl WidgetView<Deskt
             .cross_axis_alignment(CrossAxisAlignment::Fill)
             .background_color(UI_SURFACE)
             .border(UI_BORDER, 1.0)
-            .corner_radius(12.0),
+            .corner_radius(RADIUS_MEDIUM),
             settings_section_label("字型"),
             flex_col((
                 font_family_settings_row(
@@ -3441,7 +4165,7 @@ fn font_settings_content(typography: &ReaderTypography) -> impl WidgetView<Deskt
             .cross_axis_alignment(CrossAxisAlignment::Fill)
             .background_color(UI_SURFACE)
             .border(UI_BORDER, 1.0)
-            .corner_radius(12.0),
+            .corner_radius(RADIUS_MEDIUM),
             sized_box(
                 flex_col((
                     label("字体预览")
@@ -3459,12 +4183,15 @@ fn font_settings_content(typography: &ReaderTypography) -> impl WidgetView<Deskt
             )
             .background_color(UI_SURFACE_MUTED)
             .border(UI_BORDER, 1.0)
-            .corner_radius(12.0)
-            .padding(Padding::from_vh(12.0, 14.0)),
+            .corner_radius(RADIUS_MEDIUM)
+            .padding(Padding::from_vh(10.0, 12.0)),
         ))
-        .gap(10.px())
+        .gap(CONTENT_GAP.px())
         .cross_axis_alignment(CrossAxisAlignment::Fill)
-        .padding(Padding::from_vh(14.0, 20.0)),
+        .padding(Padding::from_vh(
+            CONTENT_PADDING_VERTICAL,
+            CONTENT_PADDING_HORIZONTAL,
+        )),
     )
 }
 
@@ -3526,7 +4253,7 @@ fn typography_metrics_card(
     .cross_axis_alignment(CrossAxisAlignment::Fill)
     .background_color(UI_SURFACE)
     .border(UI_BORDER, 1.0)
-    .corner_radius(12.0)
+    .corner_radius(RADIUS_MEDIUM)
 }
 
 fn settings_section_label(text: &'static str) -> impl WidgetView<DesktopReader> {
@@ -3563,7 +4290,7 @@ fn typography_stepper_row(
         .gap(5.px())
         .cross_axis_alignment(CrossAxisAlignment::Center),
     )
-    .height(48.px())
+    .height(SETTINGS_ROW_HEIGHT.px())
     .expand_width()
     .padding(Padding::horizontal(12.0))
 }
@@ -3578,11 +4305,11 @@ fn stepper_button(
             .active_background_color(UI_ACCENT_SOFT)
             .border_color(UI_BORDER)
             .hovered_border_color(UI_ACCENT_BORDER)
-            .corner_radius(7.0)
+            .corner_radius(RADIUS_SMALL)
             .padding(0.0),
     )
-    .width(28.px())
-    .height(28.px())
+    .width(CONTROL_HEIGHT_COMPACT.px())
+    .height(CONTROL_HEIGHT_COMPACT.px())
 }
 
 fn default_font_row(selected: ReaderDefaultFont) -> impl WidgetView<DesktopReader> {
@@ -3599,7 +4326,7 @@ fn default_font_row(selected: ReaderDefaultFont) -> impl WidgetView<DesktopReade
         .gap(6.px())
         .cross_axis_alignment(CrossAxisAlignment::Center),
     )
-    .height(48.px())
+    .height(SETTINGS_ROW_HEIGHT.px())
     .expand_width()
     .padding(Padding::horizontal(12.0))
 }
@@ -3627,10 +4354,10 @@ fn default_font_choice(
         .active_background_color(UI_ACCENT_SOFT)
         .border_color(if active { UI_ACCENT_BORDER } else { UI_BORDER })
         .hovered_border_color(UI_ACCENT_BORDER)
-        .corner_radius(8.0)
+        .corner_radius(RADIUS_SMALL)
         .padding(Padding::from_vh(5.0, 9.0)),
     )
-    .height(30.px())
+    .height(CONTROL_HEIGHT_COMPACT.px())
 }
 
 fn font_family_settings_row(
@@ -3664,7 +4391,7 @@ fn font_family_settings_row(
         .border_width(0.0)
         .padding(Padding::horizontal(12.0)),
     )
-    .height(48.px())
+    .height(SETTINGS_ROW_HEIGHT.px())
     .expand_width()
 }
 
@@ -3701,16 +4428,19 @@ fn font_picker_content(
                 .border_width(0.0)
                 .padding(Padding::from_vh(6.0, 8.0)),
             )
-            .height(34.px()),
+            .height(CONTROL_HEIGHT.px()),
             flex_col(rows)
                 .cross_axis_alignment(CrossAxisAlignment::Fill)
                 .background_color(UI_SURFACE)
                 .border(UI_BORDER, 1.0)
-                .corner_radius(12.0),
+                .corner_radius(RADIUS_MEDIUM),
         ))
-        .gap(10.px())
+        .gap(CONTENT_GAP.px())
         .cross_axis_alignment(CrossAxisAlignment::Fill)
-        .padding(Padding::from_vh(14.0, 20.0)),
+        .padding(Padding::from_vh(
+            CONTENT_PADDING_VERTICAL,
+            CONTENT_PADDING_HORIZONTAL,
+        )),
     )
 }
 
@@ -3861,15 +4591,518 @@ fn ui_font_stack(source: String) -> FontStack<'static> {
 }
 
 #[derive(Clone, Copy)]
-enum PluginSettingField {
-    BaseUrl,
-    ApiKey,
-    ChatModel,
-    TranslationModel,
+enum AiSettingField {
+    ProviderName(usize),
+    ProviderBaseUrl(usize),
+    ProviderApiKey(usize),
+    ProviderModel {
+        provider_index: usize,
+        model_index: usize,
+    },
     TargetLanguage,
 }
 
-fn plugin_settings_content(settings: PluginSettings) -> impl WidgetView<DesktopReader> + use<> {
+#[derive(Clone, Copy)]
+enum AiFeature {
+    Chat,
+    Translation,
+}
+
+fn ai_settings_content(settings: PluginSettings) -> impl WidgetView<DesktopReader> + use<> {
+    let provider_count = settings.providers.len();
+    let provider_cards = settings
+        .providers
+        .into_iter()
+        .enumerate()
+        .map(|(index, provider)| ai_provider_card(index, provider, provider_count > 1))
+        .collect::<Vec<_>>();
+    portal(
+        flex_col((
+            settings_section_label("Providers"),
+            flex_col(provider_cards)
+                .gap(CONTENT_GAP.px())
+                .cross_axis_alignment(CrossAxisAlignment::Fill),
+            secondary_action_button("新增 Provider", |state: &mut DesktopReader| {
+                state.ui.draft_plugin_settings.add_provider();
+            }),
+            prose(
+                "每个 Provider 可以维护多个模型。API Key 只保存在当前运行内存中，不会写入 plugins.json；默认 Provider 也可以通过 REBOOK_AI_API_KEY 环境变量提供密钥。",
+            )
+            .text_size(10.5)
+            .text_color(UI_MUTED),
+        ))
+        .gap(CONTENT_GAP.px())
+        .cross_axis_alignment(CrossAxisAlignment::Fill)
+        .padding(Padding::from_vh(
+            CONTENT_PADDING_VERTICAL,
+            CONTENT_PADDING_HORIZONTAL,
+        )),
+    )
+}
+
+fn ai_provider_card(
+    index: usize,
+    provider: AiProvider,
+    can_remove_provider: bool,
+) -> impl WidgetView<DesktopReader> {
+    let AiProvider {
+        name,
+        base_url,
+        models,
+        api_key,
+        ..
+    } = provider;
+    let title = if name.trim().is_empty() {
+        format!("Provider {}", index + 1)
+    } else {
+        name.clone()
+    };
+    let model_count = models.len();
+    let model_rows = models
+        .into_iter()
+        .enumerate()
+        .map(|(model_index, model)| {
+            ai_provider_model_row(index, model_index, model, model_count > 1)
+        })
+        .collect::<Vec<_>>();
+    let remove_provider: Box<AnyWidgetView<DesktopReader>> = if can_remove_provider {
+        icon_button(Icon::Trash2, false, move |state: &mut DesktopReader| {
+            state.ui.draft_plugin_settings.remove_provider(index);
+        })
+        .boxed()
+    } else {
+        sized_box(label("")).width(32.px()).height(32.px()).boxed()
+    };
+
+    flex_col((
+        flex_row((
+            icon_label(Icon::Bot, 16.0, UI_ACCENT),
+            label(title)
+                .font(UI_FONT_STACK)
+                .text_size(12.5)
+                .weight(FontWeight::BOLD)
+                .color(UI_TEXT),
+            FlexSpacer::Flex(1.0),
+            remove_provider,
+        ))
+        .gap(8.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center)
+        .padding(Padding::from_vh(7.0, 10.0)),
+        divider(),
+        ai_settings_input_row(
+            "名称",
+            name,
+            "例如 OpenAI、Ollama",
+            AiSettingField::ProviderName(index),
+        ),
+        divider(),
+        ai_settings_input_row(
+            "API 地址",
+            base_url,
+            "https://api.openai.com/v1",
+            AiSettingField::ProviderBaseUrl(index),
+        ),
+        divider(),
+        ai_settings_input_row(
+            "API Key（仅本次会话）",
+            api_key,
+            "sk-…",
+            AiSettingField::ProviderApiKey(index),
+        ),
+        divider(),
+        flex_col((
+            label("模型")
+                .font(UI_FONT_STACK)
+                .text_size(11.5)
+                .weight(FontWeight::BOLD)
+                .color(UI_MUTED),
+            flex_col(model_rows).cross_axis_alignment(CrossAxisAlignment::Fill),
+            secondary_action_button("新增模型", move |state: &mut DesktopReader| {
+                if let Some(provider) = state.ui.draft_plugin_settings.providers.get_mut(index) {
+                    provider.models.push(String::new());
+                }
+            }),
+        ))
+        .gap(6.px())
+        .cross_axis_alignment(CrossAxisAlignment::Fill)
+        .padding(Padding::from_vh(8.0, 10.0)),
+    ))
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+    .background_color(UI_SURFACE)
+    .border(UI_BORDER, 1.0)
+    .corner_radius(RADIUS_MEDIUM)
+}
+
+fn ai_provider_model_row(
+    provider_index: usize,
+    model_index: usize,
+    value: String,
+    can_remove: bool,
+) -> impl WidgetView<DesktopReader> {
+    let remove: Box<AnyWidgetView<DesktopReader>> = if can_remove {
+        icon_button(Icon::X, false, move |state: &mut DesktopReader| {
+            state
+                .ui
+                .draft_plugin_settings
+                .remove_model(provider_index, model_index);
+        })
+        .boxed()
+    } else {
+        sized_box(label("")).width(32.px()).height(32.px()).boxed()
+    };
+    sized_box(
+        flex_row((
+            label(format!("模型 {}", model_index + 1))
+                .font(UI_FONT_STACK)
+                .text_size(11.5)
+                .color(UI_TEXT_SOFT),
+            FlexSpacer::Flex(1.0),
+            sized_box(
+                text_input(value, move |state: &mut DesktopReader, value| {
+                    set_ai_setting(
+                        state,
+                        AiSettingField::ProviderModel {
+                            provider_index,
+                            model_index,
+                        },
+                        value,
+                    );
+                })
+                .placeholder("模型 ID，例如 gpt-4o-mini")
+                .text_color(UI_TEXT)
+                .caret_color(UI_ACCENT)
+                .background_color(UI_SURFACE_MUTED)
+                .border_color(UI_BORDER)
+                .border_width(1.0)
+                .corner_radius(RADIUS_SMALL)
+                .padding(Padding::from_vh(4.0, 8.0)),
+            )
+            .width(250.px())
+            .height(CONTROL_HEIGHT.px()),
+            remove,
+        ))
+        .gap(6.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(SETTINGS_ROW_HEIGHT.px())
+    .expand_width()
+}
+
+fn ai_settings_input_row(
+    label_text: &'static str,
+    value: String,
+    placeholder: &'static str,
+    field: AiSettingField,
+) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        flex_row((
+            label(label_text)
+                .font(UI_FONT_STACK)
+                .text_size(12.0)
+                .color(UI_TEXT_SOFT),
+            FlexSpacer::Flex(1.0),
+            sized_box(
+                text_input(value, move |state: &mut DesktopReader, value| {
+                    set_ai_setting(state, field, value);
+                })
+                .placeholder(placeholder)
+                .text_color(UI_TEXT)
+                .caret_color(UI_ACCENT)
+                .background_color(UI_SURFACE_MUTED)
+                .border_color(UI_BORDER)
+                .border_width(1.0)
+                .corner_radius(RADIUS_SMALL)
+                .padding(Padding::from_vh(4.0, 8.0)),
+            )
+            .width(276.px())
+            .height(CONTROL_HEIGHT.px()),
+        ))
+        .gap(10.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(SETTINGS_ROW_HEIGHT.px())
+    .expand_width()
+    .padding(Padding::horizontal(10.0))
+}
+
+fn set_ai_setting(state: &mut DesktopReader, field: AiSettingField, value: String) {
+    match field {
+        AiSettingField::ProviderName(index) => {
+            if let Some(provider) = state.ui.draft_plugin_settings.providers.get_mut(index) {
+                provider.name = value;
+            }
+        }
+        AiSettingField::ProviderBaseUrl(index) => {
+            if let Some(provider) = state.ui.draft_plugin_settings.providers.get_mut(index) {
+                provider.base_url = value;
+            }
+        }
+        AiSettingField::ProviderApiKey(index) => {
+            if let Some(provider) = state.ui.draft_plugin_settings.providers.get_mut(index) {
+                provider.api_key = value;
+            }
+        }
+        AiSettingField::ProviderModel {
+            provider_index,
+            model_index,
+        } => {
+            let updated = state
+                .ui
+                .draft_plugin_settings
+                .providers
+                .get_mut(provider_index)
+                .and_then(|provider| {
+                    let provider_id = provider.id.clone();
+                    let model = provider.models.get_mut(model_index)?;
+                    let previous = std::mem::replace(model, value.clone());
+                    Some((provider_id, previous))
+                });
+            if let Some((provider_id, previous)) = updated {
+                if state.ui.draft_plugin_settings.chat_provider == provider_id
+                    && state.ui.draft_plugin_settings.chat_model == previous
+                {
+                    state.ui.draft_plugin_settings.chat_model.clone_from(&value);
+                }
+                if state.ui.draft_plugin_settings.translation_provider == provider_id
+                    && state.ui.draft_plugin_settings.translation_model == previous
+                {
+                    state
+                        .ui
+                        .draft_plugin_settings
+                        .translation_model
+                        .clone_from(&value);
+                }
+            }
+        }
+        AiSettingField::TargetLanguage => {
+            state.ui.draft_plugin_settings.target_language = value;
+        }
+    }
+}
+
+fn ai_chat_settings_content(settings: &PluginSettings) -> impl WidgetView<DesktopReader> + use<> {
+    portal(
+        flex_col((
+            settings_section_label("AI Chat 模型"),
+            ai_model_choices(settings, AiFeature::Chat),
+            prose("AI Chat 会使用这里选中的 Provider 和模型进行书籍问答、检索与解释。")
+                .text_size(10.5)
+                .text_color(UI_MUTED),
+        ))
+        .gap(CONTENT_GAP.px())
+        .cross_axis_alignment(CrossAxisAlignment::Fill)
+        .padding(Padding::from_vh(
+            CONTENT_PADDING_VERTICAL,
+            CONTENT_PADDING_HORIZONTAL,
+        )),
+    )
+}
+
+fn translation_settings_content(
+    settings: &PluginSettings,
+) -> impl WidgetView<DesktopReader> + use<> {
+    let target_language = settings.target_language.clone();
+    let translation_mode = settings.translation_mode;
+    portal(
+        flex_col((
+            settings_section_label("翻译模型"),
+            ai_model_choices(settings, AiFeature::Translation),
+            settings_section_label("输出"),
+            flex_col((
+                ai_settings_input_row(
+                    "目标语言",
+                    target_language,
+                    "简体中文",
+                    AiSettingField::TargetLanguage,
+                ),
+                divider(),
+                translation_mode_settings_row(translation_mode),
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .background_color(UI_SURFACE)
+            .border(UI_BORDER, 1.0)
+            .corner_radius(RADIUS_MEDIUM),
+            prose("点击阅读器顶部的翻译按钮后，会使用这里的模型、目标语言和显示方式翻译正文。")
+                .text_size(10.5)
+                .text_color(UI_MUTED),
+        ))
+        .gap(CONTENT_GAP.px())
+        .cross_axis_alignment(CrossAxisAlignment::Fill)
+        .padding(Padding::from_vh(
+            CONTENT_PADDING_VERTICAL,
+            CONTENT_PADDING_HORIZONTAL,
+        )),
+    )
+}
+
+fn translation_mode_settings_row(mode: TranslationMode) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        flex_row((
+            label("显示方式").text_size(13.0).color(UI_TEXT_SOFT),
+            FlexSpacer::Flex(1.0),
+            translation_mode_choice("替换", TranslationMode::Replace, mode),
+            translation_mode_choice("双行翻译", TranslationMode::Bilingual, mode),
+        ))
+        .gap(6.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(SETTINGS_ROW_HEIGHT.px())
+    .expand_width()
+    .padding(Padding::horizontal(12.0))
+}
+
+fn translation_mode_choice(
+    text: &'static str,
+    value: TranslationMode,
+    selected: TranslationMode,
+) -> impl WidgetView<DesktopReader> {
+    let active = value == selected;
+    sized_box(
+        button(
+            label(text)
+                .text_size(12.0)
+                .weight(if active {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
+            move |state: &mut DesktopReader| {
+                state.ui.draft_plugin_settings.translation_mode = value;
+            },
+        )
+        .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
+        .active_background_color(UI_ACCENT_SOFT)
+        .border_color(if active { UI_ACCENT_BORDER } else { UI_BORDER })
+        .hovered_border_color(UI_ACCENT_BORDER)
+        .corner_radius(RADIUS_SMALL)
+        .padding(Padding::from_vh(5.0, 9.0)),
+    )
+    .height(CONTROL_HEIGHT.px())
+}
+
+fn ai_model_choices(
+    settings: &PluginSettings,
+    feature: AiFeature,
+) -> Box<AnyWidgetView<DesktopReader>> {
+    let choices = settings
+        .providers
+        .iter()
+        .flat_map(|provider| {
+            provider.models.iter().filter_map(|model| {
+                let model = model.trim();
+                (!model.is_empty()).then(|| {
+                    ai_model_choice_button(
+                        provider.id.clone(),
+                        &provider.name,
+                        model.to_owned(),
+                        feature,
+                        match feature {
+                            AiFeature::Chat => {
+                                settings.chat_provider == provider.id
+                                    && settings.chat_model.trim() == model
+                            }
+                            AiFeature::Translation => {
+                                settings.translation_provider == provider.id
+                                    && settings.translation_model.trim() == model
+                            }
+                        },
+                    )
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    if choices.is_empty() {
+        sized_box(
+            label("请先在 AI 页面为 Provider 添加模型")
+                .font(UI_FONT_STACK)
+                .text_size(12.0)
+                .color(UI_MUTED),
+        )
+        .height(SETTINGS_ROW_HEIGHT.px())
+        .expand_width()
+        .background_color(UI_SURFACE)
+        .border(UI_BORDER, 1.0)
+        .corner_radius(RADIUS_MEDIUM)
+        .padding(Padding::horizontal(12.0))
+        .boxed()
+    } else {
+        flex_col(choices)
+            .gap(6.px())
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .boxed()
+    }
+}
+
+fn ai_model_choice_button(
+    provider_id: String,
+    provider_name: &str,
+    model: String,
+    feature: AiFeature,
+    active: bool,
+) -> impl WidgetView<DesktopReader> {
+    let display = format!(
+        "{}  /  {}",
+        if provider_name.trim().is_empty() {
+            "Provider"
+        } else {
+            provider_name.trim()
+        },
+        model
+    );
+    sized_box(
+        button(
+            flex_row((
+                label(display)
+                    .font(UI_FONT_STACK)
+                    .text_size(12.0)
+                    .weight(if active {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
+                FlexSpacer::Flex(1.0),
+                label(if active { "已选择" } else { "选择" })
+                    .font(UI_FONT_STACK)
+                    .text_size(10.5)
+                    .color(if active { UI_ACCENT } else { UI_MUTED }),
+            )),
+            move |state: &mut DesktopReader| match feature {
+                AiFeature::Chat => {
+                    state
+                        .ui
+                        .draft_plugin_settings
+                        .chat_provider
+                        .clone_from(&provider_id);
+                    state.ui.draft_plugin_settings.chat_model.clone_from(&model);
+                }
+                AiFeature::Translation => {
+                    state
+                        .ui
+                        .draft_plugin_settings
+                        .translation_provider
+                        .clone_from(&provider_id);
+                    state
+                        .ui
+                        .draft_plugin_settings
+                        .translation_model
+                        .clone_from(&model);
+                }
+            },
+        )
+        .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
+        .active_background_color(UI_ACCENT_SOFT)
+        .border_color(if active { UI_ACCENT_BORDER } else { UI_BORDER })
+        .hovered_border_color(UI_ACCENT_BORDER)
+        .corner_radius(RADIUS_MEDIUM)
+        .padding(Padding::horizontal(12.0)),
+    )
+    .height(40.px())
+    .expand_width()
+}
+
+fn plugin_settings_content() -> impl WidgetView<DesktopReader> + use<> {
     let plugin_cards = BUILTIN_PLUGINS
         .into_iter()
         .map(|plugin| {
@@ -3907,110 +5140,15 @@ fn plugin_settings_content(settings: PluginSettings) -> impl WidgetView<DesktopR
                 .cross_axis_alignment(CrossAxisAlignment::Fill)
                 .background_color(UI_SURFACE)
                 .border(UI_BORDER, 1.0)
-                .corner_radius(12.0),
-            label("OpenAI 兼容服务")
-                .font(UI_FONT_STACK)
-                .text_size(12.0)
-                .weight(FontWeight::BOLD)
-                .color(UI_MUTED),
-            flex_col((
-                plugin_settings_input_row(
-                    "API 地址",
-                    settings.base_url,
-                    "https://api.openai.com/v1",
-                    PluginSettingField::BaseUrl,
-                ),
-                divider(),
-                plugin_settings_input_row(
-                    "API Key（仅本次会话）",
-                    settings.api_key,
-                    "sk-… 或 REBOOK_AI_API_KEY",
-                    PluginSettingField::ApiKey,
-                ),
-                divider(),
-                plugin_settings_input_row(
-                    "对话模型",
-                    settings.chat_model,
-                    "gpt-4o-mini",
-                    PluginSettingField::ChatModel,
-                ),
-                divider(),
-                plugin_settings_input_row(
-                    "翻译模型",
-                    settings.translation_model,
-                    "gpt-4o-mini",
-                    PluginSettingField::TranslationModel,
-                ),
-                divider(),
-                plugin_settings_input_row(
-                    "目标语言",
-                    settings.target_language,
-                    "简体中文",
-                    PluginSettingField::TargetLanguage,
-                ),
-            ))
-            .cross_axis_alignment(CrossAxisAlignment::Fill)
-            .background_color(UI_SURFACE)
-            .border(UI_BORDER, 1.0)
-            .corner_radius(12.0),
-            prose("API Key 只保存在当前运行内存中，不会写入 plugins.json；也可以通过 REBOOK_AI_API_KEY 环境变量提供。")
-                .text_size(10.5)
-                .text_color(UI_MUTED),
+                .corner_radius(RADIUS_MEDIUM),
         ))
-        .gap(10.px())
+        .gap(CONTENT_GAP.px())
         .cross_axis_alignment(CrossAxisAlignment::Fill)
-        .padding(Padding::from_vh(14.0, 20.0)),
+        .padding(Padding::from_vh(
+            CONTENT_PADDING_VERTICAL,
+            CONTENT_PADDING_HORIZONTAL,
+        )),
     )
-}
-
-fn plugin_settings_input_row(
-    label_text: &'static str,
-    value: String,
-    placeholder: &'static str,
-    field: PluginSettingField,
-) -> impl WidgetView<DesktopReader> {
-    sized_box(
-        flex_row((
-            label(label_text)
-                .font(UI_FONT_STACK)
-                .text_size(12.0)
-                .color(UI_TEXT_SOFT),
-            FlexSpacer::Flex(1.0),
-            sized_box(
-                text_input(value, move |state: &mut DesktopReader, value| match field {
-                    PluginSettingField::BaseUrl => {
-                        state.ui.draft_plugin_settings.base_url = value;
-                    }
-                    PluginSettingField::ApiKey => {
-                        state.ui.draft_plugin_settings.api_key = value;
-                    }
-                    PluginSettingField::ChatModel => {
-                        state.ui.draft_plugin_settings.chat_model = value;
-                    }
-                    PluginSettingField::TranslationModel => {
-                        state.ui.draft_plugin_settings.translation_model = value;
-                    }
-                    PluginSettingField::TargetLanguage => {
-                        state.ui.draft_plugin_settings.target_language = value;
-                    }
-                })
-                .placeholder(placeholder)
-                .text_color(UI_TEXT)
-                .background_color(UI_SURFACE_MUTED)
-                .border_color(UI_BORDER)
-                .border_width(1.0)
-                .corner_radius(7.0)
-                .padding(Padding::horizontal(8.0)),
-            )
-            .width(250.px())
-            .height(34.px()),
-        ))
-        .gap(10.px())
-        .cross_axis_alignment(CrossAxisAlignment::Center),
-    )
-    .height(48.px())
-    .expand_width()
-    .padding(Padding::horizontal(12.0))
 }
 
 fn settings_value_row(name: &'static str, value: &'static str) -> impl WidgetView<DesktopReader> {
@@ -4022,9 +5160,9 @@ fn settings_value_row(name: &'static str, value: &'static str) -> impl WidgetVie
         ))
         .cross_axis_alignment(CrossAxisAlignment::Center),
     )
-    .height(64.px())
+    .height(SETTINGS_ROW_HEIGHT.px())
     .expand_width()
-    .padding(Padding::horizontal(16.0))
+    .padding(Padding::horizontal(12.0))
 }
 
 fn spread_settings_row(spread: SpreadMode) -> impl WidgetView<DesktopReader> {
@@ -4038,9 +5176,9 @@ fn spread_settings_row(spread: SpreadMode) -> impl WidgetView<DesktopReader> {
         .gap(6.px())
         .cross_axis_alignment(CrossAxisAlignment::Center),
     )
-    .height(64.px())
+    .height(SETTINGS_ROW_HEIGHT.px())
     .expand_width()
-    .padding(Padding::horizontal(16.0))
+    .padding(Padding::horizontal(12.0))
 }
 
 fn spread_choice(
@@ -4065,20 +5203,20 @@ fn spread_choice(
         .active_background_color(UI_ACCENT_SOFT)
         .border_color(if active { UI_ACCENT_BORDER } else { UI_BORDER })
         .hovered_border_color(UI_ACCENT_BORDER)
-        .corner_radius(8.0)
-        .padding(Padding::from_vh(6.0, 10.0)),
+        .corner_radius(RADIUS_SMALL)
+        .padding(Padding::from_vh(5.0, 9.0)),
     )
-    .width(62.px())
-    .height(34.px())
+    .width(58.px())
+    .height(CONTROL_HEIGHT.px())
 }
 
 fn value_badge(text: &'static str) -> impl WidgetView<DesktopReader> {
     sized_box(label(text).text_size(12.0).color(UI_TEXT_SOFT))
-        .height(34.px())
+        .height(CONTROL_HEIGHT.px())
         .background_color(UI_SURFACE)
         .border(UI_BORDER, 1.0)
-        .corner_radius(8.0)
-        .padding(Padding::from_vh(7.0, 12.0))
+        .corner_radius(RADIUS_SMALL)
+        .padding(Padding::from_vh(5.0, 10.0))
 }
 
 fn primary_action_button(
@@ -4096,10 +5234,10 @@ fn primary_action_button(
         .background_color(UI_ACCENT)
         .active_background_color(UI_TEXT)
         .border_color(UI_ACCENT)
-        .corner_radius(8.0)
-        .padding(Padding::from_vh(7.0, 14.0)),
+        .corner_radius(RADIUS_SMALL)
+        .padding(Padding::from_vh(5.0, 12.0)),
     )
-    .height(36.px())
+    .height(CONTROL_HEIGHT.px())
 }
 
 fn secondary_action_button(
@@ -4112,10 +5250,10 @@ fn secondary_action_button(
             .active_background_color(UI_SURFACE_MUTED)
             .border_color(UI_SURFACE)
             .hovered_border_color(UI_BORDER)
-            .corner_radius(8.0)
-            .padding(Padding::from_vh(7.0, 12.0)),
+            .corner_radius(RADIUS_SMALL)
+            .padding(Padding::from_vh(5.0, 10.0)),
     )
-    .height(36.px())
+    .height(CONTROL_HEIGHT.px())
 }
 
 fn animated_scrim(
@@ -4320,7 +5458,6 @@ mod tests {
             title: "系统之美".into(),
             authors: vec!["Donella Meadows".into()],
             file_name: "thinking-in-systems.epub".into(),
-            format: BookFormat::Epub,
             path: PathBuf::from("book.epub"),
             cover_bytes: None,
             added_at: 0,
@@ -4343,5 +5480,90 @@ mod tests {
             ellipsize_shelf_title("A very long English book title"),
             "A very long Engl…"
         );
+    }
+
+    #[test]
+    fn sidebar_titles_wrap_to_at_most_two_ellipsized_lines() {
+        let short = wrap_display_text("Short title", 20, 2);
+        assert_eq!(short, "Short title");
+
+        let long = wrap_display_text(
+            "A very long English book title that should not overflow the sidebar",
+            20,
+            2,
+        );
+        assert_eq!(long.lines().count(), 2);
+        assert!(long.ends_with('…'));
+        assert!(
+            long.lines()
+                .all(|line| { line.chars().map(shelf_title_character_units).sum::<usize>() <= 20 })
+        );
+    }
+
+    #[test]
+    fn shelf_columns_fill_the_available_width_before_wrapping() {
+        assert_eq!(shelf_column_count(SHELF_CARD_WIDTH), 1);
+        assert_eq!(
+            shelf_column_count(SHELF_CARD_WIDTH * 4.0 + SHELF_CARD_GAP * 3.0),
+            4
+        );
+        assert_eq!(
+            shelf_column_count(SHELF_CARD_WIDTH * 6.0 + SHELF_CARD_GAP * 5.0),
+            6
+        );
+    }
+
+    #[test]
+    fn shelf_metadata_overrides_a_hash_based_parser_title() {
+        let shelf_metadata = BookDisplayMetadata {
+            title: "情景学习".into(),
+            authors: Vec::new(),
+        };
+
+        let resolved = resolve_book_display_metadata(
+            Some(shelf_metadata.clone()),
+            "21f76642e79935732871e58d99d4e7eb4e890a8ae1ed93f859097b655a37e434",
+            &[],
+        );
+
+        assert_eq!(resolved, shelf_metadata);
+    }
+
+    #[test]
+    fn parsed_metadata_remains_the_fallback_for_external_files() {
+        let authors = vec!["作者".to_owned()];
+        let resolved = resolve_book_display_metadata(None, "外部文件", &authors);
+
+        assert_eq!(resolved.title, "外部文件");
+        assert_eq!(resolved.authors, authors);
+    }
+
+    #[test]
+    fn translation_error_notice_auto_dismisses_after_three_seconds() {
+        let now = Instant::now();
+        let mut translation = TranslationUiState::default();
+        translation.show_error("测试错误".into(), now);
+
+        assert_eq!(
+            translation.dismiss_at,
+            Some(now + NOTICE_AUTO_DISMISS_DELAY)
+        );
+        assert!(!translation.dismiss_if_due(now + NOTICE_AUTO_DISMISS_DELAY / 2));
+        assert_eq!(translation.error.as_deref(), Some("测试错误"));
+
+        assert!(translation.dismiss_if_due(now + NOTICE_AUTO_DISMISS_DELAY));
+        assert!(translation.error.is_none());
+        assert!(translation.dismiss_at.is_none());
+    }
+
+    #[test]
+    fn manually_dismissing_translation_notice_cancels_auto_dismiss() {
+        let mut translation = TranslationUiState::default();
+        translation.show_error("测试错误".into(), Instant::now());
+
+        translation.clear_error();
+
+        assert!(translation.error.is_none());
+        assert!(translation.dismiss_at.is_none());
     }
 }

@@ -404,12 +404,20 @@ impl LayoutEngine {
                         paginator.push_text(&prepared, block)?;
                     }
                     Block::Image(image) => {
-                        let resource = source.resource(&image.href)?;
-                        let decoded = image::load_from_memory(&resource.bytes)?.to_rgba8();
-                        let raster = RasterImage {
-                            width: decoded.width(),
-                            height: decoded.height(),
-                            pixels: decoded.into_raw().into(),
+                        let raster = if let Some(raster) = source.raster_resource(&image.href)? {
+                            RasterImage {
+                                width: raster.width,
+                                height: raster.height,
+                                pixels: raster.pixels,
+                            }
+                        } else {
+                            let resource = source.resource(&image.href)?;
+                            let decoded = image::load_from_memory(&resource.bytes)?.to_rgba8();
+                            RasterImage {
+                                width: decoded.width(),
+                                height: decoded.height(),
+                                pixels: decoded.into_raw().into(),
+                            }
                         };
                         paginator.push_image(
                             raster,

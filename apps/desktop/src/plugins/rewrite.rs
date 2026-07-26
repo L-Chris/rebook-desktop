@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use rebook_publication::{
-    Block, Book, BookSource, Inline, PublicationError, PublicationUrl, Resource, Section, TextRun,
-    TextStyle,
+    Block, Book, BookSource, Inline, PublicationError, PublicationUrl, RasterResource, Resource,
+    Section, TextRun, TextStyle,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +124,13 @@ impl BookSource for RewriteBookSource {
 
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
         self.inner.resource(href)
+    }
+
+    fn raster_resource(
+        &self,
+        href: &PublicationUrl,
+    ) -> Result<Option<RasterResource>, PublicationError> {
+        self.inner.raster_resource(href)
     }
 }
 

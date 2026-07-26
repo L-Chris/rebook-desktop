@@ -11,8 +11,8 @@ use rebook_layout::{
     LayoutEngine, LayoutError, LayoutViewport, PageItem, ReaderFontBlob, ReaderStyle,
 };
 use rebook_publication::{
-    Block, Book, BookSource, Inline, PublicationError, PublicationUrl, Section, SourceAnchor,
-    SourceRange, TextBlock, TextRun, TocEntry,
+    Block, Book, BookSource, Inline, LocatorV1, PublicationError, PublicationUrl, Section,
+    SourceAnchor, SourceRange, TextBlock, TextRun, TocEntry,
 };
 use rebook_renderer::{DisplayListCompiler, PageDisplayList, PageTextHit};
 use thiserror::Error;
@@ -505,6 +505,100 @@ impl ReaderSession {
         }
     }
 
+    /// Captures a durable, versioned locator for the first visible content.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn current_locator(&self) -> LocatorV1 {
+        let location = self.location();
+        let segment_count = location.segment_count.max(1);
+        let page_progression = if location.page_count <= 1 {
+            0.0
+        } else {
+            location.page_index as f64 / (location.page_count - 1) as f64
+        };
+        let progression = (location.segment_index as f64 + page_progression) / segment_count as f64;
+        let section = &self.source.book().sections[location.section_index];
+        LocatorV1 {
+            version: LocatorV1::VERSION,
+            publication_id: self.source.book().id.clone(),
+            href: section.href.clone(),
+            progression: Some(progression.clamp(0.0, 1.0)),
+            total_progression: Some(self.snapshot().total_progression),
+            position: None,
+            source: self.current_page().leading_source_range(),
+            partial_cfi: None,
+            text: None,
+        }
+    }
+
+    /// Restores a durable locator, preferring source anchors over layout-relative
+    /// progression so typography and viewport changes do not move the reader.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    pub fn restore_locator(
+        &mut self,
+        locator: &LocatorV1,
+    ) -> Result<NavigationResult, ReaderError> {
+        locator.validate()?;
+        if locator.publication_id != self.source.book().id {
+            return Err(ReaderError::NavigationTargetNotFound(
+                locator.publication_id.to_string(),
+            ));
+        }
+        if let Some(source) = &locator.source
+            && let Ok(result) = self.go_to_source(&source.start)
+        {
+            return Ok(result);
+        }
+
+        let (section_index, progression) =
+            if let Some(index) = self.section_index_for_href(&locator.href) {
+                (index, locator.progression.unwrap_or(0.0))
+            } else if let Some(total) = locator.total_progression {
+                let section_count = self.source.book().sections.len();
+                let scaled = total.clamp(0.0, 1.0) * section_count as f64;
+                let index = (scaled.floor() as usize).min(section_count.saturating_sub(1));
+                (index, if total >= 1.0 { 1.0 } else { scaled.fract() })
+            } else {
+                return self.go_to_href(&locator.href);
+            };
+        let section = self.repository.load(section_index)?;
+        let segment_count = section.segments.len().max(1);
+        let scaled = progression.clamp(0.0, 1.0) * segment_count as f64;
+        let segment_index = if progression >= 1.0 {
+            segment_count - 1
+        } else {
+            (scaled.floor() as usize).min(segment_count - 1)
+        };
+        let key = SegmentKey {
+            section_index,
+            segment_index,
+        };
+        self.ensure_segment(key)?;
+        let page_count = self
+            .cache
+            .get(&key)
+            .map_or(1, |segment| segment.pages.len().max(1));
+        let within_segment = if progression >= 1.0 {
+            1.0
+        } else {
+            scaled.fract()
+        };
+        let page_index = if page_count <= 1 {
+            0
+        } else {
+            (within_segment * (page_count - 1) as f64).round() as usize
+        };
+        self.install_position(ReaderPosition {
+            section_index,
+            segment_index,
+            page_index,
+        });
+        Ok(self.moved())
+    }
+
     /// Returns the compiled display list for the current page.
     ///
     /// # Panics
@@ -839,7 +933,11 @@ impl ReaderSession {
         self.poll_prefetch()?;
         let section_count = self.source.book().sections.len();
         let segment_count = self.current_section_data().segments.len();
-        for distance in 1..=PREFETCH_DISTANCE {
+        // A double spread advances by two logical pages. Queue the whole next
+        // spread plus the normal lookahead so a turn never leaves its second
+        // page for synchronous layout on the UI thread.
+        let forward_distance = PREFETCH_DISTANCE + self.current_visible_pages().saturating_sub(1);
+        for distance in 1..=forward_distance {
             if let Some(segment_index) = self.current_segment.checked_add(distance)
                 && segment_index < segment_count
             {
@@ -1994,6 +2092,37 @@ mod tests {
     }
 
     #[test]
+    fn durable_locator_restores_after_viewport_repagination() {
+        let source = CountingSource::new(&["durable locator ".repeat(1_200)]);
+        let mut first =
+            ReaderSession::open(source.clone(), viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+        first
+            .go_to_source(&SourceAnchor {
+                spine: SpineItemId::new("section-0").unwrap(),
+                node: "paragraph-0".into(),
+                text_offset: 9_000,
+            })
+            .unwrap();
+        let locator = first.current_locator();
+        let source_anchor = locator.source.as_ref().unwrap().start.clone();
+
+        let mut restored =
+            ReaderSession::open(source, viewport(820, 620), ReaderStyle::default()).unwrap();
+        restored.restore_locator(&locator).unwrap();
+
+        assert!(
+            restored
+                .current_page()
+                .contains_source_anchor(&source_anchor)
+        );
+        assert_eq!(
+            restored.current_locator().publication_id,
+            locator.publication_id
+        );
+    }
+
+    #[test]
     fn oversized_text_block_is_split_into_stable_source_ranged_fragments() {
         let source = CountingSource::new(&["a".repeat(FRAGMENT_TEXT_BUDGET * 2 + 17)]);
         let mut section = source.sections[0].clone();
@@ -2255,6 +2384,33 @@ mod tests {
             NavigationOutcome::Moved
         );
         assert_eq!(reader.location().section_index, 0);
+    }
+
+    #[test]
+    fn double_spread_prefetches_every_page_needed_by_the_next_spread() {
+        let source = CountingSource::new(&[
+            "page one".into(),
+            "page two".into(),
+            "page three".into(),
+            "page four".into(),
+            "page five".into(),
+        ]);
+        let mut reader = ReaderSession::open(
+            source.clone(),
+            viewport(1_200, 700),
+            ReaderStyle {
+                spread: rebook_layout::SpreadMode::Double,
+                ..ReaderStyle::default()
+            },
+        )
+        .unwrap();
+
+        reader.prefetch_adjacent().unwrap();
+        reader.wait_for_prefetch().unwrap();
+
+        assert_eq!(source.parse_count(1), 1);
+        assert_eq!(source.parse_count(2), 1);
+        assert_eq!(source.parse_count(3), 1);
     }
 
     #[test]

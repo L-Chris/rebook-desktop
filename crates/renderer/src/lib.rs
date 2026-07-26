@@ -65,6 +65,16 @@ impl PageDisplayList {
             .and_then(TextRegion::visible_byte_range)
     }
 
+    /// Returns the first durable source range visible on this page.
+    ///
+    /// This is used as the primary reading-position anchor. Unlike page numbers,
+    /// the source range survives viewport, font, and pagination changes.
+    pub fn leading_source_range(&self) -> Option<SourceRange> {
+        self.text_regions
+            .iter()
+            .find_map(TextRegion::visible_source_range)
+    }
+
     /// Hit-tests source-backed text. Exact mode is used when a drag starts;
     /// nearest mode lets a drag extend naturally through line/column whitespace.
     pub fn hit_test_text(&self, x: f32, y: f32, exact: bool) -> Option<PageTextHit> {
@@ -231,6 +241,14 @@ impl TextRegion {
         match self {
             Self::Shaped(region) => region.visible_byte_range(),
             Self::Fixed(region) => region.visible_byte_range(),
+        }
+    }
+
+    fn visible_source_range(&self) -> Option<SourceRange> {
+        let visible = self.visible_byte_range()?;
+        match self {
+            Self::Shaped(region) => region.source_range_for_bytes(visible),
+            Self::Fixed(region) => region.source_range_for_bytes(visible),
         }
     }
 

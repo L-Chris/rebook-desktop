@@ -1,0 +1,75 @@
+name: Build Windows installer
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-installer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows-installer:
+    name: Build Windows MSI
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    env:
+      CARGO_WIX_VERSION: "0.3.9"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Validate tag and package version
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $tagVersion = $tag.TrimStart("v")
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object { $_.name -eq "rebook-desktop" }
+
+          if (-not $package) {
+            throw "Could not find the rebook-desktop package in Cargo metadata."
+          }
+
+          if ($tagVersion -ne $package.version) {
+            throw "Tag '$tag' does not match rebook-desktop version '$($package.version)'. Use a tag such as 'v$($package.version)'."
+          }
+
+          "REBOOK_VERSION=$($package.version)" >> $env:GITHUB_ENV
+          "version=$($package.version)" >> $env:GITHUB_OUTPUT
+
+      - name: Run tests
+        run: cargo test --locked --workspace
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version $env:CARGO_WIX_VERSION --locked
+
+      - name: Build MSI installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          cargo wix `
+            --package rebook-desktop `
+            --nocapture `
+            --output "dist\Rebook-$env:REBOOK_VERSION-x86_64.msi"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rebook-${{ steps.version.outputs.version }}-windows-x86_64
+          path: dist/*.msi
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.msi
+          fail_on_unmatched_files: true
+          generate_release_notes: true

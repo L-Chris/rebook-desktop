@@ -1,0 +1,38 @@
+# Rebook Desktop WebDAV Sync v1
+
+This protocol is currently desktop-to-desktop. It does not depend on `rebook-service` and is not yet a compatibility contract with `rebook-web`.
+
+## Remote layout
+
+```text
+Rebook/v1/
+├── protocol.json
+├── library/devices/<device-id>.json
+├── books/<sha256>/manifest.json
+├── books/<sha256>/content.<extension>
+├── books/<sha256>/cover.bin
+├── state/<sha256>/devices/<device-id>.json
+└── tmp/
+```
+
+`<sha256>` is the lowercase SHA-256 of the exact imported book bytes. A title, filename, author, or format metadata value is never used to match books.
+
+## Ownership and writes
+
+- Book content and manifests are immutable and uploaded with `If-None-Match: *`.
+- A device only updates its own files under `library/devices/` and `state/.../devices/`.
+- Mutable device files use the last ETag with `If-Match`; creation uses `If-None-Match: *`.
+- Redirects to a different origin are rejected so credentials are not forwarded.
+- Non-local endpoints must use HTTPS.
+
+## Merge rules
+
+- Reading progress stores a versioned `LocatorV1` and a hybrid logical timestamp. The newest reading event wins; progress is never merged by taking the maximum percentage.
+- Highlights have UUID identity, a vector clock, an HLC update timestamp, and an optional deletion timestamp.
+- A causally newer highlight replaces an older one. Concurrent versions choose a deterministic HLC winner and retain the visible loser as a conflict copy.
+- Highlight deletions remain as tombstones and participate in causal merge.
+- Removing a book from one local shelf records a device-local membership tombstone, preventing the same remote book from immediately reappearing on that device. Global remote deletion is intentionally not part of v1.
+
+## Local persistence
+
+Progress, annotations, HLC state, and local book membership are stored transactionally in `sync-v1.sqlite3` under the application data directory. Legacy `highlights.json` records are imported idempotently. The WebDAV password is stored in Windows Credential Manager under the `Rebook WebDAV` service name; it is not serialized with settings.
