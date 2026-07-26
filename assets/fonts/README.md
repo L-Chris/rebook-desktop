@@ -19,4 +19,4 @@ Copyright notices and reserved names remain with their upstream projects:
 
 The persisted Readest-compatible CJK preference is named `LXGW WenKai GB Screen`; the native
 renderer also includes `LXGW WenKai` in its fallback stack because the upstream desktop TTF uses
-that family name.
+that family name. The same shared binary is used when a PDF references a non-embedded CJK font.

@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use xilem::Blob;
 
-const BITTER_REGULAR: &[u8] = include_bytes!("../assets/fonts/Bitter-wght.ttf");
-const BITTER_ITALIC: &[u8] = include_bytes!("../assets/fonts/Bitter-Italic-wght.ttf");
-const ROBOTO_REGULAR: &[u8] = include_bytes!("../assets/fonts/Roboto-wdth-wght.ttf");
-const ROBOTO_ITALIC: &[u8] = include_bytes!("../assets/fonts/Roboto-Italic-wdth-wght.ttf");
-const FIRA_CODE: &[u8] = include_bytes!("../assets/fonts/FiraCode-wght.ttf");
-const LXGW_WENKAI: &[u8] = include_bytes!("../assets/fonts/LXGWWenKai-Regular.ttf");
+const BITTER_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Bitter-wght.ttf");
+const BITTER_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Bitter-Italic-wght.ttf");
+const ROBOTO_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Roboto-wdth-wght.ttf");
+const ROBOTO_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Roboto-Italic-wdth-wght.ttf");
+const FIRA_CODE: &[u8] = include_bytes!("../../../assets/fonts/FiraCode-wght.ttf");
+const LXGW_WENKAI: &[u8] = include_bytes!("../../../assets/fonts/LXGWWenKai-Regular.ttf");
 
 pub fn embedded_reader_fonts() -> Arc<[Blob<u8>]> {
     [

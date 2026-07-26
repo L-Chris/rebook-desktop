@@ -1805,8 +1805,10 @@ fn divider_for_app() -> impl WidgetView<DesktopApp> {
 fn import_with_dialog(state: &mut DesktopApp) {
     let Some(paths) = rfd::FileDialog::new()
         .add_filter(
-            "电子书（EPUB / Kindle / FB2 / CBZ）",
-            &["epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "zip"],
+            "电子书（EPUB / Kindle / FB2 / CBZ / PDF）",
+            &[
+                "epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "pdf", "zip",
+            ],
         )
         .set_title("导入本地书籍")
         .pick_files()

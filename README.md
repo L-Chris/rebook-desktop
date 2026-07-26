@@ -3,7 +3,7 @@
 Rust 原生桌面电子书阅读器。正文不嵌入 WebView，也不追求完整浏览器兼容；当前主链是：
 
 ```text
-EPUB archive source / Kindle / FB2 / CBZ direct sources
+EPUB archive source / Kindle / FB2 / CBZ / PDF direct sources
   -> shared HTML/CSS parser or fixed-page Section IR
   -> renderer-independent Reading IR
   -> Parley layout and native pagination
@@ -16,7 +16,7 @@ authored section 会先解析一次，再按与视口和阅读样式无关的文
 ## Workspace
 
 - `crates/publication`：格式无关的 `BookSource`、Reading IR、资源 URL 与 SourceRange。
-- `crates/formats`：EPUB、MOBI/AZW/AZW3、FB2/FBZ 与 CBZ 的统一注册入口；各格式直接提供 `BookSource`，其中 EPUB 模块负责受限 ZIP/OCF/OPF/Nav/NCX 与懒资源读取。
+- `crates/formats`：EPUB、MOBI/AZW/AZW3、FB2/FBZ、CBZ 与 PDF 的统一注册入口；各格式直接提供 `BookSource`，其中 EPUB 模块负责受限 ZIP/OCF/OPF/Nav/NCX 与懒资源读取，PDF 通过纯 Rust 后端按需栅格化固定页面。
 - `crates/html`：EPUB、Kindle 和 FB2 共享的 HTML/CSS → Reading IR 解析器。
 - `crates/layout`：持久化 Parley 上下文、跨 content fragment 连续分页、文字塑形、受控图片尺寸和单页/双页 spread 原生分页。
 - `crates/renderer`：把页面布局编译成 retained display list，并交给 Vello GPU/CPU 绘制。
@@ -44,7 +44,7 @@ cargo run -p rebook-desktop
 # 直接打开真实测试书籍（不导入书架）
 cargo run -p rebook-desktop -- "test-data\数学觉醒学会更清晰地思考.epub"
 
-# Kindle、FB2/FBZ 和 CBZ 使用同一个阅读入口
+# Kindle、FB2/FBZ、CBZ 和 PDF 使用同一个阅读入口
 cargo run -p rebook-desktop -- "..\rebook\data\1.azw3"
 
 # 输出统一 publication 和逐章节解析诊断
@@ -62,7 +62,7 @@ watchexec -r -e rs,toml -- cargo run --locked -p rebook-desktop
 
 ## 当前能力边界
 
-当前支持无 DRM 的 EPUB、MOBI、AZW、AZW3/KF8、FB2、FBZ（含 `.fb2.zip`）和 CBZ，不支持 PDF。Kindle 路径支持 PalmDOC 与 HUFF/CDIC 文本、KF8 SKEL/FRAG 正文重建、NCX 目录和内嵌图片；FB2 支持元数据、层级正文、Base64 图片与封面；CBZ 支持自然排序图片和 `ComicInfo.xml`。非 EPUB 格式直接构造格式无关的 publication、章节和资源模型；EPUB、Kindle 与 FB2 共享 HTML Reading IR 解析器，CBZ 直接生成固定页面 IR。
+当前支持无 DRM 的 EPUB、MOBI、AZW、AZW3/KF8、FB2、FBZ（含 `.fb2.zip`）、CBZ 和 PDF。Kindle 路径支持 PalmDOC 与 HUFF/CDIC 文本、KF8 SKEL/FRAG 正文重建、NCX 目录和内嵌图片；FB2 支持元数据、层级正文、Base64 图片与封面；CBZ 支持自然排序图片和 `ComicInfo.xml`；PDF 支持文档元数据、书签目录、单/双页翻页和按需页面渲染。非 EPUB 格式直接构造格式无关的 publication、章节和资源模型；EPUB、Kindle 与 FB2 共享 HTML Reading IR 解析器，CBZ 与 PDF 使用固定页面模型。
 
 EPUB 路径已实现 EPUB 3 常用容器、EPUB 2 NCX、层级目录、懒资源读取和归档/XML 安全预算；Reading IR 支持标题、段落、列表、引用、pre、图片、分隔线，以及受控的文字/块样式。EPUB parser 会级联 `<style>`、本地 `<link rel="stylesheet">` 和 inline style，支持 tag、class、id、`tag.class`、selector group，并把 `text-align`、`text-indent`、行高、边距、字号、字重、斜体、装饰、颜色，以及图片 `width/height/max-width/max-height` 归一化到 Reading IR；阅读器默认样式会把段落缩进覆盖为 0。图片尺寸支持 px/em/rem/pt 与百分比，最终按栏宽、页高约束并保持纵横比。布局支持中文字体回退、长段落跨页、单页/双页 spread。默认正文采用 rebook demo 的 16px、1.72 行高和 44px 页面边距。
 

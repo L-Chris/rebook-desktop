@@ -9,6 +9,7 @@ mod epub;
 mod fb2;
 mod kf8;
 mod mobi;
+mod pdf;
 mod source;
 mod xml;
 
@@ -22,7 +23,7 @@ use thiserror::Error;
 
 use self::epub::{EpubError, EpubPublication};
 
-/// Non-PDF e-book formats supported by the desktop application.
+/// E-book formats supported by the desktop application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BookFormat {
     Epub,
@@ -32,6 +33,7 @@ pub enum BookFormat {
     Fb2,
     Fbz,
     Cbz,
+    Pdf,
 }
 
 impl BookFormat {
@@ -50,6 +52,7 @@ impl BookFormat {
             "fb2" => Some(Self::Fb2),
             "fbz" => Some(Self::Fbz),
             "cbz" => Some(Self::Cbz),
+            "pdf" => Some(Self::Pdf),
             _ => None,
         }
     }
@@ -64,6 +67,7 @@ impl BookFormat {
             Self::Fb2 => "FB2",
             Self::Fbz => "FBZ",
             Self::Cbz => "CBZ",
+            Self::Pdf => "PDF",
         }
     }
 
@@ -77,6 +81,7 @@ impl BookFormat {
             Self::Fb2 => "fb2",
             Self::Fbz => "fbz",
             Self::Cbz => "cbz",
+            Self::Pdf => "pdf",
         }
     }
 }
@@ -137,6 +142,7 @@ pub fn open_bytes(
         }
         BookFormat::Fb2 | BookFormat::Fbz => Arc::new(fb2::open(bytes.as_ref(), file_name)?),
         BookFormat::Cbz => Arc::new(cbz::open(bytes.as_ref(), file_name)?),
+        BookFormat::Pdf => Arc::new(pdf::open(bytes.as_ref(), file_name)?),
     };
     let cover_bytes = source
         .book()
@@ -185,7 +191,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_every_supported_non_pdf_extension() {
+    fn detects_every_supported_extension() {
         assert_eq!(
             BookFormat::from_file_name("book.EPUB"),
             Some(BookFormat::Epub)
@@ -218,6 +224,9 @@ mod tests {
             BookFormat::from_file_name("book.cbz"),
             Some(BookFormat::Cbz)
         );
-        assert_eq!(BookFormat::from_file_name("book.pdf"), None);
+        assert_eq!(
+            BookFormat::from_file_name("book.pdf"),
+            Some(BookFormat::Pdf)
+        );
     }
 }

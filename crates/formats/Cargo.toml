@@ -10,7 +10,9 @@ base64.workspace = true
 crc32fast.workspace = true
 encoding_rs.workspace = true
 flate2.workspace = true
+hayro.workspace = true
 iepub.workspace = true
+lopdf.workspace = true
 quick-xml.workspace = true
 rebook-html = { path = "../html" }
 rebook-publication = { path = "../publication" }

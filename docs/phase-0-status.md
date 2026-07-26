@@ -9,7 +9,7 @@
 | 层 | 当前实现 |
 | --- | --- |
 | Publication | `BookSource`、`Book/Section/Block/Inline`、文字/块/图片样式子集、PublicationUrl、SourceRange |
-| Formats | EPUB archive source，以及 Kindle、FB2、CBZ 直接 `BookSource`；不再构造内存 EPUB |
+| Formats | EPUB archive source，以及 Kindle、FB2、CBZ、PDF 直接 `BookSource`；不再构造内存 EPUB |
 | HTML | EPUB、Kindle、FB2 共享的 HTML/CSS → Reading IR parser 与受控 CSS cascade |
 | EPUB | 安全 ZIP/OCF/OPF、EPUB 3 Nav、EPUB 2 NCX、层级 TOC、懒章节/资源 |
 | Layout | 持久化 Parley context、中文塑形、长段落跨页、多 content fragment 连续分页、图片 CSS 尺寸/单次解码/缩放、单页/双页 spread、renderer-independent PageLayout |
