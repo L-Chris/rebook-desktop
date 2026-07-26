@@ -10,13 +10,15 @@ use parley::{
     LayoutContext, LineHeight, StyleProperty,
 };
 use rebook_publication::{
-    Block, BookSource, FixedPageTextLayer, ImageStyle, Inline, PublicationError, RenditionLayout,
-    Rgba, Section, SourceRange, TextAlignment, TextBlock, TextBlockKind, TextStyle,
+    Block, BookSource, FixedPageTextLayer, ImageStyle, Inline, PublicationError, PublicationUrl,
+    RenditionLayout, Rgba, Section, SourceRange, TextAlignment, TextBlock, TextBlockKind,
+    TextStyle,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const COLUMN_GAP: f32 = 36.0;
+const IMAGE_BLOCK_GAP: f32 = 14.0;
 const MIN_COLUMN_WIDTH: f32 = 360.0;
 const MAX_COLUMN_WIDTH: f32 = 960.0;
 
@@ -389,11 +391,14 @@ impl LayoutEngine {
         let visible_pages = geometry.visible_pages;
         let continuation_offset_x = geometry.continuation_offset_x;
 
+        let center_standalone_image = source.book().metadata.layout
+            == RenditionLayout::PrePaginated
+            || fragments_are_standalone_cover(fragments, source.book().cover.as_ref());
         let mut paginator = Paginator::new(
             viewport,
             reader_style.background,
             geometry,
-            source.book().metadata.layout == RenditionLayout::PrePaginated,
+            center_standalone_image,
         );
 
         for blocks in fragments {
@@ -518,6 +523,18 @@ impl LayoutEngine {
     }
 }
 
+fn fragments_are_standalone_cover(fragments: &[&[Block]], cover: Option<&PublicationUrl>) -> bool {
+    let Some(cover) = cover else {
+        return false;
+    };
+    let mut visible_blocks = fragments
+        .iter()
+        .flat_map(|blocks| blocks.iter())
+        .filter(|block| !matches!(block, Block::PageBreak));
+    matches!(visible_blocks.next(), Some(Block::Image(image)) if &image.href == cover)
+        && visible_blocks.next().is_none()
+}
+
 fn resolve_page_geometry(
     page_width: f32,
     page_height: f32,
@@ -621,7 +638,7 @@ struct Paginator {
     cursor_y: f32,
     pages: Vec<PageLayout>,
     items: Vec<PageItem>,
-    center_fixed_page: bool,
+    center_standalone_image: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -639,7 +656,7 @@ impl Paginator {
         viewport: LayoutViewport,
         background: Rgba,
         geometry: PageGeometry,
-        center_fixed_page: bool,
+        center_standalone_image: bool,
     ) -> Self {
         Self {
             viewport,
@@ -652,7 +669,7 @@ impl Paginator {
             cursor_y: geometry.top,
             pages: Vec::new(),
             items: Vec::new(),
-            center_fixed_page,
+            center_standalone_image,
         }
     }
 
@@ -745,6 +762,7 @@ impl Paginator {
             .min(1.0);
         let width = requested_width * scale;
         let height = requested_height * scale;
+        self.ensure_minimum_spacing(style.margin_before.max(IMAGE_BLOCK_GAP));
         if self.cursor_y + height > self.bottom && self.column_has_content {
             self.advance_column();
         }
@@ -759,7 +777,28 @@ impl Paginator {
             text_layer,
         }));
         self.column_has_content = true;
-        self.cursor_y += height + 14.0;
+        self.cursor_y += height + style.margin_after.max(IMAGE_BLOCK_GAP);
+    }
+
+    fn ensure_minimum_spacing(&mut self, amount: f32) {
+        let Some(content_bottom) = self.items.last().and_then(|item| match item {
+            PageItem::Text(text) => text
+                .lines
+                .end
+                .checked_sub(1)
+                .and_then(|line| text.layout.get(line))
+                .map(|line| text.origin_y + line.metrics().block_max_coord),
+            PageItem::Image(image) => Some(image.y + image.height),
+            PageItem::Separator(separator) => Some(separator.y + 1.0),
+        }) else {
+            return;
+        };
+        let target = content_bottom + amount.max(0.0);
+        if target > self.bottom {
+            self.advance_column();
+        } else {
+            self.cursor_y = self.cursor_y.max(target);
+        }
     }
 
     fn push_separator(&mut self) {
@@ -804,7 +843,7 @@ impl Paginator {
             self.cursor_y = self.top;
             return;
         }
-        if self.center_fixed_page
+        if self.center_standalone_image
             && let [PageItem::Image(image)] = self.items.as_mut_slice()
         {
             let available_height = self.bottom - self.top;
@@ -924,7 +963,8 @@ mod tests {
         assert!((double.left - (viewport_width - spread_width) / 2.0).abs() < f32::EPSILON);
     }
     use rebook_publication::{
-        Book, ImageLength, Metadata, PublicationId, PublicationUrl, Resource, SpineItemId, TocEntry,
+        Book, ImageBlock, ImageLength, Metadata, PublicationId, PublicationUrl, RasterResource,
+        Resource, SpineItemId, TocEntry,
     };
 
     struct EmptySource {
@@ -942,6 +982,17 @@ mod tests {
 
         fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
             Err(PublicationError::ResourceNotFound(href.to_string()))
+        }
+
+        fn raster_resource(
+            &self,
+            _href: &PublicationUrl,
+        ) -> Result<Option<RasterResource>, PublicationError> {
+            Ok(Some(RasterResource {
+                width: 200,
+                height: 100,
+                pixels: Vec::new().into(),
+            }))
         }
     }
 
@@ -1096,6 +1147,157 @@ mod tests {
     }
 
     #[test]
+    fn image_after_zero_margin_text_keeps_a_minimum_block_gap() {
+        let image_href = PublicationUrl::parse("images/figure.png").unwrap();
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("image-gap-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![
+                Block::Text(TextBlock {
+                    kind: TextBlockKind::Paragraph,
+                    content: vec![Inline::Text(rebook_publication::TextRun {
+                        text: "Text immediately before a figure.".into(),
+                        style: TextStyle::default(),
+                        link: None,
+                    })],
+                    style: rebook_publication::BlockStyle {
+                        margin_after: 0.0,
+                        ..rebook_publication::BlockStyle::default()
+                    },
+                    source: None,
+                }),
+                Block::Image(ImageBlock {
+                    href: image_href,
+                    alt: "Figure".into(),
+                    style: ImageStyle::default(),
+                    source: None,
+                    text_layer: None,
+                }),
+            ],
+            anchors: Vec::new(),
+        };
+
+        let layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                LayoutViewport::new(400, 500).unwrap(),
+                &ReaderStyle::default(),
+            )
+            .unwrap();
+        let [PageItem::Text(text), PageItem::Image(image)] = layout.pages[0].items.as_slice()
+        else {
+            panic!("expected text followed by an image");
+        };
+        let last_line = text.layout.get(text.lines.end - 1).unwrap();
+        let text_bottom = text.origin_y + last_line.metrics().block_max_coord;
+
+        assert!((image.y - text_bottom - IMAGE_BLOCK_GAP).abs() < 0.001);
+    }
+
+    #[test]
+    fn authored_image_margin_larger_than_the_default_gap_is_preserved() {
+        let viewport = LayoutViewport::new(400, 500).unwrap();
+        let mut paginator = Paginator::new(
+            viewport,
+            Rgba::BLACK,
+            PageGeometry {
+                left: 20.0,
+                top: 40.0,
+                width: 360.0,
+                bottom: 460.0,
+                visible_pages: 1,
+                continuation_offset_x: 0.0,
+            },
+            false,
+        );
+        paginator.push_separator();
+        paginator.push_image(
+            RasterImage {
+                width: 200,
+                height: 100,
+                pixels: Vec::new().into(),
+            },
+            ImageStyle {
+                margin_before: 25.0,
+                ..ImageStyle::default()
+            },
+            None,
+            None,
+        );
+
+        let pages = paginator.finish();
+        let [PageItem::Separator(separator), PageItem::Image(image)] = pages[0].items.as_slice()
+        else {
+            panic!("expected a separator followed by an image");
+        };
+
+        assert!((image.y - (separator.y + 1.0) - 25.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn image_moved_to_the_next_page_starts_at_the_page_margin() {
+        let image_href = PublicationUrl::parse("images/figure.png").unwrap();
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("image-page-break-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![
+                Block::Text(TextBlock {
+                    kind: TextBlockKind::Paragraph,
+                    content: vec![Inline::Text(rebook_publication::TextRun {
+                        text: "Text before a figure that must move.".into(),
+                        style: TextStyle::default(),
+                        link: None,
+                    })],
+                    style: rebook_publication::BlockStyle {
+                        margin_after: 0.0,
+                        ..rebook_publication::BlockStyle::default()
+                    },
+                    source: None,
+                }),
+                Block::Image(ImageBlock {
+                    href: image_href,
+                    alt: "Figure".into(),
+                    style: ImageStyle::default(),
+                    source: None,
+                    text_layer: None,
+                }),
+            ],
+            anchors: Vec::new(),
+        };
+        let viewport = LayoutViewport::new(400, 180).unwrap();
+        let style = ReaderStyle::default();
+        let page_top = resolve_page_geometry(400.0, 180.0, &style).top;
+
+        let layout = LayoutEngine::new()
+            .layout_section(&source, &section, viewport, &style)
+            .unwrap();
+        let PageItem::Image(image) = &layout.pages[1].items[0] else {
+            panic!("expected the image on the next page");
+        };
+
+        assert!((image.y - page_top).abs() < 0.001);
+    }
+
+    #[test]
     fn fixed_page_image_is_vertically_centered_in_the_content_area() {
         let viewport = LayoutViewport::new(400, 500).unwrap();
         let mut paginator = Paginator::new(
@@ -1127,5 +1329,85 @@ mod tests {
             panic!("expected an image placement");
         };
         assert!((image.y - 200.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn reflowable_standalone_cover_is_vertically_centered() {
+        let cover = PublicationUrl::parse("images/cover.jpg").unwrap();
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("cover-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: Some(cover.clone()),
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let section = Section {
+            id: SpineItemId::new("cover").unwrap(),
+            href: PublicationUrl::parse("cover.xhtml").unwrap(),
+            blocks: vec![Block::Image(ImageBlock {
+                href: cover,
+                alt: "Cover".into(),
+                style: ImageStyle::default(),
+                source: None,
+                text_layer: None,
+            })],
+            anchors: Vec::new(),
+        };
+
+        let layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                LayoutViewport::new(400, 500).unwrap(),
+                &ReaderStyle::default(),
+            )
+            .unwrap();
+        let PageItem::Image(image) = &layout.pages[0].items[0] else {
+            panic!("expected a cover image placement");
+        };
+
+        assert!((image.y - 200.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn reflowable_standalone_non_cover_image_stays_in_normal_flow() {
+        let image_href = PublicationUrl::parse("images/illustration.jpg").unwrap();
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("illustration-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let section = Section {
+            id: SpineItemId::new("illustration").unwrap(),
+            href: PublicationUrl::parse("illustration.xhtml").unwrap(),
+            blocks: vec![Block::Image(ImageBlock {
+                href: image_href,
+                alt: "Illustration".into(),
+                style: ImageStyle::default(),
+                source: None,
+                text_layer: None,
+            })],
+            anchors: Vec::new(),
+        };
+
+        let layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                LayoutViewport::new(400, 500).unwrap(),
+                &ReaderStyle::default(),
+            )
+            .unwrap();
+        let PageItem::Image(image) = &layout.pages[0].items[0] else {
+            panic!("expected an illustration image placement");
+        };
+
+        assert!((image.y - ReaderStyle::default().vertical_margin).abs() < 0.001);
     }
 }

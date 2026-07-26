@@ -165,7 +165,7 @@ impl ReadingIrParser {
             name if is_generic_block_container(name) => self.parse_block_container(node)?,
             "ul" => self.parse_list(node, false)?,
             "ol" => self.parse_list(node, true)?,
-            "img" | "image" => self.push_image(node)?,
+            "img" | "image" => self.push_image(node, None)?,
             "hr" => self.blocks.push(Block::Separator),
             "br" => self.blocks.push(Block::PageBreak),
             _ => self.parse_children(node)?,
@@ -225,15 +225,28 @@ impl ReadingIrParser {
             }));
         }
 
-        for image in node.descendants().filter(|descendant| {
-            descendant != &node
-                && descendant.is_element()
-                && matches!(
-                    descendant.tag_name().name().to_ascii_lowercase().as_str(),
-                    "img" | "image"
-                )
-        }) {
-            self.push_image(image)?;
+        let images = node
+            .descendants()
+            .filter(|descendant| {
+                descendant != &node
+                    && descendant.is_element()
+                    && matches!(
+                        descendant.tag_name().name().to_ascii_lowercase().as_str(),
+                        "img" | "image"
+                    )
+            })
+            .collect::<Vec<_>>();
+        let image_count = images.len();
+        for (index, image) in images.into_iter().enumerate() {
+            let container_style = (text_len == 0).then_some((
+                if index == 0 { style.margin_before } else { 0.0 },
+                if index + 1 == image_count {
+                    style.margin_after
+                } else {
+                    0.0
+                },
+            ));
+            self.push_image(image, container_style)?;
         }
         Ok(())
     }
@@ -267,7 +280,11 @@ impl ReadingIrParser {
         }));
     }
 
-    fn push_image(&mut self, node: Node<'_, '_>) -> Result<(), HtmlError> {
+    fn push_image(
+        &mut self,
+        node: Node<'_, '_>,
+        container_style: Option<(f32, f32)>,
+    ) -> Result<(), HtmlError> {
         let Some(src) = attribute_local(node, "src")
             .or_else(|| attribute_local(node, "href"))
             .filter(|value| !value.trim().is_empty())
@@ -278,10 +295,15 @@ impl ReadingIrParser {
         let node_id = self.allocate_node();
         let source = self.source_range(&node_id, 0);
         self.bind_pending_anchors(&source.start);
+        let mut style = self.styles.image_style(node);
+        if let Some((margin_before, margin_after)) = container_style {
+            style.margin_before = style.margin_before.max(margin_before);
+            style.margin_after = style.margin_after.max(margin_after);
+        }
         self.blocks.push(Block::Image(ImageBlock {
             href,
             alt: attribute_local(node, "alt").unwrap_or_default().to_owned(),
-            style: self.styles.image_style(node),
+            style,
             source: Some(source),
             text_layer: None,
         }));
@@ -657,6 +679,18 @@ impl StyleSheet {
             .and_then(|value| image_length(value))
         {
             style.max_height = Some(value);
+        }
+        if let Some(value) = properties
+            .get("margin-top")
+            .and_then(|value| css_length(value))
+        {
+            style.margin_before = value;
+        }
+        if let Some(value) = properties
+            .get("margin-bottom")
+            .and_then(|value| css_length(value))
+        {
+            style.margin_after = value;
         }
         style
     }
@@ -1078,6 +1112,31 @@ mod tests {
         assert_eq!(image.style.width, Some(ImageLength::Fraction(0.8)));
         assert_eq!(image.style.max_width, Some(ImageLength::Pixels(420.0)));
         assert_eq!(image.style.max_height, Some(ImageLength::Fraction(0.6)));
+    }
+
+    #[test]
+    fn preserves_margins_from_an_image_only_block_container() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("OPS/chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml">
+            <head><style>
+                p.IMG { margin-top: 25px; margin-bottom: 10px; text-align: center; }
+            </style></head>
+            <body><p class="IMG"><a id="figure"/><img src="images/chart.png"/></p></body>
+        </html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let [Block::Image(image)] = section.blocks.as_slice() else {
+            panic!("expected only the image block");
+        };
+
+        assert_close(image.style.margin_before, 25.0);
+        assert_close(image.style.margin_after, 10.0);
     }
 
     #[test]

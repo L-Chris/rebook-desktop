@@ -436,6 +436,12 @@ pub struct ImageStyle {
     pub height: Option<ImageLength>,
     pub max_width: Option<ImageLength>,
     pub max_height: Option<ImageLength>,
+    /// Block spacing before the image, inherited from an image-only container when present.
+    #[serde(default)]
+    pub margin_before: f32,
+    /// Block spacing after the image, inherited from an image-only container when present.
+    #[serde(default)]
+    pub margin_after: f32,
 }
 
 /// RGBA color stored without renderer coupling.
