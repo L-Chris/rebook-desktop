@@ -2,15 +2,22 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use hayro::hayro_interpret::InterpreterSettings;
-use hayro::hayro_interpret::font::{FontData, FontQuery};
+use hayro::hayro_interpret::font::{FontData, FontQuery, Glyph};
+use hayro::hayro_interpret::hayro_cmap::BfString;
+use hayro::hayro_interpret::util::TransformExt as _;
+use hayro::hayro_interpret::{
+    BlendMode, ClipPath, Context, Device, GlyphDrawMode, Image, InterpreterCache,
+    InterpreterSettings, Paint, PathDrawMode, SoftMask, interpret_page,
+};
 use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{RenderCache, RenderSettings};
+use kurbo::{Affine, BezPath, Point, Rect, Shape};
 use lopdf::{Document, TocType, decode_text_string};
 use rebook_publication::{
-    Book, BookSource, Metadata, PublicationError, PublicationUrl, RenditionLayout, Resource,
-    Section,
+    Block, Book, BookSource, FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan, Metadata,
+    PublicationError, PublicationUrl, RenditionLayout, Resource, Section, SourceAnchor,
+    SourceRange,
 };
 use sha2::{Digest, Sha256};
 
@@ -37,6 +44,7 @@ struct PdfResourceCache {
     cover: Option<Arc<[u8]>>,
     pages: HashMap<usize, Arc<[u8]>>,
     page_lru: VecDeque<usize>,
+    text_layers: HashMap<usize, FixedPageTextLayer>,
 }
 
 pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<PdfPublication, FormatError> {
@@ -108,7 +116,18 @@ impl BookSource for PdfPublication {
     }
 
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
-        self.descriptor.parse_section(index)
+        let mut section = self.descriptor.parse_section(index)?;
+        let text_layer = self.page_text_layer(index)?;
+        let Some(Block::Image(image)) = section.blocks.first_mut() else {
+            return Err(PublicationError::InvalidPublication(format!(
+                "PDF page {} did not produce a fixed page image",
+                index + 1
+            )));
+        };
+        let source = page_text_source(&section.id, text_layer.text.chars().count());
+        image.source = Some(source);
+        image.text_layer = Some(text_layer);
+        Ok(section)
     }
 
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
@@ -130,6 +149,37 @@ impl BookSource for PdfPublication {
 }
 
 impl PdfPublication {
+    fn page_text_layer(&self, page_index: usize) -> Result<FixedPageTextLayer, PublicationError> {
+        if let Some(layer) = self.lock_cache()?.text_layers.get(&page_index).cloned() {
+            return Ok(layer);
+        }
+
+        let layer = self.extract_page_text(page_index)?;
+        self.lock_cache()?
+            .text_layers
+            .insert(page_index, layer.clone());
+        Ok(layer)
+    }
+
+    fn extract_page_text(&self, page_index: usize) -> Result<FixedPageTextLayer, PublicationError> {
+        let pdf = Pdf::new(Arc::clone(&self.bytes)).map_err(pdf_render_error)?;
+        let page = pdf.pages().get(page_index).ok_or_else(|| {
+            PublicationError::ResourceNotFound(format!("PDF page {}", page_index + 1))
+        })?;
+        let (width, height) = page.render_dimensions();
+        let cache = InterpreterCache::new();
+        let mut context = Context::new(
+            page.initial_transform(true).to_kurbo(),
+            Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
+            &cache,
+            page.xref(),
+            interpreter_settings(),
+        );
+        let mut extractor = PdfTextExtractor::default();
+        interpret_page(page, &mut context, &mut extractor);
+        Ok(extractor.finish(width, height))
+    }
+
     fn cover_resource(&self) -> Result<Arc<[u8]>, PublicationError> {
         let mut cache = self.lock_cache()?;
         if let Some(cover) = &cache.cover {
@@ -190,6 +240,270 @@ impl PdfPublication {
             },
         );
         pixmap.into_png().map_err(pdf_render_error)
+    }
+}
+
+fn page_text_source(spine: &rebook_publication::SpineItemId, char_count: usize) -> SourceRange {
+    let end = u64::try_from(char_count).unwrap_or(u64::MAX);
+    SourceRange {
+        start: SourceAnchor {
+            spine: spine.clone(),
+            node: "pdf-page-text".into(),
+            text_offset: 0,
+        },
+        end: SourceAnchor {
+            spine: spine.clone(),
+            node: "pdf-page-text".into(),
+            text_offset: end,
+        },
+    }
+}
+
+#[derive(Default)]
+struct PdfTextExtractor {
+    glyphs: Vec<ExtractedGlyph>,
+}
+
+struct ExtractedGlyph {
+    text: String,
+    rect: Rect,
+    baseline: Point,
+    advance_end: Point,
+}
+
+impl Device<'_> for PdfTextExtractor {
+    fn set_soft_mask(&mut self, _: Option<SoftMask<'_>>) {}
+
+    fn set_blend_mode(&mut self, _: BlendMode) {}
+
+    fn draw_path(&mut self, _: &BezPath, _: Affine, _: &Paint<'_>, _: &PathDrawMode) {}
+
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'_>>, _: BlendMode) {}
+
+    fn draw_glyph(
+        &mut self,
+        glyph: &Glyph<'_>,
+        transform: Affine,
+        glyph_transform: Affine,
+        _: &Paint<'_>,
+        _: &GlyphDrawMode,
+    ) {
+        let Some(unicode) = glyph.as_unicode() else {
+            return;
+        };
+        let text = match unicode {
+            BfString::Char(character) => character.to_string(),
+            BfString::String(value) => value,
+        }
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\t' | '\n' | '\r'))
+        .map(|character| match character {
+            '\t' | '\n' | '\r' => ' ',
+            other => other,
+        })
+        .collect::<String>();
+        if text.is_empty() {
+            return;
+        }
+
+        let combined = transform * glyph_transform;
+        let baseline = combined * Point::ORIGIN;
+        let advance_end = combined * Point::new(glyph_advance(glyph), 0.0);
+        let fallback = fallback_glyph_rect(glyph, combined);
+        let rect =
+            glyph_outline_rect(glyph, combined).map_or(fallback, |outline| outline.union(fallback));
+        if !rect_is_finite(rect) {
+            return;
+        }
+        if self.glyphs.last().is_some_and(|previous| {
+            previous.text == text
+                && (previous.rect.x0 - rect.x0).abs() < 0.01
+                && (previous.rect.y0 - rect.y0).abs() < 0.01
+                && (previous.rect.x1 - rect.x1).abs() < 0.01
+                && (previous.rect.y1 - rect.y1).abs() < 0.01
+        }) {
+            return;
+        }
+        self.glyphs.push(ExtractedGlyph {
+            text,
+            rect,
+            baseline,
+            advance_end,
+        });
+    }
+
+    fn draw_image(&mut self, _: Image<'_, '_>, _: Affine) {}
+
+    fn pop_clip_path(&mut self) {}
+
+    fn pop_transparency_group(&mut self) {}
+}
+
+impl PdfTextExtractor {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "PDF page coordinates are already represented as bounded f32 dimensions"
+    )]
+    fn finish(self, width: f32, height: f32) -> FixedPageTextLayer {
+        let mut text = String::new();
+        let mut char_len = 0_u64;
+        let mut spans = Vec::new();
+        let mut previous: Option<&ExtractedGlyph> = None;
+
+        for glyph in &self.glyphs {
+            if let Some(previous) = previous {
+                if glyph_starts_new_line(previous, glyph) {
+                    if !text.ends_with('\n') {
+                        text.push('\n');
+                        char_len = char_len.saturating_add(1);
+                    }
+                } else if glyph_needs_space(previous, glyph)
+                    && !text.ends_with(char::is_whitespace)
+                    && !glyph.text.starts_with(char::is_whitespace)
+                {
+                    text.push(' ');
+                    char_len = char_len.saturating_add(1);
+                }
+            }
+
+            let glyph_char_count = u64::try_from(glyph.text.chars().count()).unwrap_or(u64::MAX);
+            let start = char_len;
+            text.push_str(&glyph.text);
+            char_len = char_len.saturating_add(glyph_char_count);
+            append_glyph_spans(&mut spans, glyph.rect, start, glyph_char_count);
+            previous = Some(glyph);
+        }
+
+        FixedPageTextLayer {
+            width,
+            height,
+            text,
+            spans,
+        }
+    }
+}
+
+fn glyph_outline_rect(glyph: &Glyph<'_>, transform: Affine) -> Option<Rect> {
+    let Glyph::Outline(glyph) = glyph else {
+        return None;
+    };
+    let mut outline = glyph.outline();
+    if outline.elements().is_empty() {
+        return None;
+    }
+    outline.apply_affine(transform);
+    let rect = outline.bounding_box();
+    (rect.width().abs() > 0.01 && rect.height().abs() > 0.01).then_some(rect)
+}
+
+fn fallback_glyph_rect(glyph: &Glyph<'_>, transform: Affine) -> Rect {
+    let advance = glyph_advance(glyph).max(100.0);
+    transformed_bounds(
+        transform,
+        [
+            Point::new(0.0, -800.0),
+            Point::new(advance, -800.0),
+            Point::new(0.0, 200.0),
+            Point::new(advance, 200.0),
+        ],
+    )
+}
+
+fn glyph_advance(glyph: &Glyph<'_>) -> f64 {
+    match glyph {
+        Glyph::Outline(glyph) => f64::from(glyph.advance_width().unwrap_or(500.0)),
+        Glyph::Type3(_) => 500.0,
+    }
+}
+
+fn transformed_bounds(transform: Affine, points: [Point; 4]) -> Rect {
+    let points = points.map(|point| transform * point);
+    let min_x = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f64::INFINITY, f64::min);
+    let min_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::INFINITY, f64::min);
+    let max_x = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let max_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    Rect::new(min_x, min_y, max_x, max_y)
+}
+
+fn rect_is_finite(rect: Rect) -> bool {
+    [rect.x0, rect.y0, rect.x1, rect.y1]
+        .into_iter()
+        .all(f64::is_finite)
+}
+
+fn glyph_starts_new_line(previous: &ExtractedGlyph, current: &ExtractedGlyph) -> bool {
+    let tolerance = previous
+        .rect
+        .height()
+        .abs()
+        .max(current.rect.height().abs())
+        .max(1.0)
+        * 0.55;
+    (current.baseline.y - previous.baseline.y).abs() > tolerance
+}
+
+fn glyph_needs_space(previous: &ExtractedGlyph, current: &ExtractedGlyph) -> bool {
+    let gap = current.baseline.x - previous.advance_end.x;
+    let line_height = previous
+        .rect
+        .height()
+        .abs()
+        .max(current.rect.height().abs());
+    gap > (line_height * 0.2).max(1.0)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "PDF page coordinates are already represented as bounded f32 dimensions"
+)]
+fn append_glyph_spans(spans: &mut Vec<FixedPageTextSpan>, rect: Rect, start: u64, char_count: u64) {
+    if char_count == 0 {
+        return;
+    }
+    let bounded_count = u32::try_from(char_count).unwrap_or(u32::MAX);
+    let vertical = rect.height().abs() > rect.width().abs() * 1.5 && bounded_count > 1;
+    for index in 0..bounded_count {
+        let first = f64::from(index) / f64::from(bounded_count);
+        let second = f64::from(index + 1) / f64::from(bounded_count);
+        let fragment = if vertical {
+            Rect::new(
+                rect.x0,
+                rect.y0 + rect.height() * first,
+                rect.x1,
+                rect.y0 + rect.height() * second,
+            )
+        } else {
+            Rect::new(
+                rect.x0 + rect.width() * first,
+                rect.y0,
+                rect.x0 + rect.width() * second,
+                rect.y1,
+            )
+        };
+        let source_index = u64::from(index);
+        spans.push(FixedPageTextSpan {
+            char_range: start.saturating_add(source_index)..start.saturating_add(source_index + 1),
+            rect: FixedPageTextRect {
+                x: fragment.x0 as f32,
+                y: fragment.y0 as f32,
+                width: fragment.width().abs() as f32,
+                height: fragment.height().abs() as f32,
+            },
+        });
     }
 }
 
@@ -304,6 +618,13 @@ mod tests {
             panic!("expected a fixed PDF page image");
         };
         assert_eq!(image.href.path(), "Pages/page-00001.png");
+        let text_layer = image
+            .text_layer
+            .as_ref()
+            .expect("PDF page should expose extracted text geometry");
+        assert!(text_layer.text.contains("Hello PDF"));
+        assert_eq!(text_layer.spans.len(), "Hello PDF".chars().count());
+        assert_eq!(image.source.as_ref().unwrap().end.text_offset, 9);
 
         let page = publication.resource(&image.href).unwrap();
         assert!(page.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));

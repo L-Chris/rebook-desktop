@@ -9,7 +9,7 @@ use parley::editing::{Cursor, Selection};
 use parley::layout::{Affinity, Cluster, ClusterSide};
 use parley::{FontData, Layout, PositionedLayoutItem};
 use peniko::{Blob, Color, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
-use rebook_layout::{PageItem, PageLayout, TextBrush, TextPlacement};
+use rebook_layout::{ImagePlacement, PageItem, PageLayout, TextBrush, TextPlacement};
 use rebook_publication::{Rgba, SourceAnchor, SourceRange};
 
 /// Pointer hit inside one retained text placement.
@@ -170,6 +170,26 @@ impl PageDisplayList {
         self.paint_content_with_transform(scene, Affine::translate((f64::from(offset_x), 0.0)));
     }
 
+    /// Paints fixed-page raster content below source range overlays.
+    pub fn paint_images_at(&self, scene: &mut impl PaintScene, offset_x: f32) {
+        let transform = Affine::translate((f64::from(offset_x), 0.0));
+        for command in &self.commands {
+            if matches!(command, DisplayCommand::Image(_)) {
+                command.paint(scene, transform);
+            }
+        }
+    }
+
+    /// Paints text and rules above source range overlays.
+    pub fn paint_non_image_content_at(&self, scene: &mut impl PaintScene, offset_x: f32) {
+        let transform = Affine::translate((f64::from(offset_x), 0.0));
+        for command in &self.commands {
+            if !matches!(command, DisplayCommand::Image(_)) {
+                command.paint(scene, transform);
+            }
+        }
+    }
+
     /// Paints translucent source-backed marks below page content.
     pub fn paint_source_ranges(
         &self,
@@ -201,7 +221,63 @@ impl PageDisplayList {
     }
 }
 
-struct TextRegion {
+enum TextRegion {
+    Shaped(ShapedTextRegion),
+    Fixed(FixedTextRegion),
+}
+
+impl TextRegion {
+    fn visible_byte_range(&self) -> Option<Range<usize>> {
+        match self {
+            Self::Shaped(region) => region.visible_byte_range(),
+            Self::Fixed(region) => region.visible_byte_range(),
+        }
+    }
+
+    fn vertical_distance(&self, y: f32) -> f32 {
+        match self {
+            Self::Shaped(region) => region.vertical_distance(y),
+            Self::Fixed(region) => region.vertical_distance(y),
+        }
+    }
+
+    fn hit_test(&self, x: f32, y: f32, exact: bool) -> Option<usize> {
+        match self {
+            Self::Shaped(region) => region.hit_test(x, y, exact),
+            Self::Fixed(region) => region.hit_test(x, y, exact),
+        }
+    }
+
+    fn selection_fragment(&self, byte_range: Range<usize>) -> Option<PageSelectionFragment> {
+        match self {
+            Self::Shaped(region) => region.selection_fragment(byte_range),
+            Self::Fixed(region) => region.selection_fragment(byte_range),
+        }
+    }
+
+    fn selection_rects(&self, byte_range: Range<usize>) -> Vec<Rect> {
+        match self {
+            Self::Shaped(region) => region.selection_rects(byte_range),
+            Self::Fixed(region) => region.selection_rects(byte_range),
+        }
+    }
+
+    fn byte_range_for_source(&self, range: &SourceRange) -> Option<Range<usize>> {
+        match self {
+            Self::Shaped(region) => region.byte_range_for_source(range),
+            Self::Fixed(region) => region.byte_range_for_source(range),
+        }
+    }
+
+    fn contains_source_anchor(&self, anchor: &SourceAnchor) -> bool {
+        match self {
+            Self::Shaped(region) => region.contains_source_anchor(anchor),
+            Self::Fixed(region) => region.contains_source_anchor(anchor),
+        }
+    }
+}
+
+struct ShapedTextRegion {
     layout: Arc<Layout<TextBrush>>,
     text: Arc<str>,
     source_text_start: usize,
@@ -211,7 +287,7 @@ struct TextRegion {
     source: SourceRange,
 }
 
-impl TextRegion {
+impl ShapedTextRegion {
     fn visible_byte_range(&self) -> Option<Range<usize>> {
         let first = self.layout.get(self.lines.start)?;
         let last = self.layout.get(self.lines.end.checked_sub(1)?)?;
@@ -393,6 +469,201 @@ impl TextRegion {
     }
 }
 
+struct FixedTextRegion {
+    text: Arc<str>,
+    spans: Arc<[FixedTextSpan]>,
+    source: SourceRange,
+}
+
+#[derive(Clone)]
+struct FixedTextSpan {
+    byte_range: Range<usize>,
+    rect: Rect,
+}
+
+impl FixedTextRegion {
+    fn visible_byte_range(&self) -> Option<Range<usize>> {
+        (!self.text.is_empty() && !self.spans.is_empty()).then_some(0..self.text.len())
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "fixed page coordinates originate from bounded f32 layout dimensions"
+    )]
+    fn vertical_bounds(&self) -> Option<(f32, f32)> {
+        let top = self
+            .spans
+            .iter()
+            .map(|span| span.rect.y0 as f32)
+            .min_by(f32::total_cmp)?;
+        let bottom = self
+            .spans
+            .iter()
+            .map(|span| span.rect.y1 as f32)
+            .max_by(f32::total_cmp)?;
+        Some((top, bottom))
+    }
+
+    fn vertical_distance(&self, y: f32) -> f32 {
+        let Some((top, bottom)) = self.vertical_bounds() else {
+            return f32::MAX;
+        };
+        if y < top {
+            top - y
+        } else if y > bottom {
+            y - bottom
+        } else {
+            0.0
+        }
+    }
+
+    fn hit_test(&self, x: f32, y: f32, exact: bool) -> Option<usize> {
+        let point = kurbo::Point::new(f64::from(x), f64::from(y));
+        let span = if exact {
+            self.spans.iter().find(|span| span.rect.contains(point))?
+        } else {
+            self.spans.iter().min_by(|left, right| {
+                rect_distance_squared(left.rect, point)
+                    .total_cmp(&rect_distance_squared(right.rect, point))
+            })?
+        };
+        let vertical = span.rect.height().abs() > span.rect.width().abs() * 1.5;
+        let after_middle = if vertical {
+            point.y >= span.rect.center().y
+        } else {
+            point.x >= span.rect.center().x
+        };
+        Some(if after_middle {
+            span.byte_range.end
+        } else {
+            span.byte_range.start
+        })
+    }
+
+    fn selection_fragment(&self, byte_range: Range<usize>) -> Option<PageSelectionFragment> {
+        let visible = self.visible_byte_range()?;
+        let start = floor_char_boundary(
+            &self.text,
+            byte_range.start.clamp(visible.start, visible.end),
+        );
+        let end = floor_char_boundary(&self.text, byte_range.end.clamp(visible.start, visible.end));
+        if end <= start {
+            return None;
+        }
+        Some(PageSelectionFragment {
+            range: self.source_range_for_bytes(start..end)?,
+            quote: self.text.get(start..end)?.to_owned(),
+            rects: self.selection_rects(start..end),
+        })
+    }
+
+    fn selection_rects(&self, byte_range: Range<usize>) -> Vec<Rect> {
+        let rects = self
+            .spans
+            .iter()
+            .filter(|span| {
+                span.byte_range.start < byte_range.end && span.byte_range.end > byte_range.start
+            })
+            .map(|span| span.rect)
+            .collect::<Vec<_>>();
+        merge_fixed_text_rects(rects)
+    }
+
+    fn source_range_for_bytes(&self, byte_range: Range<usize>) -> Option<SourceRange> {
+        if self.source.start.spine != self.source.end.spine
+            || self.source.start.node != self.source.end.node
+        {
+            return None;
+        }
+        let start = self.source.start.text_offset
+            + u64::try_from(self.text.get(..byte_range.start)?.chars().count()).ok()?;
+        let end = self.source.start.text_offset
+            + u64::try_from(self.text.get(..byte_range.end)?.chars().count()).ok()?;
+        Some(SourceRange {
+            start: SourceAnchor {
+                spine: self.source.start.spine.clone(),
+                node: self.source.start.node.clone(),
+                text_offset: start,
+            },
+            end: SourceAnchor {
+                spine: self.source.start.spine.clone(),
+                node: self.source.start.node.clone(),
+                text_offset: end,
+            },
+        })
+    }
+
+    fn byte_range_for_source(&self, range: &SourceRange) -> Option<Range<usize>> {
+        if self.source.start.spine != self.source.end.spine
+            || self.source.start.node != self.source.end.node
+            || range.start.spine != range.end.spine
+            || range.start.node != range.end.node
+            || self.source.start.spine != range.start.spine
+            || self.source.start.node != range.start.node
+        {
+            return None;
+        }
+        let start_offset = range
+            .start
+            .text_offset
+            .max(self.source.start.text_offset)
+            .min(self.source.end.text_offset);
+        let end_offset = range
+            .end
+            .text_offset
+            .max(self.source.start.text_offset)
+            .min(self.source.end.text_offset);
+        if end_offset <= start_offset {
+            return None;
+        }
+        let start_chars = usize::try_from(start_offset - self.source.start.text_offset).ok()?;
+        let end_chars = usize::try_from(end_offset - self.source.start.text_offset).ok()?;
+        let start = byte_index_for_char_offset(&self.text, start_chars);
+        let end = byte_index_for_char_offset(&self.text, end_chars);
+        (end > start).then_some(start..end)
+    }
+
+    fn contains_source_anchor(&self, anchor: &SourceAnchor) -> bool {
+        source_range_contains(&self.source, anchor)
+    }
+}
+
+fn rect_distance_squared(rect: Rect, point: kurbo::Point) -> f64 {
+    let dx = if point.x < rect.x0 {
+        rect.x0 - point.x
+    } else if point.x > rect.x1 {
+        point.x - rect.x1
+    } else {
+        0.0
+    };
+    let dy = if point.y < rect.y0 {
+        rect.y0 - point.y
+    } else if point.y > rect.y1 {
+        point.y - rect.y1
+    } else {
+        0.0
+    };
+    dx.mul_add(dx, dy * dy)
+}
+
+fn merge_fixed_text_rects(rects: Vec<Rect>) -> Vec<Rect> {
+    let mut merged: Vec<Rect> = Vec::new();
+    for rect in rects {
+        if let Some(previous) = merged.last_mut() {
+            let same_line = (previous.center().y - rect.center().y).abs()
+                <= previous.height().abs().max(rect.height().abs()) * 0.55;
+            let gap = rect.x0 - previous.x1;
+            let merge_gap = previous.height().abs().max(rect.height().abs()) * 0.45;
+            if same_line && gap <= merge_gap && rect.x1 >= previous.x0 {
+                *previous = previous.union(rect);
+                continue;
+            }
+        }
+        merged.push(rect);
+    }
+    merged
+}
+
 fn byte_index_for_char_offset(text: &str, offset: usize) -> usize {
     text.char_indices()
         .nth(offset)
@@ -507,6 +778,9 @@ impl DisplayListCompiler {
                         image: ImageBrush::new(data),
                         transform,
                     }));
+                    if let Some(region) = fixed_text_region(image) {
+                        text_regions.push(region);
+                    }
                 }
                 PageItem::Separator(separator) => {
                     commands.push(DisplayCommand::Rule(RuleCommand {
@@ -533,7 +807,7 @@ impl DisplayListCompiler {
 }
 
 fn text_region(text: &TextPlacement) -> Option<TextRegion> {
-    Some(TextRegion {
+    Some(TextRegion::Shaped(ShapedTextRegion {
         layout: Arc::clone(&text.layout),
         text: Arc::clone(&text.text),
         source_text_start: text.source_text_start,
@@ -541,6 +815,47 @@ fn text_region(text: &TextPlacement) -> Option<TextRegion> {
         origin_x: text.origin_x,
         origin_y: text.origin_y,
         source: text.source.clone()?,
+    }))
+}
+
+fn fixed_text_region(image: &ImagePlacement) -> Option<TextRegion> {
+    let layer = image.text_layer.as_ref()?;
+    let source = image.source.clone()?;
+    if layer.text.is_empty() || layer.spans.is_empty() || layer.width <= 0.0 || layer.height <= 0.0
+    {
+        return None;
+    }
+    let scale_x = f64::from(image.width / layer.width);
+    let scale_y = f64::from(image.height / layer.height);
+    let spans = layer
+        .spans
+        .iter()
+        .filter_map(|span| {
+            let start_chars = usize::try_from(span.char_range.start).ok()?;
+            let end_chars = usize::try_from(span.char_range.end).ok()?;
+            let byte_start = byte_index_for_char_offset(&layer.text, start_chars);
+            let byte_end = byte_index_for_char_offset(&layer.text, end_chars);
+            if byte_end <= byte_start {
+                return None;
+            }
+            let rect = &span.rect;
+            Some(FixedTextSpan {
+                byte_range: byte_start..byte_end,
+                rect: Rect::new(
+                    f64::from(image.x) + f64::from(rect.x) * scale_x,
+                    f64::from(image.y) + f64::from(rect.y) * scale_y,
+                    f64::from(image.x) + f64::from(rect.x + rect.width) * scale_x,
+                    f64::from(image.y) + f64::from(rect.y + rect.height) * scale_y,
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!spans.is_empty()).then(|| {
+        TextRegion::Fixed(FixedTextRegion {
+            text: Arc::from(layer.text.as_str()),
+            spans: spans.into(),
+            source,
+        })
     })
 }
 
@@ -606,8 +921,13 @@ fn color(value: Rgba) -> Color {
 mod tests {
     use super::*;
     use parley::{Alignment, AlignmentOptions, FontContext, LayoutContext, StyleProperty};
-    use rebook_layout::{LayoutViewport, PageItem, PageLayout, TextBrush, TextPlacement};
-    use rebook_publication::{SourceAnchor, SourceRange, SpineItemId};
+    use rebook_layout::{
+        ImagePlacement, LayoutViewport, PageItem, PageLayout, RasterImage, TextBrush, TextPlacement,
+    };
+    use rebook_publication::{
+        FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan, SourceAnchor, SourceRange,
+        SpineItemId,
+    };
 
     #[test]
     fn empty_page_still_has_a_background() {
@@ -692,5 +1012,71 @@ mod tests {
         assert_eq!(fragment.quote, "ello");
         assert_eq!(fragment.range, selected_source);
         assert!(!fragment.rects.is_empty());
+    }
+
+    #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the test uses small, bounded logical page coordinates"
+    )]
+    fn fixed_page_text_geometry_supports_hit_testing_and_source_ranges() {
+        let spine = SpineItemId::new("pdf-page-1").unwrap();
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "pdf-page-text".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "pdf-page-text".into(),
+                text_offset: 3,
+            },
+        };
+        let spans = (0_u16..3)
+            .map(|index| FixedPageTextSpan {
+                char_range: u64::from(index)..u64::from(index + 1),
+                rect: FixedPageTextRect {
+                    x: 10.0 + f32::from(index) * 10.0,
+                    y: 20.0,
+                    width: 9.0,
+                    height: 12.0,
+                },
+            })
+            .collect();
+        let page = PageLayout {
+            viewport: LayoutViewport::new(200, 200).unwrap(),
+            background: Rgba::BLACK,
+            items: vec![PageItem::Image(ImagePlacement {
+                image: RasterImage {
+                    width: 100,
+                    height: 100,
+                    pixels: vec![255; 100 * 100 * 4].into(),
+                },
+                x: 50.0,
+                y: 40.0,
+                width: 100.0,
+                height: 100.0,
+                source: Some(source.clone()),
+                text_layer: Some(FixedPageTextLayer {
+                    width: 100.0,
+                    height: 100.0,
+                    text: "PDF".into(),
+                    spans,
+                }),
+            })],
+        };
+
+        let list = DisplayListCompiler.compile(&page);
+        assert_eq!(list.text_region_count(), 1);
+        let rects = list.source_rects(std::slice::from_ref(&source));
+        assert_eq!(rects.len(), 1);
+        let point = rects[0].center();
+        let hit = list
+            .hit_test_text(point.x as f32, point.y as f32, true)
+            .expect("fixed text should be hit-testable");
+        let fragment = list.selection_fragment(hit.region_index, 0..3).unwrap();
+        assert_eq!(fragment.quote, "PDF");
+        assert_eq!(fragment.range, source);
     }
 }

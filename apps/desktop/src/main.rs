@@ -1245,6 +1245,7 @@ impl DesktopReader {
             match self.reader.current_spread() {
                 Ok(spread) => {
                     spread.primary.paint_background(&mut bridge);
+                    spread.primary.paint_images_at(&mut bridge, 0.0);
                     for highlight in &self.highlights {
                         spread.primary.paint_source_ranges(
                             &mut bridge,
@@ -1269,8 +1270,9 @@ impl DesktopReader {
                             0.0,
                         );
                     }
-                    spread.primary.paint_content_at(&mut bridge, 0.0);
+                    spread.primary.paint_non_image_content_at(&mut bridge, 0.0);
                     if let Some(secondary) = spread.secondary {
+                        secondary.paint_images_at(&mut bridge, spread.secondary_offset_x);
                         for highlight in &self.highlights {
                             secondary.paint_source_ranges(
                                 &mut bridge,
@@ -1295,7 +1297,8 @@ impl DesktopReader {
                                 spread.secondary_offset_x,
                             );
                         }
-                        secondary.paint_content_at(&mut bridge, spread.secondary_offset_x);
+                        secondary
+                            .paint_non_image_content_at(&mut bridge, spread.secondary_offset_x);
                     }
                 }
                 Err(error) => {

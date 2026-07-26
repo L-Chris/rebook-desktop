@@ -12,6 +12,7 @@ encoding_rs.workspace = true
 flate2.workspace = true
 hayro.workspace = true
 iepub.workspace = true
+kurbo.workspace = true
 lopdf.workspace = true
 quick-xml.workspace = true
 rebook-html = { path = "../html" }

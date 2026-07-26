@@ -212,6 +212,7 @@ impl ReadingIrParser {
             alt: attribute_local(node, "alt").unwrap_or_default().to_owned(),
             style: self.styles.image_style(node),
             source: Some(source),
+            text_layer: None,
         }));
         Ok(())
     }

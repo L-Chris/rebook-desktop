@@ -3628,6 +3628,7 @@ dependencies = [
  "flate2",
  "hayro",
  "iepub",
+ "kurbo 0.13.1",
  "lopdf",
  "quick-xml 0.41.0",
  "rebook-html",

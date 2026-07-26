@@ -348,6 +348,40 @@ pub struct ImageBlock {
     pub style: ImageStyle,
     /// Stable source range.
     pub source: Option<SourceRange>,
+    /// Optional text geometry for fixed-layout pages such as PDF documents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_layer: Option<FixedPageTextLayer>,
+}
+
+/// Searchable and selectable text attached to one fixed-layout image page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FixedPageTextLayer {
+    /// Coordinate-space width used by all span rectangles.
+    pub width: f32,
+    /// Coordinate-space height used by all span rectangles.
+    pub height: f32,
+    /// Extracted page text in logical reading order.
+    pub text: String,
+    /// Source character ranges and their fixed-page rectangles.
+    pub spans: Vec<FixedPageTextSpan>,
+}
+
+/// One source-backed fragment in a fixed page text layer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FixedPageTextSpan {
+    /// Unicode scalar range within [`FixedPageTextLayer::text`].
+    pub char_range: std::ops::Range<u64>,
+    /// Fragment rectangle in the text layer's coordinate space.
+    pub rect: FixedPageTextRect,
+}
+
+/// Axis-aligned rectangle in fixed-page coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FixedPageTextRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 /// A portable image length resolved by layout against the containing column.

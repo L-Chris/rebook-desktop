@@ -10,8 +10,8 @@ use parley::{
     LayoutContext, LineHeight, StyleProperty,
 };
 use rebook_publication::{
-    Block, BookSource, ImageStyle, Inline, PublicationError, Rgba, Section, SourceRange,
-    TextAlignment, TextBlock, TextBlockKind, TextStyle,
+    Block, BookSource, FixedPageTextLayer, ImageStyle, Inline, PublicationError, RenditionLayout,
+    Rgba, Section, SourceRange, TextAlignment, TextBlock, TextBlockKind, TextStyle,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -295,6 +295,7 @@ pub struct ImagePlacement {
     pub width: f32,
     pub height: f32,
     pub source: Option<SourceRange>,
+    pub text_layer: Option<FixedPageTextLayer>,
 }
 
 /// Positioned thematic break.
@@ -388,7 +389,12 @@ impl LayoutEngine {
         let visible_pages = geometry.visible_pages;
         let continuation_offset_x = geometry.continuation_offset_x;
 
-        let mut paginator = Paginator::new(viewport, reader_style.background, geometry);
+        let mut paginator = Paginator::new(
+            viewport,
+            reader_style.background,
+            geometry,
+            source.book().metadata.layout == RenditionLayout::PrePaginated,
+        );
 
         for blocks in fragments {
             for block in *blocks {
@@ -405,7 +411,12 @@ impl LayoutEngine {
                             height: decoded.height(),
                             pixels: decoded.into_raw().into(),
                         };
-                        paginator.push_image(raster, image.style, image.source.clone());
+                        paginator.push_image(
+                            raster,
+                            image.style,
+                            image.source.clone(),
+                            image.text_layer.clone(),
+                        );
                     }
                     Block::Separator => paginator.push_separator(),
                     Block::PageBreak => paginator.force_page(),
@@ -602,6 +613,7 @@ struct Paginator {
     cursor_y: f32,
     pages: Vec<PageLayout>,
     items: Vec<PageItem>,
+    center_fixed_page: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -615,7 +627,12 @@ struct PageGeometry {
 }
 
 impl Paginator {
-    fn new(viewport: LayoutViewport, background: Rgba, geometry: PageGeometry) -> Self {
+    fn new(
+        viewport: LayoutViewport,
+        background: Rgba,
+        geometry: PageGeometry,
+        center_fixed_page: bool,
+    ) -> Self {
         Self {
             viewport,
             background,
@@ -627,6 +644,7 @@ impl Paginator {
             cursor_y: geometry.top,
             pages: Vec::new(),
             items: Vec::new(),
+            center_fixed_page,
         }
     }
 
@@ -685,7 +703,13 @@ impl Paginator {
         clippy::cast_precision_loss,
         reason = "decoded image dimensions are bounded by publication resource limits"
     )]
-    fn push_image(&mut self, image: RasterImage, style: ImageStyle, source: Option<SourceRange>) {
+    fn push_image(
+        &mut self,
+        image: RasterImage,
+        style: ImageStyle,
+        source: Option<SourceRange>,
+        text_layer: Option<FixedPageTextLayer>,
+    ) {
         let intrinsic_width = image.width.max(1) as f32;
         let intrinsic_height = image.height.max(1) as f32;
         let aspect_ratio = intrinsic_width / intrinsic_height;
@@ -724,6 +748,7 @@ impl Paginator {
             width,
             height,
             source,
+            text_layer,
         }));
         self.column_has_content = true;
         self.cursor_y += height + 14.0;
@@ -770,6 +795,12 @@ impl Paginator {
         if self.items.is_empty() {
             self.cursor_y = self.top;
             return;
+        }
+        if self.center_fixed_page
+            && let [PageItem::Image(image)] = self.items.as_mut_slice()
+        {
+            let available_height = self.bottom - self.top;
+            image.y = self.top + ((available_height - image.height) / 2.0).max(0.0);
         }
         self.pages.push(PageLayout {
             viewport: self.viewport,
@@ -1030,6 +1061,7 @@ mod tests {
                 visible_pages: 1,
                 continuation_offset_x: 0.0,
             },
+            false,
         );
         paginator.push_image(
             RasterImage {
@@ -1043,6 +1075,7 @@ mod tests {
                 ..ImageStyle::default()
             },
             None,
+            None,
         );
 
         let pages = paginator.finish();
@@ -1052,5 +1085,39 @@ mod tests {
         assert!((image.width - 250.0).abs() < 0.001);
         assert!((image.height - 187.5).abs() < 0.001);
         assert!((image.x - 75.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn fixed_page_image_is_vertically_centered_in_the_content_area() {
+        let viewport = LayoutViewport::new(400, 500).unwrap();
+        let mut paginator = Paginator::new(
+            viewport,
+            Rgba::BLACK,
+            PageGeometry {
+                left: 20.0,
+                top: 40.0,
+                width: 360.0,
+                bottom: 460.0,
+                visible_pages: 1,
+                continuation_offset_x: 0.0,
+            },
+            true,
+        );
+        paginator.push_image(
+            RasterImage {
+                width: 200,
+                height: 100,
+                pixels: Vec::new().into(),
+            },
+            ImageStyle::default(),
+            None,
+            None,
+        );
+
+        let pages = paginator.finish();
+        let PageItem::Image(image) = &pages[0].items[0] else {
+            panic!("expected an image placement");
+        };
+        assert!((image.y - 200.0).abs() < 0.001);
     }
 }

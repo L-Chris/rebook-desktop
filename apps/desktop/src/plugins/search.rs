@@ -37,13 +37,22 @@ pub fn search_book(
             .map_err(|error| format!("解析第 {} 节失败：{error}", section_index + 1))?;
         let section_title = section_title(source, section_index, &section.blocks);
         for block in &section.blocks {
-            let Block::Text(block) = block else {
-                continue;
+            let (text, source_range) = match block {
+                Block::Text(block) => {
+                    let Some(source_range) = &block.source else {
+                        continue;
+                    };
+                    (text_block_text(block), source_range)
+                }
+                Block::Image(image) => {
+                    let (Some(layer), Some(source_range)) = (&image.text_layer, &image.source)
+                    else {
+                        continue;
+                    };
+                    (layer.text.clone(), source_range)
+                }
+                Block::Separator | Block::PageBreak => continue,
             };
-            let Some(source_range) = &block.source else {
-                continue;
-            };
-            let text = text_block_text(block);
             for found in matcher.find_iter(&text) {
                 let range = source_range_for_match(source_range, &text, found.start(), found.end());
                 results.push(BookSearchResult {
@@ -74,6 +83,9 @@ pub(crate) fn section_text(
         .iter()
         .filter_map(|block| match block {
             Block::Text(block) => Some(text_block_text(block)),
+            Block::Image(image) if image.text_layer.is_some() => {
+                image.text_layer.as_ref().map(|layer| layer.text.clone())
+            }
             Block::Image(image) if !image.alt.trim().is_empty() => Some(image.alt.clone()),
             _ => None,
         })
@@ -178,8 +190,9 @@ fn excerpt(text: &str, start: usize, end: usize, context_chars: usize) -> String
 #[cfg(test)]
 mod tests {
     use rebook_publication::{
-        BlockStyle, Book, Metadata, PublicationError, PublicationId, PublicationUrl, Resource,
-        Section, SpineItem, SpineItemId, TextRun, TextStyle,
+        BlockStyle, Book, FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan, ImageBlock,
+        ImageStyle, Metadata, PublicationError, PublicationId, PublicationUrl, Resource, Section,
+        SpineItem, SpineItemId, TextRun, TextStyle,
     };
 
     use super::*;
@@ -258,6 +271,73 @@ mod tests {
         assert_eq!(results[0].range.start.text_offset, 4);
         assert_eq!(results[0].range.end.text_offset, 11);
         assert_eq!(results[1].range.start.text_offset, 34);
+    }
+
+    #[test]
+    fn search_returns_source_ranges_from_fixed_page_text() {
+        let spine = SpineItemId::new("pdf-page-1").unwrap();
+        let href = PublicationUrl::parse("page-1.xhtml").unwrap();
+        let text = "可搜索的 PDF 页面";
+        let char_count = u64::try_from(text.chars().count()).unwrap();
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "pdf-page-text".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: spine.clone(),
+                node: "pdf-page-text".into(),
+                text_offset: char_count,
+            },
+        };
+        let search_source = SearchSource {
+            book: Book {
+                id: PublicationId::new("searchable-pdf").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: vec![SpineItem {
+                    id: spine.clone(),
+                    href: href.clone(),
+                    media_type: "application/pdf".into(),
+                    linear: true,
+                    properties: Vec::new(),
+                }],
+                table_of_contents: Vec::new(),
+            },
+            sections: vec![Section {
+                id: spine,
+                href,
+                blocks: vec![Block::Image(ImageBlock {
+                    href: PublicationUrl::parse("Pages/page-00001.png").unwrap(),
+                    alt: "PDF page 1".into(),
+                    style: ImageStyle::default(),
+                    source: Some(source),
+                    text_layer: Some(FixedPageTextLayer {
+                        width: 100.0,
+                        height: 100.0,
+                        text: text.into(),
+                        spans: vec![FixedPageTextSpan {
+                            char_range: 0..char_count,
+                            rect: FixedPageTextRect {
+                                x: 0.0,
+                                y: 0.0,
+                                width: 100.0,
+                                height: 20.0,
+                            },
+                        }],
+                    }),
+                })],
+                anchors: Vec::new(),
+            }],
+        };
+
+        let results = search_book(&search_source, "PDF", 10).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].matched_text, "PDF");
+        assert_eq!(results[0].range.start.text_offset, 5);
+        assert_eq!(results[0].range.end.text_offset, 8);
     }
 
     #[test]

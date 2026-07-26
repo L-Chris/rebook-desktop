@@ -158,6 +158,7 @@ impl BookSource for DirectBookSource {
                         alt: alt.clone(),
                         style: ImageStyle::default(),
                         source: None,
+                        text_layer: None,
                     })],
                     anchors: Vec::new(),
                 })
