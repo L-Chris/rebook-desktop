@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::persistence::write_json_atomic;
+
 pub use ai::{ChatResponse, ChatRole, ChatTurn, chat_with_book, translate_blocks};
 pub use commands::{
     ChatCommand, ChatCommandResolution, chat_command_suggestions, resolve_chat_command,
@@ -165,13 +167,7 @@ impl PluginSettings {
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "插件设置路径没有父目录"))?;
         fs::create_dir_all(parent)?;
-        let temporary = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(&settings).map_err(io::Error::other)?;
-        fs::write(&temporary, bytes)?;
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        fs::rename(temporary, path)
+        write_json_atomic(&path, &settings)
     }
 
     pub fn normalize(&mut self) {

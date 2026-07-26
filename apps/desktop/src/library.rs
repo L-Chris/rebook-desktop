@@ -8,6 +8,7 @@ use rebook_formats::open_bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::persistence::{write_bytes_atomic, write_json_atomic};
 use crate::sync::RemoteBookDownload;
 
 const LIBRARY_VERSION: u32 = 1;
@@ -162,14 +163,7 @@ impl LocalLibrary {
         let cover_name = cover_bytes
             .as_ref()
             .map(|_| format!("{}.cover", remote.manifest.book_id));
-        fs::write(
-            self.root.join(BOOKS_DIRECTORY).join(&storage_name),
-            remote.content,
-        )?;
-        if let (Some(name), Some(cover)) = (&cover_name, &cover_bytes) {
-            fs::write(self.root.join(COVERS_DIRECTORY).join(name), cover)?;
-        }
-        self.books.push(LibraryBook {
+        let book = LibraryBook {
             id: remote.manifest.book_id,
             title,
             authors,
@@ -177,10 +171,8 @@ impl LocalLibrary {
             path: self.root.join(BOOKS_DIRECTORY).join(storage_name),
             cover_bytes,
             added_at: remote.manifest.added_at,
-        });
-        self.books
-            .sort_by_key(|book| std::cmp::Reverse(book.added_at));
-        self.persist()?;
+        };
+        self.commit_import(&book, &remote.content, cover_name.as_deref())?;
         Ok(true)
     }
 
@@ -210,24 +202,16 @@ impl LocalLibrary {
         let cover_bytes = publication.cover_bytes().map(<[u8]>::to_vec);
         let cover_name = cover_bytes.as_ref().map(|_| format!("{id}.cover"));
 
-        fs::write(self.root.join(BOOKS_DIRECTORY).join(&storage_name), bytes)?;
-        if let (Some(name), Some(cover)) = (&cover_name, &cover_bytes) {
-            fs::write(self.root.join(COVERS_DIRECTORY).join(name), cover)?;
-        }
-
-        self.books.insert(
-            0,
-            LibraryBook {
-                id,
-                title,
-                authors: metadata.authors.clone(),
-                file_name,
-                path: self.root.join(BOOKS_DIRECTORY).join(storage_name),
-                cover_bytes,
-                added_at: unix_timestamp_millis(),
-            },
-        );
-        self.persist()?;
+        let book = LibraryBook {
+            id,
+            title,
+            authors: metadata.authors.clone(),
+            file_name,
+            path: self.root.join(BOOKS_DIRECTORY).join(storage_name),
+            cover_bytes,
+            added_at: unix_timestamp_millis(),
+        };
+        self.commit_import(&book, &bytes, cover_name.as_deref())?;
         Ok(true)
     }
 
@@ -235,26 +219,24 @@ impl LocalLibrary {
         let Some(index) = self.books.iter().position(|book| book.id == id) else {
             return Ok(false);
         };
-        let book = self.books.remove(index);
-        if let Err(error) = self.persist() {
-            self.books.insert(index, book);
-            return Err(error);
-        }
-        remove_if_exists(&book.path)?;
-        remove_if_exists(
-            &self
-                .root
-                .join(COVERS_DIRECTORY)
-                .join(format!("{}.cover", book.id)),
-        )?;
+        let book = self.books[index].clone();
+        let mut books = self.books.clone();
+        books.remove(index);
+        self.persist_books(&books)?;
+        self.books = books;
+        self.cleanup_book_files(&book);
         Ok(true)
     }
 
+    #[cfg(test)]
     fn persist(&self) -> LibraryResult<()> {
+        self.persist_books(&self.books)
+    }
+
+    fn persist_books(&self, books: &[LibraryBook]) -> LibraryResult<()> {
         let stored = StoredLibrary {
             version: LIBRARY_VERSION,
-            books: self
-                .books
+            books: books
                 .iter()
                 .map(|book| StoredBook {
                     id: book.id.clone(),
@@ -275,11 +257,47 @@ impl LocalLibrary {
                 })
                 .collect(),
         };
-        fs::write(
-            self.root.join(MANIFEST_FILE),
-            serde_json::to_vec_pretty(&stored)?,
-        )?;
+        write_json_atomic(&self.root.join(MANIFEST_FILE), &stored)?;
         Ok(())
+    }
+
+    fn commit_import(
+        &mut self,
+        book: &LibraryBook,
+        content: &[u8],
+        cover_name: Option<&str>,
+    ) -> LibraryResult<()> {
+        write_bytes_atomic(&book.path, content)?;
+        let cover_path = cover_name.map(|name| self.root.join(COVERS_DIRECTORY).join(name));
+        if let (Some(path), Some(cover)) = (&cover_path, &book.cover_bytes)
+            && let Err(error) = write_bytes_atomic(path, cover)
+        {
+            remove_if_exists_warn(&book.path);
+            return Err(error.into());
+        }
+
+        let mut books = self.books.clone();
+        books.push(book.clone());
+        books.sort_by_key(|entry| std::cmp::Reverse(entry.added_at));
+        if let Err(error) = self.persist_books(&books) {
+            remove_if_exists_warn(&book.path);
+            if let Some(path) = &cover_path {
+                remove_if_exists_warn(path);
+            }
+            return Err(error);
+        }
+        self.books = books;
+        Ok(())
+    }
+
+    fn cleanup_book_files(&self, book: &LibraryBook) {
+        remove_if_exists_warn(&book.path);
+        remove_if_exists_warn(
+            &self
+                .root
+                .join(COVERS_DIRECTORY)
+                .join(format!("{}.cover", book.id)),
+        );
     }
 }
 
@@ -306,6 +324,12 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+fn remove_if_exists_warn(path: &Path) {
+    if let Err(error) = remove_if_exists(path) {
+        tracing::warn!(%error, path = %path.display(), "failed to clean unreferenced library file");
     }
 }
 
@@ -396,6 +420,59 @@ mod tests {
         assert_eq!(second.imported, 0);
         assert_eq!(second.duplicates, 1);
         assert_eq!(library.books.len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_manifest_commit_rolls_back_imported_files_and_memory() {
+        let root = test_directory("import-rollback");
+        let source = root.join("source.epub");
+        build_fixture(&source);
+        let data_root = root.join("data");
+        let mut library = LocalLibrary::load_from(data_root.clone()).unwrap();
+        fs::create_dir(data_root.join(MANIFEST_FILE)).unwrap();
+
+        assert!(library.import_files(&[source]).is_err());
+        assert!(library.books().is_empty());
+        assert_eq!(
+            fs::read_dir(data_root.join(BOOKS_DIRECTORY))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            fs::read_dir(data_root.join(COVERS_DIRECTORY))
+                .unwrap()
+                .count(),
+            0
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_remove_commit_keeps_book_and_managed_file() {
+        let root = test_directory("remove-rollback");
+        let mut library = LocalLibrary::load_from(root.clone()).unwrap();
+        let managed_path = root.join(BOOKS_DIRECTORY).join("managed.epub");
+        fs::write(&managed_path, b"fixture").unwrap();
+        library.books.push(LibraryBook {
+            id: "managed".into(),
+            title: "Managed".into(),
+            authors: Vec::new(),
+            file_name: "original.epub".into(),
+            path: managed_path.clone(),
+            cover_bytes: None,
+            added_at: 1,
+        });
+        library.persist().unwrap();
+        fs::remove_file(root.join(MANIFEST_FILE)).unwrap();
+        fs::create_dir(root.join(MANIFEST_FILE)).unwrap();
+
+        assert!(library.remove("managed").is_err());
+        assert_eq!(library.books().len(), 1);
+        assert!(managed_path.exists());
 
         fs::remove_dir_all(root).unwrap();
     }

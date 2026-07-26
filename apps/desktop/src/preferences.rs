@@ -6,6 +6,8 @@ use directories::ProjectDirs;
 use rebook_layout::ReaderTypography;
 use serde::{Deserialize, Serialize};
 
+use crate::persistence::write_json_atomic;
+
 const SETTINGS_VERSION: u32 = 1;
 const SETTINGS_FILE: &str = "reader-settings.json";
 
@@ -60,17 +62,8 @@ fn save_to(path: &Path, typography: &ReaderTypography) -> PreferencesResult<()> 
         version: SETTINGS_VERSION,
         typography,
     };
-    persist_json(path, &serde_json::to_vec_pretty(&stored)?)?;
+    write_json_atomic(path, &stored)?;
     Ok(())
-}
-
-fn persist_json(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, bytes)?;
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(temporary, path)
 }
 
 #[cfg(test)]

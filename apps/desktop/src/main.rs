@@ -1,17 +1,20 @@
 //! Native e-book reader: parser -> reading IR -> page layout -> display list -> Xilem/Vello.
 
+mod async_task;
 mod design;
 mod dialog;
 mod feedback;
 mod fonts;
 mod highlights;
 mod library;
+mod persistence;
 mod plugins;
 mod pointer_button;
 mod preferences;
 mod reader_canvas;
 mod shelf_width_probe;
 mod sync;
+mod ui;
 mod vello_bridge;
 
 use std::borrow::Cow;
@@ -23,6 +26,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_task::{TaskResult, TaskSlot};
 use design::{
     CONTENT_GAP, CONTENT_PADDING_HORIZONTAL, CONTENT_PADDING_VERTICAL, CONTROL_HEIGHT,
     CONTROL_HEIGHT_COMPACT, DIALOG_FOOTER_HEIGHT, DIALOG_HEADER_HEIGHT, RADIUS_DIALOG,
@@ -45,11 +49,13 @@ use rebook_formats::{BookFormat, open_file as open_publication_file};
 use rebook_layout::{LayoutViewport, ReaderDefaultFont, ReaderStyle, ReaderTypography, SpreadMode};
 use rebook_publication::{BookSource, PublicationUrl, Rgba, SourceRange};
 use rebook_reader::{
-    NavigationOutcome, PageDirection, ReaderSelection, ReaderSession, ReaderSnapshot,
-    ReaderTextHit, TocViewItem,
+    NavigationAttempt, NavigationOutcome, PageDirection, ReaderSelection, ReaderSession,
+    ReaderSnapshot, ReaderTextHit, TocViewItem,
 };
+use rebook_renderer::PageDisplayList;
 use shelf_width_probe::shelf_width_probe;
 use sync::{LocalSyncBook, SyncReport, SyncSettings, SyncStore, run_sync};
+use ui::{divider, icon_label};
 use vello_bridge::XilemVelloScene;
 use xilem::core::{fork, map_state};
 use xilem::masonry::kurbo::Size;
@@ -156,6 +162,7 @@ fn open_reader(
     path: &Path,
     reader_fonts: Arc<[Blob<u8>]>,
     shelf_metadata: Option<BookDisplayMetadata>,
+    local_store: SyncStore,
 ) -> Result<DesktopReader, Box<dyn std::error::Error + Send + Sync>> {
     let started = Instant::now();
     let publication = open_publication_file(path)?;
@@ -180,7 +187,7 @@ fn open_reader(
         plugin_settings.translation_mode,
     ));
     let source: Arc<dyn BookSource> = translation_source.clone();
-    let highlight_store = HighlightStore::load_default()?;
+    let highlight_store = HighlightStore::from_store(local_store.clone())?;
     let highlights = highlight_store.for_book(&book_id);
     let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
     let typography = preferences::load_reader_typography().unwrap_or_else(|error| {
@@ -193,13 +200,7 @@ fn open_reader(
     };
     let mut reader =
         ReaderSession::open_with_fonts(Arc::clone(&source), viewport, style, reader_fonts)?;
-    let progress_store = SyncSettings::load_default()
-        .and_then(|settings| SyncStore::open_default(settings.device_id))
-        .map_err(|error| {
-            tracing::warn!(%error, "failed to open reading progress store");
-            error
-        })
-        .ok();
+    let progress_store = Some(local_store);
     if let Some(store) = &progress_store
         && let Some(progress) = store.load_progress(&book_id)?
         && let Err(error) = reader.restore_locator(&progress.locator)
@@ -281,6 +282,7 @@ struct DesktopApp {
     shelf: ShelfState,
     reader: Option<DesktopReader>,
     reader_fonts: Arc<[Blob<u8>]>,
+    local_store: Option<SyncStore>,
     sync: SyncUiState,
 }
 
@@ -300,24 +302,18 @@ struct SyncUiState {
     draft_settings: SyncSettings,
     draft_password: String,
     dialog_open: bool,
-    pending: Option<SyncTaskRequest>,
+    task: TaskSlot<SyncTask>,
     status: String,
-    next_request_id: u64,
 }
 
 #[derive(Clone)]
-struct SyncTaskRequest {
-    id: u64,
+struct SyncTask {
     settings: SyncSettings,
     password: String,
     books: Vec<LocalSyncBook>,
 }
 
-#[derive(Debug)]
-struct SyncTaskMessage {
-    id: u64,
-    result: Result<SyncReport, String>,
-}
+type SyncTaskMessage = TaskResult<SyncReport>;
 
 #[derive(Clone, Debug)]
 struct ShelfRemoveConfirmation {
@@ -341,26 +337,34 @@ impl DesktopApp {
                 Some(format!("读取 Windows 凭据失败：{error}")),
             ),
         };
+        let (local_store, store_error) = match SyncStore::open_default(settings.device_id.clone()) {
+            Ok(store) => (Some(store), None),
+            Err(error) => (None, Some(format!("打开本地阅读数据库失败：{error}"))),
+        };
         let mut shelf = ShelfState::new(library);
-        shelf.error = settings_error.or(password_error);
+        shelf.error = settings_error.or(password_error).or(store_error);
         Self {
             shelf,
             reader: None,
             reader_fonts,
+            local_store,
             sync: SyncUiState {
                 draft_settings: settings.clone(),
                 draft_password: password.clone(),
                 settings,
                 password,
                 dialog_open: false,
-                pending: None,
+                task: TaskSlot::default(),
                 status: String::new(),
-                next_request_id: 1,
             },
         }
     }
 
     fn open_book(&mut self, path: &Path) {
+        let Some(local_store) = self.local_store.clone() else {
+            self.shelf.error = Some("本地阅读数据库不可用，无法打开书籍".into());
+            return;
+        };
         let shelf_metadata = self
             .shelf
             .library
@@ -368,7 +372,12 @@ impl DesktopApp {
             .iter()
             .find(|book| book.path.as_path() == path)
             .map(BookDisplayMetadata::from);
-        match open_reader(path, Arc::clone(&self.reader_fonts), shelf_metadata) {
+        match open_reader(
+            path,
+            Arc::clone(&self.reader_fonts),
+            shelf_metadata,
+            local_store,
+        ) {
             Ok(reader) => {
                 self.reader = Some(reader);
                 self.shelf.error = None;
@@ -400,7 +409,7 @@ impl DesktopApp {
     fn remove_book(&mut self, id: &str) {
         match self.shelf.library.remove(id) {
             Ok(true) => {
-                if let Ok(store) = SyncStore::open_default(self.sync.settings.device_id.clone())
+                if let Some(store) = &self.local_store
                     && let Err(error) = store.set_book_present(id, false)
                 {
                     tracing::warn!(%error, "failed to persist local book removal tombstone");
@@ -466,7 +475,7 @@ impl DesktopApp {
     }
 
     fn start_sync(&mut self) {
-        if self.sync.pending.is_some() || !self.sync.settings.enabled {
+        if self.sync.task.is_pending() || !self.sync.settings.enabled {
             return;
         }
         if let Err(error) = self.sync.settings.validate() {
@@ -477,11 +486,8 @@ impl DesktopApp {
             self.shelf.error = Some("无法开始同步：请先填写 WebDAV 密码".into());
             return;
         }
-        let id = self.sync.next_request_id;
-        self.sync.next_request_id = self.sync.next_request_id.wrapping_add(1);
         self.sync.status = "正在同步书籍与阅读数据…".into();
-        self.sync.pending = Some(SyncTaskRequest {
-            id,
+        self.sync.task.begin(SyncTask {
             settings: self.sync.settings.clone(),
             password: self.sync.password.clone(),
             books: self
@@ -504,10 +510,9 @@ impl DesktopApp {
     }
 
     fn complete_sync(&mut self, message: SyncTaskMessage) {
-        if self.sync.pending.as_ref().map(|request| request.id) != Some(message.id) {
+        if self.sync.task.complete(message.id).is_none() {
             return;
         }
-        self.sync.pending = None;
         match message.result {
             Ok(mut report) => {
                 let mut imported = 0;
@@ -598,8 +603,9 @@ struct DesktopReader {
     ui: ReaderUiState,
     canvas_size: Option<(u32, u32)>,
     scene_revision: u64,
-    page_scenes: HashMap<PageSceneKey, Arc<Scene>>,
+    page_scenes: HashMap<PageSceneKey, Arc<PageSceneLayers>>,
     page_scene_lru: VecDeque<PageSceneKey>,
+    pending_page_turn: Option<PageDirection>,
     error: Option<String>,
     exit_requested: bool,
 }
@@ -620,17 +626,12 @@ struct DesktopReaderResources {
 }
 
 #[derive(Clone)]
-struct SearchTaskRequest {
-    id: u64,
+struct SearchTask {
     source: Arc<dyn BookSource>,
     query: String,
 }
 
-#[derive(Debug)]
-struct SearchTaskMessage {
-    id: u64,
-    result: Result<Vec<BookSearchResult>, String>,
-}
+type SearchTaskMessage = TaskResult<Vec<BookSearchResult>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusedMarkKind {
@@ -678,13 +679,11 @@ struct SearchUiState {
     query: String,
     results: Vec<BookSearchResult>,
     status: String,
-    pending: Option<SearchTaskRequest>,
-    next_request_id: u64,
+    task: TaskSlot<SearchTask>,
 }
 
 #[derive(Clone)]
-struct ChatTaskRequest {
-    id: u64,
+struct ChatTask {
     source: Arc<dyn BookSource>,
     settings: PluginSettings,
     history: Vec<ChatTurn>,
@@ -692,43 +691,31 @@ struct ChatTaskRequest {
     current_section: usize,
 }
 
-#[derive(Debug)]
-struct ChatTaskMessage {
-    id: u64,
-    result: Result<ChatResponse, String>,
-}
+type ChatTaskMessage = TaskResult<ChatResponse>;
 
 #[derive(Default)]
 struct ChatUiState {
     input: String,
     messages: Vec<ChatTurn>,
     error: Option<String>,
-    pending: Option<ChatTaskRequest>,
-    next_request_id: u64,
+    task: TaskSlot<ChatTask>,
 }
 
 #[derive(Clone)]
-struct TranslationTaskRequest {
-    id: u64,
+struct TranslationTask {
     section_index: usize,
     settings: PluginSettings,
     blocks: Vec<TranslationBlockInput>,
 }
 
-#[derive(Debug)]
-struct TranslationTaskMessage {
-    id: u64,
-    section_index: usize,
-    result: Result<Vec<BlockTranslation>, String>,
-}
+type TranslationTaskMessage = TaskResult<Vec<BlockTranslation>>;
 
 #[derive(Default)]
 struct TranslationUiState {
     enabled: bool,
     error: Option<String>,
     dismiss_at: Option<Instant>,
-    pending: Option<TranslationTaskRequest>,
-    next_request_id: u64,
+    task: TaskSlot<TranslationTask>,
 }
 
 impl TranslationUiState {
@@ -756,6 +743,67 @@ struct PageSceneKey {
     section: usize,
     segment: usize,
     page: usize,
+}
+
+struct PageSceneLayers {
+    underlay: Arc<Scene>,
+    content: Arc<Scene>,
+}
+
+#[derive(Clone, Copy)]
+enum SceneChange {
+    Overlays,
+    StaticContent,
+}
+
+#[derive(Clone, Copy)]
+enum MarkRetention {
+    Keep,
+    ClearSelectedHighlight,
+    ClearAll,
+}
+
+#[derive(Clone, Copy)]
+enum FollowUp {
+    None,
+    Run,
+}
+
+#[derive(Clone, Copy)]
+enum ProgressChange {
+    Keep,
+    Persist,
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotEffects {
+    scene: SceneChange,
+    marks: MarkRetention,
+    prefetch: FollowUp,
+    translation: FollowUp,
+    progress: ProgressChange,
+}
+
+impl SnapshotEffects {
+    const fn navigation() -> Self {
+        Self {
+            scene: SceneChange::Overlays,
+            marks: MarkRetention::ClearSelectedHighlight,
+            prefetch: FollowUp::Run,
+            translation: FollowUp::Run,
+            progress: ProgressChange::Persist,
+        }
+    }
+
+    const fn static_content_change() -> Self {
+        Self {
+            scene: SceneChange::StaticContent,
+            marks: MarkRetention::Keep,
+            prefetch: FollowUp::Run,
+            translation: FollowUp::None,
+            progress: ProgressChange::Keep,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1018,6 +1066,7 @@ impl DesktopReader {
             scene_revision: 0,
             page_scenes: HashMap::new(),
             page_scene_lru: VecDeque::new(),
+            pending_page_turn: None,
             error,
             exit_requested: false,
         }
@@ -1035,7 +1084,7 @@ impl DesktopReader {
                 self.selection_anchor = anchor;
                 self.selection = None;
                 self.selected_highlight_id = None;
-                self.invalidate_page_scenes();
+                self.bump_scene_revision();
             }
             Err(error) => self.error = Some(format!("选择文字失败：{error}")),
         }
@@ -1056,7 +1105,7 @@ impl DesktopReader {
         match result {
             Ok(selection) if self.selection != selection => {
                 self.selection = selection;
-                self.invalidate_page_scenes();
+                self.bump_scene_revision();
             }
             Ok(_) => {}
             Err(error) => self.error = Some(format!("选择文字失败：{error}")),
@@ -1076,7 +1125,7 @@ impl DesktopReader {
         self.selection_toolbar_visible = false;
         self.selection_anchor = None;
         self.selection = None;
-        self.invalidate_page_scenes();
+        self.bump_scene_revision();
         let candidates = self
             .highlights
             .iter()
@@ -1102,7 +1151,7 @@ impl DesktopReader {
         self.selection_toolbar_visible = false;
         self.selection_anchor = None;
         if self.selection.take().is_some() {
-            self.invalidate_page_scenes();
+            self.bump_scene_revision();
         }
     }
 
@@ -1118,7 +1167,7 @@ impl DesktopReader {
                 self.selection_anchor = None;
                 self.selection = None;
                 self.selected_highlight_id = None;
-                self.invalidate_page_scenes();
+                self.bump_scene_revision();
                 self.error = None;
             }
             Err(error) => self.error = Some(format!("保存高亮失败：{error}")),
@@ -1132,7 +1181,7 @@ impl DesktopReader {
                 if self.selected_highlight_id.as_deref() == Some(id) {
                     self.selected_highlight_id = None;
                 }
-                self.invalidate_page_scenes();
+                self.bump_scene_revision();
                 self.error = None;
             }
             Ok(false) => {}
@@ -1152,14 +1201,14 @@ impl DesktopReader {
         };
         match self.reader.go_to_source(&anchor) {
             Ok(result) => {
-                self.install_snapshot(result.snapshot);
+                self.apply_snapshot(
+                    result.snapshot,
+                    SnapshotEffects {
+                        marks: MarkRetention::Keep,
+                        ..SnapshotEffects::navigation()
+                    },
+                );
                 self.selected_highlight_id = Some(id.to_owned());
-                self.selection_anchor = None;
-                self.selection = None;
-                self.invalidate_page_scenes();
-                self.prefetch();
-                self.queue_current_section_translation();
-                self.error = None;
             }
             Err(error) => self.error = Some(format!("高亮跳转失败：{error}")),
         }
@@ -1175,7 +1224,7 @@ impl DesktopReader {
     }
 
     fn start_search(&mut self) {
-        if self.search.pending.is_some() {
+        if self.search.task.is_pending() {
             return;
         }
         let query = self.search.query.trim().to_owned();
@@ -1183,24 +1232,20 @@ impl DesktopReader {
             self.search.status = "请输入搜索内容".into();
             return;
         }
-        let id = self.search.next_request_id;
-        self.search.next_request_id = self.search.next_request_id.wrapping_add(1);
         self.search.status = "正在搜索…".into();
         self.search.results.clear();
         self.focused_mark = None;
-        self.search.pending = Some(SearchTaskRequest {
-            id,
+        self.search.task.begin(SearchTask {
             source: Arc::clone(&self.source),
             query,
         });
-        self.invalidate_page_scenes();
+        self.bump_scene_revision();
     }
 
     fn complete_search(&mut self, message: SearchTaskMessage) {
-        if self.search.pending.as_ref().map(|request| request.id) != Some(message.id) {
+        if self.search.task.complete(message.id).is_none() {
             return;
         }
-        self.search.pending = None;
         match message.result {
             Ok(results) => {
                 self.search.status = if results.is_empty() {
@@ -1220,15 +1265,8 @@ impl DesktopReader {
     fn go_to_search_result(&mut self, result: &BookSearchResult) {
         match self.reader.go_to_source(&result.range.start) {
             Ok(navigation) => {
-                self.install_snapshot(navigation.snapshot);
                 self.focused_mark = Some(FocusedMark::search(result.range.clone()));
-                self.selection_anchor = None;
-                self.selection = None;
-                self.selected_highlight_id = None;
-                self.invalidate_page_scenes();
-                self.prefetch();
-                self.queue_current_section_translation();
-                self.error = None;
+                self.apply_snapshot(navigation.snapshot, SnapshotEffects::navigation());
             }
             Err(error) => self.search.status = format!("搜索结果跳转失败：{error}"),
         }
@@ -1249,7 +1287,7 @@ impl DesktopReader {
 
     fn send_chat(&mut self) {
         let raw = self.chat.input.trim().to_owned();
-        if raw.is_empty() || self.chat.pending.is_some() {
+        if raw.is_empty() || self.chat.task.is_pending() {
             return;
         }
         match resolve_chat_command(&raw) {
@@ -1282,7 +1320,7 @@ impl DesktopReader {
     }
 
     fn select_chat_command(&mut self, command: ChatCommand) {
-        if self.chat.pending.is_none() {
+        if !self.chat.task.is_pending() {
             self.chat.input = command.insert_text.into();
             self.chat.error = None;
         }
@@ -1308,8 +1346,6 @@ impl DesktopReader {
             self.ui.assistant_panel = Some(AssistantPanel::Chat);
             return;
         }
-        let id = self.chat.next_request_id;
-        self.chat.next_request_id = self.chat.next_request_id.wrapping_add(1);
         let history = self.chat.messages.clone();
         self.chat.messages.push(ChatTurn {
             role: ChatRole::User,
@@ -1317,8 +1353,7 @@ impl DesktopReader {
             display_content,
         });
         self.chat.error = None;
-        self.chat.pending = Some(ChatTaskRequest {
-            id,
+        self.chat.task.begin(ChatTask {
             source: Arc::clone(&self.source),
             settings: self.plugin_settings.clone(),
             history,
@@ -1328,10 +1363,9 @@ impl DesktopReader {
     }
 
     fn complete_chat(&mut self, message: ChatTaskMessage) {
-        if self.chat.pending.as_ref().map(|request| request.id) != Some(message.id) {
+        if self.chat.task.complete(message.id).is_none() {
             return;
         }
-        self.chat.pending = None;
         match message.result {
             Ok(response) => {
                 if !response.rewrites.is_empty() {
@@ -1344,13 +1378,13 @@ impl DesktopReader {
                     };
                     match self.reader.refresh_source() {
                         Ok(snapshot) => {
-                            self.install_snapshot(snapshot);
-                            self.selection_anchor = None;
-                            self.selection = None;
-                            self.selected_highlight_id = None;
-                            self.focused_mark = None;
-                            self.invalidate_page_scenes();
-                            self.prefetch();
+                            self.apply_snapshot(
+                                snapshot,
+                                SnapshotEffects {
+                                    marks: MarkRetention::ClearAll,
+                                    ..SnapshotEffects::static_content_change()
+                                },
+                            );
                         }
                         Err(error) => {
                             let rollback_error = self.rewrite_source.rollback(transaction).err();
@@ -1376,7 +1410,7 @@ impl DesktopReader {
     }
 
     fn clear_chat(&mut self) {
-        if self.chat.pending.is_none() {
+        if !self.chat.task.is_pending() {
             self.chat.messages.clear();
             self.chat.error = None;
         }
@@ -1387,7 +1421,7 @@ impl DesktopReader {
         self.translation.clear_error();
         if self.translation.enabled {
             self.translation.enabled = false;
-            self.translation.pending = None;
+            self.translation.task.cancel();
             if let Err(error) = self.translation_source.set_enabled(false) {
                 self.translation.show_error(error, Instant::now());
                 return;
@@ -1424,7 +1458,7 @@ impl DesktopReader {
     }
 
     fn queue_current_section_translation(&mut self) {
-        if !self.translation.enabled || self.translation.pending.is_some() {
+        if !self.translation.enabled || self.translation.task.is_pending() {
             return;
         }
         let section_index = self.snapshot.location.section_index;
@@ -1444,11 +1478,8 @@ impl DesktopReader {
             }
             return;
         }
-        let id = self.translation.next_request_id;
-        self.translation.next_request_id = self.translation.next_request_id.wrapping_add(1);
         self.translation.clear_error();
-        self.translation.pending = Some(TranslationTaskRequest {
-            id,
+        self.translation.task.begin(TranslationTask {
             section_index,
             settings: self.plugin_settings.clone(),
             blocks,
@@ -1456,22 +1487,21 @@ impl DesktopReader {
     }
 
     fn complete_translation(&mut self, message: TranslationTaskMessage) {
-        if self.translation.pending.as_ref().map(|request| request.id) != Some(message.id) {
+        let Some(request) = self.translation.task.complete(message.id) else {
             return;
-        }
-        self.translation.pending = None;
+        };
         match message.result {
             Ok(translations) => {
                 if let Err(error) = self
                     .translation_source
-                    .store_section(message.section_index, &translations)
+                    .store_section(request.section_index, &translations)
                 {
                     self.translation.show_error(error, Instant::now());
                     return;
                 }
                 self.translation.clear_error();
                 if self.translation.enabled
-                    && self.snapshot.location.section_index == message.section_index
+                    && self.snapshot.location.section_index == request.section_index
                 {
                     self.refresh_translation_view();
                 }
@@ -1487,12 +1517,13 @@ impl DesktopReader {
     fn refresh_translation_view(&mut self) {
         match self.reader.refresh_source() {
             Ok(snapshot) => {
-                self.install_snapshot(snapshot);
-                self.selection_anchor = None;
-                self.selection = None;
-                self.selected_highlight_id = None;
-                self.invalidate_page_scenes();
-                self.prefetch();
+                self.apply_snapshot(
+                    snapshot,
+                    SnapshotEffects {
+                        marks: MarkRetention::ClearSelectedHighlight,
+                        ..SnapshotEffects::static_content_change()
+                    },
+                );
             }
             Err(error) => self
                 .translation
@@ -1501,28 +1532,46 @@ impl DesktopReader {
     }
 
     fn turn_page(&mut self, direction: PageDirection) {
+        if self.pending_page_turn.is_some() {
+            return;
+        }
+        self.pending_page_turn = Some(direction);
+        self.retry_pending_page_turn();
+    }
+
+    fn retry_pending_page_turn(&mut self) {
+        let Some(direction) = self.pending_page_turn else {
+            return;
+        };
         let previous_section = self.snapshot.location.section_index;
         let previous_segment = self.snapshot.location.segment_index;
-        let result = self.reader.turn_page(direction);
+        let result = self.reader.try_turn_page(direction);
+        if result.is_err() {
+            self.pending_page_turn = None;
+        }
         match result {
-            Ok(result) => {
+            Ok(NavigationAttempt::Pending) => {}
+            Ok(NavigationAttempt::Ready(result)) => {
                 let moved = result.outcome == NavigationOutcome::Moved;
                 let section_changed = result.snapshot.location.section_index != previous_section;
                 let segment_changed = result.snapshot.location.segment_index != previous_segment;
-                self.install_snapshot(result.snapshot);
-                self.selection_anchor = None;
-                self.selection = None;
-                self.selected_highlight_id = None;
-                self.error = None;
-                if moved {
-                    self.bump_scene_revision();
-                }
-                if moved && (section_changed || segment_changed) {
-                    self.prefetch();
-                }
-                if moved {
-                    self.queue_current_section_translation();
-                }
+                self.apply_snapshot(
+                    result.snapshot,
+                    SnapshotEffects {
+                        prefetch: if moved && (section_changed || segment_changed) {
+                            FollowUp::Run
+                        } else {
+                            FollowUp::None
+                        },
+                        translation: if moved { FollowUp::Run } else { FollowUp::None },
+                        progress: if moved {
+                            ProgressChange::Persist
+                        } else {
+                            ProgressChange::Keep
+                        },
+                        ..SnapshotEffects::navigation()
+                    },
+                );
             }
             Err(error) => self.error = Some(format!("翻页失败：{error}")),
         }
@@ -1580,16 +1629,17 @@ impl DesktopReader {
             Ok(snapshot) => {
                 self.plugin_settings = plugin_settings;
                 self.translation.clear_error();
-                self.install_snapshot(snapshot);
-                self.selection_anchor = None;
-                self.selection = None;
-                self.close_overlay();
-                self.invalidate_page_scenes();
-                self.prefetch();
                 if translation_backend_changed {
-                    self.translation.pending = None;
+                    self.translation.task.cancel();
                 }
-                self.queue_current_section_translation();
+                self.apply_snapshot(
+                    snapshot,
+                    SnapshotEffects {
+                        translation: FollowUp::Run,
+                        ..SnapshotEffects::static_content_change()
+                    },
+                );
+                self.close_overlay();
             }
             Err(error) => self.error = Some(format!("应用阅读设置失败：{error}")),
         }
@@ -1599,14 +1649,7 @@ impl DesktopReader {
         let result = self.reader.go_to_href(target);
         match result {
             Ok(result) => {
-                self.install_snapshot(result.snapshot);
-                self.selection_anchor = None;
-                self.selection = None;
-                self.selected_highlight_id = None;
-                self.bump_scene_revision();
-                self.error = None;
-                self.prefetch();
-                self.queue_current_section_translation();
+                self.apply_snapshot(result.snapshot, SnapshotEffects::navigation());
             }
             Err(error) => self.error = Some(format!("目录跳转失败：{error}")),
         }
@@ -1627,12 +1670,8 @@ impl DesktopReader {
         let result = self.reader.resize(viewport);
         match result {
             Ok(snapshot) => {
-                self.install_snapshot(snapshot);
-                self.selection_anchor = None;
-                self.selection = None;
                 self.canvas_size = Some((width, height));
-                self.invalidate_page_scenes();
-                self.prefetch();
+                self.apply_snapshot(snapshot, SnapshotEffects::static_content_change());
             }
             Err(error) => self.error = Some(format!("调整页面失败：{error}")),
         }
@@ -1658,7 +1697,36 @@ impl DesktopReader {
             .expanded_toc
             .extend(snapshot.active_toc_path.iter().cloned());
         self.snapshot = snapshot;
-        self.persist_progress();
+    }
+
+    fn apply_snapshot(&mut self, snapshot: ReaderSnapshot, effects: SnapshotEffects) {
+        self.pending_page_turn = None;
+        self.install_snapshot(snapshot);
+        self.selection_toolbar_visible = false;
+        self.selection_anchor = None;
+        self.selection = None;
+        match effects.marks {
+            MarkRetention::Keep => {}
+            MarkRetention::ClearSelectedHighlight => self.selected_highlight_id = None,
+            MarkRetention::ClearAll => {
+                self.selected_highlight_id = None;
+                self.focused_mark = None;
+            }
+        }
+        match effects.scene {
+            SceneChange::Overlays => self.bump_scene_revision(),
+            SceneChange::StaticContent => self.invalidate_page_scenes(),
+        }
+        self.error = None;
+        if matches!(effects.progress, ProgressChange::Persist) {
+            self.persist_progress();
+        }
+        if matches!(effects.prefetch, FollowUp::Run) {
+            self.prefetch();
+        }
+        if matches!(effects.translation, FollowUp::Run) {
+            self.queue_current_section_translation();
+        }
     }
 
     fn persist_progress(&self) {
@@ -1672,86 +1740,66 @@ impl DesktopReader {
     }
 
     fn page_scene(&mut self) -> Arc<Scene> {
+        let layers = self.page_scene_layers();
+        let mut scene = Scene::new();
+        scene.append(&layers.underlay, None);
+        match self.reader.current_spread() {
+            Ok(spread) => {
+                let mut bridge = XilemVelloScene::new(&mut scene);
+                self.paint_page_overlays(&spread.primary, &mut bridge, 0.0);
+                if let Some(secondary) = spread.secondary {
+                    self.paint_page_overlays(&secondary, &mut bridge, spread.secondary_offset_x);
+                }
+            }
+            Err(error) => self.error = Some(format!("组合双页失败：{error}")),
+        }
+        scene.append(&layers.content, None);
+        Arc::new(scene)
+    }
+
+    fn page_scene_layers(&mut self) -> Arc<PageSceneLayers> {
         let key = PageSceneKey {
             section: self.snapshot.location.section_index,
             segment: self.snapshot.location.segment_index,
             page: self.snapshot.location.page_index,
         };
-        if let Some(scene) = self.page_scenes.get(&key).cloned() {
+        if let Some(layers) = self.page_scenes.get(&key).cloned() {
             self.touch_page_scene(key);
-            return scene;
+            return layers;
         }
 
-        let mut scene = Scene::new();
-        {
-            let mut bridge = XilemVelloScene::new(&mut scene);
-            match self.reader.current_spread() {
-                Ok(spread) => {
-                    spread.primary.paint_background(&mut bridge);
-                    spread.primary.paint_images_at(&mut bridge, 0.0);
-                    for highlight in &self.highlights {
-                        spread.primary.paint_source_ranges(
-                            &mut bridge,
-                            &highlight.ranges,
-                            ANNOTATION_MARK_COLOR,
-                            0.0,
-                        );
-                    }
-                    if let Some(mark) = &self.focused_mark {
-                        spread.primary.paint_source_ranges(
-                            &mut bridge,
-                            &mark.ranges,
-                            mark.color(),
-                            0.0,
-                        );
-                    }
-                    if let Some(selection) = &self.selection {
-                        spread.primary.paint_source_ranges(
-                            &mut bridge,
-                            &selection.ranges,
-                            TEXT_SELECTION_COLOR,
-                            0.0,
-                        );
-                    }
-                    spread.primary.paint_non_image_content_at(&mut bridge, 0.0);
-                    if let Some(secondary) = spread.secondary {
-                        secondary.paint_images_at(&mut bridge, spread.secondary_offset_x);
-                        for highlight in &self.highlights {
-                            secondary.paint_source_ranges(
-                                &mut bridge,
-                                &highlight.ranges,
-                                ANNOTATION_MARK_COLOR,
-                                spread.secondary_offset_x,
-                            );
-                        }
-                        if let Some(mark) = &self.focused_mark {
-                            secondary.paint_source_ranges(
-                                &mut bridge,
-                                &mark.ranges,
-                                mark.color(),
-                                spread.secondary_offset_x,
-                            );
-                        }
-                        if let Some(selection) = &self.selection {
-                            secondary.paint_source_ranges(
-                                &mut bridge,
-                                &selection.ranges,
-                                TEXT_SELECTION_COLOR,
-                                spread.secondary_offset_x,
-                            );
-                        }
-                        secondary
-                            .paint_non_image_content_at(&mut bridge, spread.secondary_offset_x);
-                    }
+        let mut underlay = Scene::new();
+        let mut content = Scene::new();
+        match self.reader.current_spread() {
+            Ok(spread) => {
+                let mut underlay_bridge = XilemVelloScene::new(&mut underlay);
+                spread.primary.paint_background(&mut underlay_bridge);
+                spread.primary.paint_images_at(&mut underlay_bridge, 0.0);
+                if let Some(secondary) = &spread.secondary {
+                    secondary.paint_images_at(&mut underlay_bridge, spread.secondary_offset_x);
                 }
-                Err(error) => {
-                    self.error = Some(format!("组合双页失败：{error}"));
-                    self.reader.current_page().paint(&mut bridge);
+
+                let mut content_bridge = XilemVelloScene::new(&mut content);
+                spread
+                    .primary
+                    .paint_non_image_content_at(&mut content_bridge, 0.0);
+                if let Some(secondary) = spread.secondary {
+                    secondary
+                        .paint_non_image_content_at(&mut content_bridge, spread.secondary_offset_x);
                 }
             }
+            Err(error) => {
+                self.error = Some(format!("组合双页失败：{error}"));
+                self.reader
+                    .current_page()
+                    .paint(&mut XilemVelloScene::new(&mut underlay));
+            }
         }
-        let scene = Arc::new(scene);
-        self.page_scenes.insert(key, Arc::clone(&scene));
+        let layers = Arc::new(PageSceneLayers {
+            underlay: Arc::new(underlay),
+            content: Arc::new(content),
+        });
+        self.page_scenes.insert(key, Arc::clone(&layers));
         self.touch_page_scene(key);
         let cache_capacity = match self.format {
             BookFormat::Pdf => PDF_PAGE_SCENE_CACHE_CAPACITY,
@@ -1765,7 +1813,24 @@ impl DesktopReader {
                 self.page_scenes.remove(&oldest);
             }
         }
-        scene
+        layers
+    }
+
+    fn paint_page_overlays(
+        &self,
+        page: &PageDisplayList,
+        scene: &mut XilemVelloScene<'_>,
+        offset_x: f32,
+    ) {
+        for highlight in &self.highlights {
+            page.paint_source_ranges(scene, &highlight.ranges, ANNOTATION_MARK_COLOR, offset_x);
+        }
+        if let Some(mark) = &self.focused_mark {
+            page.paint_source_ranges(scene, &mark.ranges, mark.color(), offset_x);
+        }
+        if let Some(selection) = &self.selection {
+            page.paint_source_ranges(scene, &selection.ranges, TEXT_SELECTION_COLOR, offset_x);
+        }
     }
 
     fn touch_page_scene(&mut self, key: PageSceneKey) {
@@ -1884,6 +1949,11 @@ impl DesktopReader {
             self.ui.last_motion_tick = None;
         }
     }
+
+    fn advance_frame(&mut self, now: Instant) {
+        self.advance_motion(now);
+        self.retry_pending_page_turn();
+    }
 }
 
 fn root_view(state: &mut DesktopApp) -> Box<AnyWidgetView<DesktopApp>> {
@@ -1908,7 +1978,7 @@ fn root_view(state: &mut DesktopApp) -> Box<AnyWidgetView<DesktopApp>> {
 }
 
 fn shelf_app_view(state: &mut DesktopApp) -> impl WidgetView<DesktopApp> + use<> {
-    let pending = state.sync.pending.clone();
+    let pending = state.sync.task.pending.clone();
     let auto_sync = state.sync.settings.enabled;
     let interval = Duration::from_secs(u64::from(state.sync.settings.interval_minutes.max(1)) * 60);
     let view = fork(
@@ -1919,7 +1989,8 @@ fn shelf_app_view(state: &mut DesktopApp) -> impl WidgetView<DesktopApp> + use<>
                     let request = request.clone();
                     async move {
                         let id = request.id;
-                        let result = run_sync(request.settings, request.password, request.books)
+                        let payload = request.payload;
+                        let result = run_sync(payload.settings, payload.password, payload.books)
                             .await
                             .map_err(|error| error.to_string());
                         let _ = proxy.message(SyncTaskMessage { id, result });
@@ -1965,7 +2036,7 @@ fn shelf_view(state: &mut DesktopApp) -> impl WidgetView<DesktopApp> + use<> {
         sized_box(
             flex_col((
                 FlexSpacer::Fixed(96.px()),
-                icon_label_for_app(Icon::Search, 30.0, UI_MUTED),
+                icon_label(Icon::Search, 30.0, UI_MUTED),
                 label("没有匹配的书籍").text_size(14.0).color(UI_MUTED),
             ))
             .gap(14.px())
@@ -1983,9 +2054,9 @@ fn shelf_view(state: &mut DesktopApp) -> impl WidgetView<DesktopApp> + use<> {
                 state.shelf.query.clone(),
                 book_count,
                 state.sync.settings.enabled,
-                state.sync.pending.is_some(),
+                state.sync.task.is_pending(),
             ),
-            divider_for_app(),
+            divider(),
             portal(
                 sized_box(zstack((
                     content.alignment(UnitPoint::TOP_LEFT),
@@ -2032,7 +2103,7 @@ fn shelf_feedback_notice(state: &DesktopApp) -> Box<AnyWidgetView<DesktopApp>> {
         notice_card(NoticeTone::Error, "操作失败", message.clone()).boxed()
     } else if let Some(message) = &state.shelf.notice {
         notice_card(NoticeTone::Success, "操作完成", message.clone()).boxed()
-    } else if state.sync.pending.is_some() {
+    } else if state.sync.task.is_pending() {
         notice_card(NoticeTone::Info, "WebDAV 同步", state.sync.status.clone()).boxed()
     } else {
         return sized_box(label("")).width(0.px()).height(0.px()).boxed();
@@ -2052,7 +2123,7 @@ fn shelf_toolbar(
 ) -> impl WidgetView<DesktopApp> {
     let search = sized_box(
         flex_row((
-            icon_label_for_app(Icon::Search, 16.0, UI_MUTED),
+            icon_label(Icon::Search, 16.0, UI_MUTED),
             text_input(query, |state: &mut DesktopApp, value| {
                 state.shelf.query = value;
             })
@@ -2159,7 +2230,7 @@ fn shelf_sync_dialog(state: &DesktopApp) -> impl WidgetView<DesktopApp> + use<> 
             sized_box(
                 flex_row((
                     flex_row((
-                        icon_label_for_app(Icon::CloudCog, 17.0, UI_ACCENT),
+                        icon_label(Icon::CloudCog, 17.0, UI_ACCENT),
                         label("WebDAV 同步")
                             .font(UI_FONT_STACK)
                             .text_size(15.0)
@@ -2176,7 +2247,7 @@ fn shelf_sync_dialog(state: &DesktopApp) -> impl WidgetView<DesktopApp> + use<> 
             .height(DIALOG_HEADER_HEIGHT.px())
             .expand_width()
             .padding(Padding::horizontal(CONTENT_PADDING_HORIZONTAL)),
-            divider_for_app(),
+            divider(),
             flex_col((
                 label("桌面端会直接连接 WebDAV；密码只保存到 Windows 凭据管理器。")
                     .font(UI_FONT_STACK)
@@ -2222,7 +2293,7 @@ fn shelf_sync_dialog(state: &DesktopApp) -> impl WidgetView<DesktopApp> + use<> 
                 CONTENT_PADDING_HORIZONTAL,
             ))
             .flex(1.0),
-            divider_for_app(),
+            divider(),
             sized_box(
                 flex_row((
                     FlexSpacer::Flex(1.0),
@@ -2455,7 +2526,7 @@ fn shelf_cover_content(
         book.authors.join(" / ")
     };
     flex_col((
-        icon_label_for_app(Icon::BookOpen, 20.0, Color::from_rgba8(255, 255, 255, 150)),
+        icon_label(Icon::BookOpen, 20.0, Color::from_rgba8(255, 255, 255, 150)),
         FlexSpacer::Flex(1.0),
         prose(book.title.clone())
             .text_size(17.0)
@@ -2474,7 +2545,7 @@ fn shelf_cover_content(
 fn shelf_remove_button(id: String, title: String) -> impl WidgetView<DesktopApp> {
     sized_box(
         button(
-            icon_label_for_app(Icon::Trash2, 14.0, Color::WHITE),
+            icon_label(Icon::Trash2, 14.0, Color::WHITE),
             move |state: &mut DesktopApp| {
                 state.request_remove_book(id.clone(), title.clone());
             },
@@ -2503,7 +2574,7 @@ fn shelf_book_status(available: bool) -> impl WidgetView<DesktopApp> {
         )
     };
     flex_row((
-        icon_label_for_app(icon, 12.0, color),
+        icon_label(icon, 12.0, color),
         label(text).text_size(11.5).color(color),
     ))
     .gap(5.px())
@@ -2514,16 +2585,13 @@ fn import_card() -> impl WidgetView<DesktopApp> {
     sized_box(
         flex_col((
             sized_box(
-                button(
-                    icon_label_for_app(Icon::Plus, 46.0, UI_MUTED),
-                    import_with_dialog,
-                )
-                .background_color(UI_SURFACE_MUTED)
-                .active_background_color(UI_ACCENT_SOFT)
-                .border_color(UI_BORDER)
-                .hovered_border_color(UI_ACCENT_BORDER)
-                .corner_radius(4.0)
-                .padding(0.0),
+                button(icon_label(Icon::Plus, 46.0, UI_MUTED), import_with_dialog)
+                    .background_color(UI_SURFACE_MUTED)
+                    .active_background_color(UI_ACCENT_SOFT)
+                    .border_color(UI_BORDER)
+                    .hovered_border_color(UI_ACCENT_BORDER)
+                    .corner_radius(4.0)
+                    .padding(0.0),
             )
             .width(SHELF_CARD_WIDTH.px())
             .height(SHELF_COVER_HEIGHT.px()),
@@ -2544,7 +2612,7 @@ fn shelf_icon_button(
     callback: impl Fn(&mut DesktopApp) + Send + Sync + 'static,
 ) -> impl WidgetView<DesktopApp> {
     sized_box(
-        button(icon_label_for_app(icon, 17.0, UI_TEXT_SOFT), callback)
+        button(icon_label(icon, 17.0, UI_TEXT_SOFT), callback)
             .background_color(UI_SURFACE)
             .active_background_color(UI_SURFACE_MUTED)
             .border_color(Color::TRANSPARENT)
@@ -2554,20 +2622,6 @@ fn shelf_icon_button(
     )
     .width(36.px())
     .height(36.px())
-}
-
-fn icon_label_for_app(icon: Icon, size: f32, color: Color) -> impl WidgetView<DesktopApp> {
-    label(char::from(icon).to_string())
-        .font("lucide")
-        .text_size(size)
-        .color(color)
-}
-
-fn divider_for_app() -> impl WidgetView<DesktopApp> {
-    sized_box(label(""))
-        .height(1.px())
-        .expand_width()
-        .background_color(UI_BORDER)
 }
 
 fn import_with_dialog(state: &mut DesktopApp) {
@@ -2674,10 +2728,12 @@ fn cover_color(id: &str) -> Color {
 }
 
 fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
-    let animations_running = state.ui.needs_motion_tick() || state.translation.dismiss_at.is_some();
-    let search_request = state.search.pending.clone();
-    let chat_request = state.chat.pending.clone();
-    let translation_request = state.translation.pending.clone();
+    let animations_running = state.ui.needs_motion_tick()
+        || state.translation.dismiss_at.is_some()
+        || state.pending_page_turn.is_some();
+    let search_request = state.search.task.pending.clone();
+    let chat_request = state.chat.task.pending.clone();
+    let translation_request = state.translation.task.pending.clone();
     let app = reader_shell(state);
 
     let app = fork(
@@ -2694,7 +2750,7 @@ fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopReader> + use<>
                         }
                     }
                 },
-                |state: &mut DesktopReader, now| state.advance_motion(now),
+                |state: &mut DesktopReader, now| state.advance_frame(now),
             )
         }),
     );
@@ -2706,8 +2762,9 @@ fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopReader> + use<>
                     let request = request.clone();
                     async move {
                         let id = request.id;
+                        let payload = request.payload;
                         let result = xilem::tokio::task::spawn_blocking(move || {
-                            search_book(request.source.as_ref(), &request.query, 100)
+                            search_book(payload.source.as_ref(), &payload.query, 100)
                         })
                         .await
                         .map_err(|error| format!("搜索任务失败：{error}"))
@@ -2727,12 +2784,13 @@ fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopReader> + use<>
                     let request = request.clone();
                     async move {
                         let id = request.id;
+                        let payload = request.payload;
                         let result = chat_with_book(
-                            request.source,
-                            request.settings,
-                            request.history,
-                            request.question,
-                            request.current_section,
+                            payload.source,
+                            payload.settings,
+                            payload.history,
+                            payload.question,
+                            payload.current_section,
                         )
                         .await;
                         let _ = proxy.message(ChatTaskMessage { id, result });
@@ -2750,13 +2808,9 @@ fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopReader> + use<>
                     let request = request.clone();
                     async move {
                         let id = request.id;
-                        let section_index = request.section_index;
-                        let result = translate_blocks(request.settings, request.blocks).await;
-                        let _ = proxy.message(TranslationTaskMessage {
-                            id,
-                            section_index,
-                            result,
-                        });
+                        let payload = request.payload;
+                        let result = translate_blocks(payload.settings, payload.blocks).await;
+                        let _ = proxy.message(TranslationTaskMessage { id, result });
                     }
                 },
                 DesktopReader::complete_translation,
@@ -2906,7 +2960,7 @@ fn reader_workspace(
 }
 
 fn translation_status_notice(state: &DesktopReader) -> Box<AnyWidgetView<DesktopReader>> {
-    let content: Box<AnyWidgetView<DesktopReader>> = if state.translation.pending.is_some() {
+    let content: Box<AnyWidgetView<DesktopReader>> = if state.translation.task.is_pending() {
         notice_card(
             NoticeTone::Info,
             "正在翻译",
@@ -3121,7 +3175,7 @@ fn sidebar_toolbar(pinned: bool, tab: SidebarTab) -> impl WidgetView<DesktopRead
 
 fn search_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     let query = state.search.query.clone();
-    let busy = state.search.pending.is_some();
+    let busy = state.search.task.is_pending();
     let status = state.search.status.clone();
     let active_range = state
         .focused_mark
@@ -3558,7 +3612,7 @@ fn assistant_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + us
 
 fn chat_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     let input = state.chat.input.clone();
-    let busy = state.chat.pending.is_some();
+    let busy = state.chat.task.is_pending();
     let mut rows = state
         .chat
         .messages
@@ -3840,13 +3894,6 @@ fn icon_button(
     )
     .width(32.px())
     .height(32.px())
-}
-
-fn icon_label(icon: Icon, size: f32, color: Color) -> impl WidgetView<DesktopReader> {
-    label(char::from(icon).to_string())
-        .font("lucide")
-        .text_size(size)
-        .color(color)
 }
 
 fn reader_menu() -> impl WidgetView<DesktopReader> {
@@ -5286,13 +5333,6 @@ fn transparent_catcher(
             .padding(0.0),
     )
     .expand()
-}
-
-fn divider() -> impl WidgetView<DesktopReader> {
-    sized_box(label(""))
-        .height(1.px())
-        .expand_width()
-        .background_color(UI_BORDER)
 }
 
 fn sidebar_scrim_color(progress: f32) -> Color {

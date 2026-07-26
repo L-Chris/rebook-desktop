@@ -11,6 +11,7 @@ authors.workspace = true
 
 [dependencies]
 anyrender.workspace = true
+atomicwrites.workspace = true
 directories.workspace = true
 image.workspace = true
 keyring.workspace = true

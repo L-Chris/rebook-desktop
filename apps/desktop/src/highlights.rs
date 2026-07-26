@@ -10,7 +10,7 @@ use rebook_publication::SourceRange;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::sync::{SyncSettings, SyncStore};
+use crate::sync::SyncStore;
 
 const LEGACY_STORE_VERSION: u32 = 1;
 const LEGACY_STORE_FILE: &str = "highlights.json";
@@ -50,11 +50,9 @@ struct LegacyStoredHighlights {
 }
 
 impl HighlightStore {
-    pub fn load_default() -> HighlightResult<Self> {
+    pub fn from_store(store: SyncStore) -> HighlightResult<Self> {
         let project = ProjectDirs::from("com", "Rebook", "Rebook")
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法确定高亮数据目录"))?;
-        let settings = SyncSettings::load_default()?;
-        let store = SyncStore::open_default(settings.device_id)?;
         migrate_legacy(&store, &project.data_local_dir().join(LEGACY_STORE_FILE))?;
         Ok(Self { store })
     }

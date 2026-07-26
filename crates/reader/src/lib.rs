@@ -116,6 +116,20 @@ pub struct NavigationResult {
     pub snapshot: ReaderSnapshot,
 }
 
+/// Result of an interactive navigation attempt. A pending result means the
+/// destination is being prepared by the background pagination worker and the
+/// caller should retry without blocking its event loop.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NavigationAttempt {
+    Ready(NavigationResult),
+    Pending,
+}
+
+enum PositionAttempt {
+    Ready(Option<ReaderPosition>),
+    Pending,
+}
+
 struct CachedSegment {
     section: Arc<PreparedSection>,
     pages: Vec<Arc<PageDisplayList>>,
@@ -925,6 +939,20 @@ impl ReaderSession {
         }
     }
 
+    /// Attempts to turn a page without parsing, laying out, or waiting on the
+    /// caller thread. When the destination is not cached, this queues exactly
+    /// the required segment and returns [`NavigationAttempt::Pending`].
+    pub fn try_turn_page(
+        &mut self,
+        direction: PageDirection,
+    ) -> Result<NavigationAttempt, ReaderError> {
+        self.poll_prefetch()?;
+        match direction {
+            PageDirection::Next => self.try_next_page(),
+            PageDirection::Previous => self.try_previous_page(),
+        }
+    }
+
     /// Queues a small layout-segment window around the current position for background
     /// pagination and display-list compilation. Crossing forward over an
     /// authored section boundary queues the start of the following sections.
@@ -1113,6 +1141,168 @@ impl ReaderSession {
         Ok(self.moved())
     }
 
+    fn try_next_page(&mut self) -> Result<NavigationAttempt, ReaderError> {
+        let mut destination = self.current_position();
+        for _ in 0..self.current_visible_pages() {
+            match self.try_next_position(destination)? {
+                PositionAttempt::Ready(Some(next)) => destination = next,
+                PositionAttempt::Ready(None) => {
+                    return Ok(NavigationAttempt::Ready(self.boundary()));
+                }
+                PositionAttempt::Pending => return Ok(NavigationAttempt::Pending),
+            }
+        }
+        if !self.try_spread_ready_at(destination)? {
+            return Ok(NavigationAttempt::Pending);
+        }
+        self.install_position(destination);
+        Ok(NavigationAttempt::Ready(self.moved()))
+    }
+
+    fn try_previous_page(&mut self) -> Result<NavigationAttempt, ReaderError> {
+        let original = self.current_position();
+        let mut destination = original;
+        for _ in 0..self.current_visible_pages() {
+            match self.try_previous_position(destination)? {
+                PositionAttempt::Ready(Some(previous)) => destination = previous,
+                PositionAttempt::Ready(None) => break,
+                PositionAttempt::Pending => return Ok(NavigationAttempt::Pending),
+            }
+        }
+        if destination == original {
+            return Ok(NavigationAttempt::Ready(self.boundary()));
+        }
+        if !self.try_spread_ready_at(destination)? {
+            return Ok(NavigationAttempt::Pending);
+        }
+        self.install_position(destination);
+        Ok(NavigationAttempt::Ready(self.moved()))
+    }
+
+    fn try_spread_ready_at(&mut self, position: ReaderPosition) -> Result<bool, ReaderError> {
+        let key = SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        };
+        if !self.try_ensure_segment(key)? {
+            return Ok(false);
+        }
+        let visible_pages = self
+            .cache
+            .get(&key)
+            .expect("ready layout segment must remain cached")
+            .visible_pages;
+        if visible_pages <= 1 {
+            return Ok(true);
+        }
+        Ok(matches!(
+            self.try_next_position(position)?,
+            PositionAttempt::Ready(_)
+        ))
+    }
+
+    fn try_next_position(
+        &mut self,
+        position: ReaderPosition,
+    ) -> Result<PositionAttempt, ReaderError> {
+        let key = SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        };
+        if !self.try_ensure_segment(key)? {
+            return Ok(PositionAttempt::Pending);
+        }
+        let segment = self
+            .cache
+            .get(&key)
+            .expect("ready layout segment must remain cached");
+        if position.page_index + 1 < segment.pages.len() {
+            return Ok(PositionAttempt::Ready(Some(ReaderPosition {
+                page_index: position.page_index + 1,
+                ..position
+            })));
+        }
+        let next_key = if position.segment_index + 1 < segment.section.segments.len() {
+            SegmentKey {
+                section_index: position.section_index,
+                segment_index: position.segment_index + 1,
+            }
+        } else {
+            let section_index = position.section_index + 1;
+            if section_index >= self.source.book().sections.len() {
+                return Ok(PositionAttempt::Ready(None));
+            }
+            SegmentKey {
+                section_index,
+                segment_index: 0,
+            }
+        };
+        if !self.try_ensure_segment(next_key)? {
+            return Ok(PositionAttempt::Pending);
+        }
+        Ok(PositionAttempt::Ready(Some(ReaderPosition {
+            section_index: next_key.section_index,
+            segment_index: next_key.segment_index,
+            page_index: 0,
+        })))
+    }
+
+    fn try_previous_position(
+        &mut self,
+        position: ReaderPosition,
+    ) -> Result<PositionAttempt, ReaderError> {
+        if position.page_index > 0 {
+            return Ok(PositionAttempt::Ready(Some(ReaderPosition {
+                page_index: position.page_index - 1,
+                ..position
+            })));
+        }
+        let previous_key = if let Some(segment_index) = position.segment_index.checked_sub(1) {
+            SegmentKey {
+                section_index: position.section_index,
+                segment_index,
+            }
+        } else {
+            let Some(section_index) = position.section_index.checked_sub(1) else {
+                return Ok(PositionAttempt::Ready(None));
+            };
+            let first_key = SegmentKey {
+                section_index,
+                segment_index: 0,
+            };
+            if !self.try_ensure_segment(first_key)? {
+                return Ok(PositionAttempt::Pending);
+            }
+            let segment_index = self
+                .cache
+                .get(&first_key)
+                .expect("ready layout segment must remain cached")
+                .section
+                .segments
+                .len()
+                .saturating_sub(1);
+            SegmentKey {
+                section_index,
+                segment_index,
+            }
+        };
+        if !self.try_ensure_segment(previous_key)? {
+            return Ok(PositionAttempt::Pending);
+        }
+        let page_index = self
+            .cache
+            .get(&previous_key)
+            .expect("ready layout segment must remain cached")
+            .pages
+            .len()
+            .saturating_sub(1);
+        Ok(PositionAttempt::Ready(Some(ReaderPosition {
+            section_index: previous_key.section_index,
+            segment_index: previous_key.segment_index,
+            page_index,
+        })))
+    }
+
     fn next_position(
         &mut self,
         position: ReaderPosition,
@@ -1260,6 +1450,24 @@ impl ReaderSession {
         self.touch(key);
         self.evict();
         Ok(())
+    }
+
+    fn try_ensure_segment(&mut self, key: SegmentKey) -> Result<bool, ReaderError> {
+        if self.cache.contains_key(&key) {
+            self.touch(key);
+            return Ok(true);
+        }
+        if let Some(error) = self.prefetch_failures.remove(&key) {
+            return Err(error);
+        }
+        let prefetch_key = PrefetchKey {
+            generation: self.prefetch_worker.generation(),
+            segment: key,
+        };
+        if !self.prefetch_inflight.contains(&prefetch_key) {
+            self.queue_prefetch(key)?;
+        }
+        Ok(false)
     }
 
     fn invalidate_layout(&mut self, fraction: f32) -> Result<(), ReaderError> {
@@ -2643,6 +2851,45 @@ mod tests {
 
         reader.wait_for_prefetch().unwrap();
         assert_eq!(source.parse_count(1), 1);
+    }
+
+    #[test]
+    fn interactive_page_turn_waits_in_background_instead_of_blocking() {
+        let blocking_source = CountingSource::with_background_delay(
+            &["first".into(), "second".into()],
+            Duration::from_millis(300),
+        );
+        let mut blocking_reader =
+            ReaderSession::open(blocking_source, viewport(600, 400), ReaderStyle::default())
+                .unwrap();
+        let blocking_started = Instant::now();
+        let blocking_result = blocking_reader.turn_page(PageDirection::Next).unwrap();
+        let blocking_elapsed = blocking_started.elapsed();
+        assert_eq!(blocking_result.outcome, NavigationOutcome::Moved);
+        assert!(blocking_elapsed >= Duration::from_millis(250));
+
+        let source = CountingSource::with_background_delay(
+            &["first".into(), "second".into()],
+            Duration::from_millis(300),
+        );
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        let nonblocking_started = Instant::now();
+        let attempt = reader.try_turn_page(PageDirection::Next).unwrap();
+        let nonblocking_elapsed = nonblocking_started.elapsed();
+
+        assert_eq!(attempt, NavigationAttempt::Pending);
+        assert!(nonblocking_elapsed < Duration::from_millis(100));
+        assert!(blocking_elapsed > nonblocking_elapsed * 2);
+        assert_eq!(reader.location().section_index, 0);
+
+        reader.wait_for_prefetch().unwrap();
+        let attempt = reader.try_turn_page(PageDirection::Next).unwrap();
+        let NavigationAttempt::Ready(result) = attempt else {
+            panic!("prefetched destination should be ready");
+        };
+        assert_eq!(result.outcome, NavigationOutcome::Moved);
+        assert_eq!(result.snapshot.location.section_index, 1);
     }
 
     #[test]

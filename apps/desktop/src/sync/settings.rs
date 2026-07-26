@@ -1,12 +1,14 @@
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use directories::ProjectDirs;
 use keyring::Entry;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::persistence::write_json_atomic;
 
 use super::SyncResult;
 
@@ -113,7 +115,7 @@ impl SyncSettings {
             version: SETTINGS_VERSION,
             settings: self.clone(),
         };
-        persist_json(&path, &serde_json::to_vec_pretty(&stored)?)?;
+        write_json_atomic(&path, &stored)?;
         Ok(())
     }
 
@@ -151,15 +153,6 @@ fn settings_path() -> io::Result<PathBuf> {
     let project = ProjectDirs::from("com", "Rebook", "Rebook")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法确定 WebDAV 同步设置目录"))?;
     Ok(project.config_dir().join(SETTINGS_FILE))
-}
-
-fn persist_json(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, bytes)?;
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(temporary, path)
 }
 
 #[cfg(test)]
