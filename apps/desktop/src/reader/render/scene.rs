@@ -1,0 +1,139 @@
+use std::sync::Arc;
+
+use rebook_formats::BookFormat;
+use rebook_renderer::PageDisplayList;
+use xilem::Color;
+use xilem::masonry::vello::Scene;
+
+use super::super::DesktopReader;
+use super::vello::XilemVelloScene;
+
+const PAGE_SCENE_CACHE_CAPACITY: usize = 32;
+const PDF_PAGE_SCENE_CACHE_CAPACITY: usize = 4;
+const ANNOTATION_MARK_COLOR: Color = Color::from_rgba8(96, 165, 250, 72);
+const TEXT_SELECTION_COLOR: Color = Color::from_rgba8(96, 165, 250, 89);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PageSceneKey {
+    section: usize,
+    segment: usize,
+    page: usize,
+}
+
+pub(crate) struct PageSceneLayers {
+    underlay: Arc<Scene>,
+    content: Arc<Scene>,
+}
+
+impl DesktopReader {
+    pub(in crate::reader) fn page_scene(&mut self) -> Arc<Scene> {
+        let layers = self.page_scene_layers();
+        let mut scene = Scene::new();
+        scene.append(&layers.underlay, None);
+        match self.reader.current_spread() {
+            Ok(spread) => {
+                let mut bridge = XilemVelloScene::new(&mut scene);
+                self.paint_page_overlays(&spread.primary, &mut bridge, 0.0);
+                if let Some(secondary) = spread.secondary {
+                    self.paint_page_overlays(&secondary, &mut bridge, spread.secondary_offset_x);
+                }
+            }
+            Err(error) => self.error = Some(format!("组合双页失败：{error}")),
+        }
+        scene.append(&layers.content, None);
+        Arc::new(scene)
+    }
+
+    fn page_scene_layers(&mut self) -> Arc<PageSceneLayers> {
+        let key = PageSceneKey {
+            section: self.snapshot.location.section_index,
+            segment: self.snapshot.location.segment_index,
+            page: self.snapshot.location.page_index,
+        };
+        if let Some(layers) = self.page_scenes.get(&key).cloned() {
+            self.touch_page_scene(key);
+            return layers;
+        }
+
+        let mut underlay = Scene::new();
+        let mut content = Scene::new();
+        match self.reader.current_spread() {
+            Ok(spread) => {
+                let mut underlay_bridge = XilemVelloScene::new(&mut underlay);
+                spread.primary.paint_background(&mut underlay_bridge);
+                spread.primary.paint_images_at(&mut underlay_bridge, 0.0);
+                if let Some(secondary) = &spread.secondary {
+                    secondary.paint_images_at(&mut underlay_bridge, spread.secondary_offset_x);
+                }
+
+                let mut content_bridge = XilemVelloScene::new(&mut content);
+                spread
+                    .primary
+                    .paint_non_image_content_at(&mut content_bridge, 0.0);
+                if let Some(secondary) = spread.secondary {
+                    secondary
+                        .paint_non_image_content_at(&mut content_bridge, spread.secondary_offset_x);
+                }
+            }
+            Err(error) => {
+                self.error = Some(format!("组合双页失败：{error}"));
+                self.reader
+                    .current_page()
+                    .paint(&mut XilemVelloScene::new(&mut underlay));
+            }
+        }
+        let layers = Arc::new(PageSceneLayers {
+            underlay: Arc::new(underlay),
+            content: Arc::new(content),
+        });
+        self.page_scenes.insert(key, Arc::clone(&layers));
+        self.touch_page_scene(key);
+        let cache_capacity = match self.format {
+            BookFormat::Pdf => PDF_PAGE_SCENE_CACHE_CAPACITY,
+            _ => PAGE_SCENE_CACHE_CAPACITY,
+        };
+        while self.page_scenes.len() > cache_capacity {
+            let Some(oldest) = self.page_scene_lru.pop_front() else {
+                break;
+            };
+            if oldest != key {
+                self.page_scenes.remove(&oldest);
+            }
+        }
+        layers
+    }
+
+    fn paint_page_overlays(
+        &self,
+        page: &PageDisplayList,
+        scene: &mut XilemVelloScene<'_>,
+        offset_x: f32,
+    ) {
+        for highlight in &self.highlights {
+            page.paint_source_ranges(scene, &highlight.ranges, ANNOTATION_MARK_COLOR, offset_x);
+        }
+        if let Some(mark) = &self.focused_mark {
+            page.paint_source_ranges(scene, &mark.ranges, mark.color(), offset_x);
+        }
+        if let Some(selection) = &self.selection {
+            page.paint_source_ranges(scene, &selection.ranges, TEXT_SELECTION_COLOR, offset_x);
+        }
+    }
+
+    fn touch_page_scene(&mut self, key: PageSceneKey) {
+        if let Some(position) = self.page_scene_lru.iter().position(|entry| *entry == key) {
+            self.page_scene_lru.remove(position);
+        }
+        self.page_scene_lru.push_back(key);
+    }
+
+    pub(in crate::reader) fn bump_scene_revision(&mut self) {
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+    }
+
+    pub(in crate::reader) fn invalidate_page_scenes(&mut self) {
+        self.page_scenes.clear();
+        self.page_scene_lru.clear();
+        self.bump_scene_revision();
+    }
+}

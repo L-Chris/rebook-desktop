@@ -8,8 +8,8 @@ use xilem::view::{
 };
 use xilem::{AnyWidgetView, Color, FontWeight, WidgetView};
 
-use crate::pointer_button::button;
-use crate::{UI_BORDER, UI_FONT_STACK, UI_MUTED, UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT};
+use super::button::button;
+use super::theme::{UI_BORDER, UI_FONT_STACK, UI_MUTED, UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NoticeTone {

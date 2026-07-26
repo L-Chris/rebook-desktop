@@ -7,6 +7,8 @@ use directories::ProjectDirs;
 use rebook_publication::{LocatorV1, SourceRange};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+use crate::highlights::{HighlightRepository, HighlightResult, StoredHighlight};
+
 use super::SyncResult;
 use super::protocol::{
     AnnotationState, ClockOrder, DeviceBookEntry, HybridTimestamp, ProgressState, compare_clocks,
@@ -407,6 +409,48 @@ impl SyncStore {
         let connection = Connection::open(&self.path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(connection)
+    }
+}
+
+impl HighlightRepository for SyncStore {
+    fn highlights_for_book(&self, book_id: &str) -> HighlightResult<Vec<StoredHighlight>> {
+        self.annotations_for_book(book_id).map(|annotations| {
+            annotations
+                .into_iter()
+                .map(|annotation| StoredHighlight {
+                    id: annotation.id,
+                    book_id: annotation.book_id,
+                    ranges: annotation.ranges,
+                    quote: annotation.quote,
+                    created_at: annotation.created_at,
+                })
+                .collect()
+        })
+    }
+
+    fn insert_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<()> {
+        self.create_annotation(
+            highlight.id.clone(),
+            highlight.book_id.clone(),
+            highlight.ranges.clone(),
+            highlight.quote.clone(),
+            highlight.created_at,
+        )?;
+        Ok(())
+    }
+
+    fn remove_highlight(&self, id: &str) -> HighlightResult<bool> {
+        self.delete_annotation(id)
+    }
+
+    fn import_legacy_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<()> {
+        self.import_legacy_annotation(
+            highlight.id.clone(),
+            highlight.book_id.clone(),
+            highlight.ranges.clone(),
+            highlight.quote.clone(),
+            highlight.created_at,
+        )
     }
 }
 

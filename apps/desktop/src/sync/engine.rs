@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
+use crate::library::RemoteLibraryBook;
+
 use super::SyncResult;
 use super::protocol::{
     BookManifest, DeviceBookState, DeviceLibrary, PROTOCOL_VERSION, ProtocolDocument,
@@ -24,20 +26,13 @@ pub(crate) struct LocalSyncBook {
     pub added_at: u64,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct RemoteBookDownload {
-    pub manifest: BookManifest,
-    pub content: Vec<u8>,
-    pub cover: Option<Vec<u8>>,
-}
-
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SyncReport {
     pub uploaded_books: usize,
     pub downloaded_books: usize,
     pub merged_annotations: usize,
     pub updated_progress: usize,
-    pub downloads: Vec<RemoteBookDownload>,
+    pub downloads: Vec<RemoteLibraryBook>,
 }
 
 pub(crate) async fn run_sync(
@@ -230,7 +225,7 @@ async fn discover_remote_books(webdav: &WebDavClient) -> SyncResult<BTreeSet<Str
     Ok(books)
 }
 
-async fn download_book(webdav: &WebDavClient, book_id: &str) -> SyncResult<RemoteBookDownload> {
+async fn download_book(webdav: &WebDavClient, book_id: &str) -> SyncResult<RemoteLibraryBook> {
     validate_book_id(book_id)?;
     let manifest_path = format!("books/{book_id}/manifest.json");
     let manifest_object = webdav
@@ -264,8 +259,13 @@ async fn download_book(webdav: &WebDavClient, book_id: &str) -> SyncResult<Remot
     } else {
         None
     };
-    Ok(RemoteBookDownload {
-        manifest,
+    Ok(RemoteLibraryBook {
+        id: manifest.book_id,
+        title: manifest.title,
+        authors: manifest.authors,
+        file_name: manifest.file_name,
+        content_sha256: manifest.content_sha256,
+        added_at: manifest.added_at,
         content,
         cover,
     })
@@ -430,7 +430,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(second_report.downloaded_books, 1);
-        assert_eq!(second_report.downloads[0].manifest.book_id, book_id);
+        assert_eq!(second_report.downloads[0].id, book_id);
         assert_eq!(second_report.downloads[0].content, content);
         assert!(
             server

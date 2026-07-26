@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::persistence::{write_bytes_atomic, write_json_atomic};
-use crate::sync::RemoteBookDownload;
 
 const LIBRARY_VERSION: u32 = 1;
 const MANIFEST_FILE: &str = "library.json";
@@ -33,6 +32,18 @@ pub struct LibraryBook {
 pub struct ImportSummary {
     pub imported: usize,
     pub duplicates: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteLibraryBook {
+    pub id: String,
+    pub title: String,
+    pub authors: Vec<String>,
+    pub file_name: String,
+    pub content_sha256: String,
+    pub added_at: u64,
+    pub content: Vec<u8>,
+    pub cover: Option<Vec<u8>>,
 }
 
 pub struct LocalLibrary {
@@ -126,51 +137,41 @@ impl LocalLibrary {
         Ok(summary)
     }
 
-    pub fn import_remote(&mut self, remote: RemoteBookDownload) -> LibraryResult<bool> {
-        if self
-            .books
-            .iter()
-            .any(|book| book.id == remote.manifest.book_id)
-        {
+    pub fn import_remote(&mut self, remote: RemoteLibraryBook) -> LibraryResult<bool> {
+        if self.books.iter().any(|book| book.id == remote.id) {
             return Ok(false);
         }
         let digest = format!("{:x}", Sha256::digest(&remote.content));
-        if digest != remote.manifest.book_id || digest != remote.manifest.content_sha256 {
+        if digest != remote.id || digest != remote.content_sha256 {
             return Err(
                 io::Error::new(io::ErrorKind::InvalidData, "远端书籍内容哈希与清单不一致").into(),
             );
         }
-        let publication = open_bytes(remote.content.clone(), &remote.manifest.file_name)?;
+        let publication = open_bytes(remote.content.clone(), &remote.file_name)?;
         let metadata = &publication.book().metadata;
-        let title = if remote.manifest.title.trim().is_empty() {
+        let title = if remote.title.trim().is_empty() {
             metadata.title.trim().to_owned()
         } else {
-            remote.manifest.title.trim().to_owned()
+            remote.title.trim().to_owned()
         };
-        let authors = if remote.manifest.authors.is_empty() {
+        let authors = if remote.authors.is_empty() {
             metadata.authors.clone()
         } else {
-            remote.manifest.authors.clone()
+            remote.authors.clone()
         };
-        let storage_name = format!(
-            "{}.{}",
-            remote.manifest.book_id,
-            publication.format().storage_extension()
-        );
+        let storage_name = format!("{}.{}", remote.id, publication.format().storage_extension());
         let cover_bytes = remote
             .cover
             .or_else(|| publication.cover_bytes().map(<[u8]>::to_vec));
-        let cover_name = cover_bytes
-            .as_ref()
-            .map(|_| format!("{}.cover", remote.manifest.book_id));
+        let cover_name = cover_bytes.as_ref().map(|_| format!("{}.cover", remote.id));
         let book = LibraryBook {
-            id: remote.manifest.book_id,
+            id: remote.id,
             title,
             authors,
-            file_name: remote.manifest.file_name,
+            file_name: remote.file_name,
             path: self.root.join(BOOKS_DIRECTORY).join(storage_name),
             cover_bytes,
-            added_at: remote.manifest.added_at,
+            added_at: remote.added_at,
         };
         self.commit_import(&book, &remote.content, cover_name.as_deref())?;
         Ok(true)

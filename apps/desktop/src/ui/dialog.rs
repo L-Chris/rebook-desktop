@@ -10,10 +10,10 @@ use xilem::view::{
 };
 use xilem::{Color, FontWeight, WidgetView};
 
-use crate::design::{CONTROL_HEIGHT, RADIUS_DIALOG, RADIUS_MEDIUM, RADIUS_SMALL};
-use crate::feedback::{centered_lucide_icon, wrapped_ui_text};
-use crate::pointer_button::button;
-use crate::{UI_BORDER, UI_FONT_STACK, UI_MUTED, UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT};
+use super::button::button;
+use super::feedback::{centered_lucide_icon, wrapped_ui_text};
+use super::theme::{CONTROL_HEIGHT, RADIUS_DIALOG, RADIUS_MEDIUM, RADIUS_SMALL};
+use super::theme::{UI_BORDER, UI_FONT_STACK, UI_MUTED, UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT};
 
 const DIALOG_WIDTH: f64 = 360.0;
 const DANGER: Color = Color::from_rgb8(0xb4, 0x23, 0x18);
