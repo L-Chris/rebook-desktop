@@ -23,6 +23,7 @@ const DANGER_SOFT: Color = Color::from_rgb8(0xfe, 0xf3, 0xf2);
 pub(crate) fn confirmation_dialog<State: 'static>(
     title: impl Into<String>,
     message: impl Into<String>,
+    cancel_label: impl Into<String>,
     confirm_label: impl Into<String>,
     on_cancel: impl Fn(&mut State) + Send + Sync + 'static,
     on_confirm: impl Fn(&mut State) + Send + Sync + 'static,
@@ -32,6 +33,7 @@ pub(crate) fn confirmation_dialog<State: 'static>(
     let scrim_cancel = Arc::clone(&on_cancel);
     let button_cancel = Arc::clone(&on_cancel);
     let confirm_label = confirm_label.into();
+    let cancel_label = cancel_label.into();
     let message = message.into();
 
     let scrim = sized_box(
@@ -68,7 +70,7 @@ pub(crate) fn confirmation_dialog<State: 'static>(
     let cancel_action = Arc::clone(&on_cancel);
     let cancel = sized_box(
         button(
-            label("取消")
+            label(cancel_label)
                 .font(UI_FONT_STACK)
                 .text_size(12.0)
                 .color(UI_TEXT),

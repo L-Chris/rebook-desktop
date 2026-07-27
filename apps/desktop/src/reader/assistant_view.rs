@@ -31,27 +31,36 @@ fn chat_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
         .messages
         .iter()
         .cloned()
-        .map(|turn| chat_message_row(turn).boxed())
+        .map(|turn| chat_message_row(turn, state.language).boxed())
         .collect::<Vec<_>>();
     if busy {
         rows.push(
-            chat_message_row(ChatTurn {
-                role: ChatRole::Assistant,
-                content: "正在阅读和检索书籍…".into(),
-                display_content: None,
-            })
+            chat_message_row(
+                ChatTurn {
+                    role: ChatRole::Assistant,
+                    content: state
+                        .language
+                        .text("正在阅读和检索书籍…", "Reading and searching the book…")
+                        .into(),
+                    display_content: None,
+                },
+                state.language,
+            )
             .boxed(),
         );
     }
     let conversation: Box<AnyWidgetView<DesktopReader>> = if rows.is_empty() {
         flex_col((
             icon_label(Icon::MessageCircle, 28.0, UI_MUTED),
-            label("围绕当前书籍提问")
+            label(state.language.text("围绕当前书籍提问", "Ask about this book"))
                 .font(UI_FONT_STACK)
                 .text_size(13.0)
                 .weight(FontWeight::BOLD)
                 .color(UI_TEXT_SOFT),
-            prose("可以总结章节、解释选中的段落，或让 AI 搜索书中的概念。")
+            prose(state.language.text(
+                "可以总结章节、解释选中的段落，或让 AI 搜索书中的概念。",
+                "Summarize sections, explain selected passages, or ask AI to find concepts in the book.",
+            ))
                 .text_size(12.0)
                 .text_color(UI_MUTED),
         ))
@@ -71,12 +80,23 @@ fn chat_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     };
     let error: Box<AnyWidgetView<DesktopReader>> = state.chat.error.as_ref().map_or_else(
         || sized_box(label("")).width(0.px()).height(0.px()).boxed(),
-        |error| notice_card(NoticeTone::Error, "AI 请求失败", error.clone()).boxed(),
+        |error| {
+            notice_card(
+                NoticeTone::Error,
+                state.language.text("AI 请求失败", "AI request failed"),
+                error.clone(),
+            )
+            .boxed()
+        },
     );
     let command_menu = chat_command_menu(&input, busy);
-    let composer = chat_composer(input, busy);
+    let composer = chat_composer(input, busy, state.language);
     let conversation_layer = flex_col((
-        assistant_panel_header(Icon::MessageCircle, "AI 对话", true),
+        assistant_panel_header(
+            Icon::MessageCircle,
+            state.language.text("AI 对话", "AI Chat"),
+            true,
+        ),
         divider(),
         conversation.flex(1.0),
         sized_box(label("")).height(48.px()),
@@ -123,7 +143,11 @@ fn chat_command_menu(input: &str, busy: bool) -> Box<AnyWidgetView<DesktopReader
         .boxed()
 }
 
-fn chat_composer(input: String, busy: bool) -> impl WidgetView<DesktopReader> + use<> {
+fn chat_composer(
+    input: String,
+    busy: bool,
+    language: crate::preferences::AppLanguage,
+) -> impl WidgetView<DesktopReader> + use<> {
     sized_box(
         flex_row((
             text_input(input, |state: &mut DesktopReader, value| {
@@ -133,7 +157,10 @@ fn chat_composer(input: String, busy: bool) -> impl WidgetView<DesktopReader> + 
                 state.chat.input = value;
                 state.send_chat();
             })
-            .placeholder("询问这本书，或输入 / 使用技能…")
+            .placeholder(language.text(
+                "询问这本书，或输入 / 使用技能…",
+                "Ask about this book, or type / for skills…",
+            ))
             .text_color(UI_TEXT)
             .caret_color(UI_ACCENT)
             .background_color(Color::TRANSPARENT)
@@ -153,9 +180,17 @@ fn chat_composer(input: String, busy: bool) -> impl WidgetView<DesktopReader> + 
     .padding(Padding::horizontal(8.0))
 }
 
-fn chat_message_row(turn: ChatTurn) -> impl WidgetView<DesktopReader> + use<> {
+fn chat_message_row(
+    turn: ChatTurn,
+    language: crate::preferences::AppLanguage,
+) -> impl WidgetView<DesktopReader> + use<> {
     let (role, background, border, label_color) = match turn.role {
-        ChatRole::User => ("你", UI_ACCENT_SOFT, UI_ACCENT_BORDER, UI_ACCENT),
+        ChatRole::User => (
+            language.text("你", "You"),
+            UI_ACCENT_SOFT,
+            UI_ACCENT_BORDER,
+            UI_ACCENT,
+        ),
         ChatRole::Assistant => ("Rebook AI", UI_SURFACE, UI_BORDER, UI_MUTED),
     };
     let content = turn.display_content.unwrap_or(turn.content);

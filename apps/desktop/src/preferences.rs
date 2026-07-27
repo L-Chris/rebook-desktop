@@ -13,19 +13,66 @@ const SETTINGS_FILE: &str = "reader-settings.json";
 
 pub type PreferencesResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum AppLanguage {
+    #[default]
+    #[serde(rename = "zh-CN")]
+    SimplifiedChinese,
+    #[serde(rename = "en")]
+    English,
+}
+
+impl AppLanguage {
+    pub(crate) const fn text(
+        self,
+        simplified_chinese: &'static str,
+        english: &'static str,
+    ) -> &'static str {
+        match self {
+            Self::SimplifiedChinese => simplified_chinese,
+            Self::English => english,
+        }
+    }
+
+    pub(crate) const fn translation_target(self) -> &'static str {
+        match self {
+            Self::SimplifiedChinese => "简体中文",
+            Self::English => "English",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ReaderPreferences {
+    pub(crate) typography: ReaderTypography,
+    pub(crate) language: AppLanguage,
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredReaderPreferences {
     version: u32,
     #[serde(default)]
     typography: ReaderTypography,
+    #[serde(default)]
+    language: AppLanguage,
 }
 
-pub fn load_reader_typography() -> PreferencesResult<ReaderTypography> {
+pub(crate) fn load_reader_preferences() -> PreferencesResult<ReaderPreferences> {
     load_from(settings_path()?)
 }
 
-pub fn save_reader_typography(typography: &ReaderTypography) -> PreferencesResult<()> {
-    save_to(&settings_path()?, typography)
+pub(crate) fn save_reader_preferences(preferences: &ReaderPreferences) -> PreferencesResult<()> {
+    save_to(&settings_path()?, preferences)
+}
+
+pub(crate) fn load_app_language() -> PreferencesResult<AppLanguage> {
+    Ok(load_reader_preferences()?.language)
+}
+
+pub(crate) fn save_app_language(language: AppLanguage) -> PreferencesResult<()> {
+    let mut preferences = load_reader_preferences()?;
+    preferences.language = language;
+    save_reader_preferences(&preferences)
 }
 
 fn settings_path() -> io::Result<PathBuf> {
@@ -34,9 +81,9 @@ fn settings_path() -> io::Result<PathBuf> {
     Ok(project.config_dir().join(SETTINGS_FILE))
 }
 
-fn load_from(path: PathBuf) -> PreferencesResult<ReaderTypography> {
+fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
     if !path.exists() {
-        return Ok(ReaderTypography::default());
+        return Ok(ReaderPreferences::default());
     }
     let stored: StoredReaderPreferences = serde_json::from_slice(&fs::read(path)?)?;
     if stored.version != SETTINGS_VERSION {
@@ -48,19 +95,23 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderTypography> {
     }
     let mut typography = stored.typography;
     typography.normalize();
-    Ok(typography)
+    Ok(ReaderPreferences {
+        typography,
+        language: stored.language,
+    })
 }
 
-fn save_to(path: &Path, typography: &ReaderTypography) -> PreferencesResult<()> {
+fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "阅读设置路径没有父目录"))?;
     fs::create_dir_all(parent)?;
-    let mut typography = typography.clone();
+    let mut typography = preferences.typography.clone();
     typography.normalize();
     let stored = StoredReaderPreferences {
         version: SETTINGS_VERSION,
         typography,
+        language: preferences.language,
     };
     write_json_atomic(path, &stored)?;
     Ok(())
@@ -86,15 +137,27 @@ mod tests {
             font_weight: 550,
         };
 
-        save_to(&path, &typography).unwrap();
+        let preferences = ReaderPreferences {
+            typography,
+            language: AppLanguage::English,
+        };
+        save_to(&path, &preferences).unwrap();
         let loaded = load_from(path.clone()).unwrap();
 
-        assert_eq!(loaded.default_font, ReaderDefaultFont::SansSerif);
-        assert_eq!(loaded.default_cjk_font, "Microsoft YaHei");
-        assert!((loaded.font_size - 18.0).abs() < f32::EPSILON);
-        assert!((loaded.minimum_font_size - 9.0).abs() < f32::EPSILON);
-        assert_eq!(loaded.font_weight, 600);
+        assert_eq!(loaded.typography.default_font, ReaderDefaultFont::SansSerif);
+        assert_eq!(loaded.typography.default_cjk_font, "Microsoft YaHei");
+        assert!((loaded.typography.font_size - 18.0).abs() < f32::EPSILON);
+        assert!((loaded.typography.minimum_font_size - 9.0).abs() < f32::EPSILON);
+        assert_eq!(loaded.typography.font_weight, 600);
+        assert_eq!(loaded.language, AppLanguage::English);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_preferences_default_to_simplified_chinese() {
+        let json = r#"{"version":1}"#;
+        let stored: StoredReaderPreferences = serde_json::from_str(json).unwrap();
+        assert_eq!(stored.language, AppLanguage::SimplifiedChinese);
     }
 
     fn test_path() -> PathBuf {

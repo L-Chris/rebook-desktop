@@ -2,10 +2,12 @@ mod engine;
 mod protocol;
 mod settings;
 mod store;
+mod view;
 mod webdav;
 
 pub(crate) use engine::{LocalSyncBook, SyncReport, run_sync};
 pub(crate) use settings::SyncSettings;
 pub(crate) use store::SyncStore;
+pub(crate) use view::{SyncSettingsCallbacks, sync_settings_content};
 
 pub(crate) type SyncResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;

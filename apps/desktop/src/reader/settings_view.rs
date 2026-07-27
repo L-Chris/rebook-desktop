@@ -12,7 +12,12 @@ use xilem::view::{
 };
 use xilem::{Affine, AnyWidgetView, Color, FontWeight, WidgetView};
 
-use crate::plugins::{AiProvider, BUILTIN_PLUGINS, PluginSettings, TranslationMode};
+use crate::plugins::{
+    AiProvider, BUILTIN_PLUGINS, PluginSettings, TARGET_LANGUAGE_ENGLISH,
+    TARGET_LANGUAGE_INTERFACE, TARGET_LANGUAGE_SIMPLIFIED_CHINESE, TranslationMode,
+};
+use crate::preferences::AppLanguage;
+use crate::sync::{SyncSettingsCallbacks, sync_settings_content};
 use crate::ui::{
     CONTENT_GAP, CONTENT_PADDING_HORIZONTAL, CONTENT_PADDING_VERTICAL, CONTROL_HEIGHT,
     CONTROL_HEIGHT_COMPACT, DIALOG_FOOTER_HEIGHT, DIALOG_HEADER_HEIGHT, RADIUS_DIALOG,
@@ -57,95 +62,143 @@ fn settings_dialog(state: &DesktopReader) -> impl WidgetView<DesktopReader> + us
 }
 
 fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
+    let language = state.ui.draft_language;
     let spread = state.ui.draft_spread;
     let typography = &state.ui.draft_typography;
     let font_picker = state.ui.font_picker;
     let tab = state.ui.settings_tab;
     let title = match tab {
-        SettingsTab::Reading => "阅读",
-        SettingsTab::Font => font_picker.map_or("字体", FontPickerKind::title),
+        SettingsTab::General => language.text("通用", "General"),
+        SettingsTab::Reading => language.text("阅读", "Reading"),
+        SettingsTab::Font => {
+            font_picker.map_or(language.text("字体", "Font"), |kind| kind.title(language))
+        }
+        SettingsTab::Cloud => language.text("云盘", "Cloud drive"),
         SettingsTab::Ai => "AI",
         SettingsTab::AiChat => "AI Chat",
-        SettingsTab::Translation => "翻译",
-        SettingsTab::Plugins => "插件",
+        SettingsTab::Translation => language.text("翻译", "Translation"),
+        SettingsTab::Plugins => language.text("插件", "Plugins"),
     };
     let body: Box<AnyWidgetView<DesktopReader>> = match tab {
-        SettingsTab::Reading => reading_settings_content(spread).boxed(),
+        SettingsTab::General => general_settings_content(language).boxed(),
+        SettingsTab::Reading => reading_settings_content(spread, language).boxed(),
         SettingsTab::Font => match font_picker {
             Some(kind) => {
-                font_picker_content(kind, typography, &state.available_font_families).boxed()
+                font_picker_content(kind, typography, &state.available_font_families, language)
+                    .boxed()
             }
-            None => font_settings_content(typography).boxed(),
+            None => font_settings_content(typography, language).boxed(),
         },
-        SettingsTab::Ai => ai_settings_content(state.ui.draft_plugin_settings.clone()).boxed(),
-        SettingsTab::AiChat => ai_chat_settings_content(&state.ui.draft_plugin_settings).boxed(),
-        SettingsTab::Translation => {
-            translation_settings_content(&state.ui.draft_plugin_settings).boxed()
+        SettingsTab::Cloud => sync_settings_content(
+            &state.ui.draft_sync_settings,
+            state.ui.draft_sync_password.clone(),
+            !state.sync_password.is_empty(),
+            language,
+            &SyncSettingsCallbacks {
+                toggle_enabled: toggle_sync_enabled,
+                set_base_url: set_sync_base_url,
+                set_username: set_sync_username,
+                set_password: set_sync_password,
+                set_device_name: set_sync_device_name,
+            },
+        ),
+        SettingsTab::Ai => {
+            ai_settings_content(state.ui.draft_plugin_settings.clone(), language).boxed()
         }
-        SettingsTab::Plugins => plugin_settings_content().boxed(),
+        SettingsTab::AiChat => {
+            ai_chat_settings_content(&state.ui.draft_plugin_settings, language).boxed()
+        }
+        SettingsTab::Translation => {
+            translation_settings_content(&state.ui.draft_plugin_settings, language).boxed()
+        }
+        SettingsTab::Plugins => plugin_settings_content(language).boxed(),
     };
 
     flex_row((
-        sized_box(zstack((
-            sized_box(label(""))
-                .expand()
-                .background_color(UI_SURFACE_MUTED)
-                .corner_radius(RADIUS_LARGE),
-            sized_box(label(""))
-                .width(RADIUS_DIALOG.px())
-                .expand_height()
-                .background_color(UI_SURFACE_MUTED)
-                .alignment(UnitPoint::RIGHT),
-            sized_box(
-                flex_col((
-                    flex_row((
-                        icon_label(Icon::Settings, 17.0, UI_MUTED),
-                        label("设置")
-                            .font(UI_FONT_STACK)
-                            .text_size(15.0)
-                            .weight(FontWeight::BOLD)
-                            .color(UI_TEXT),
-                    ))
-                    .gap(9.px())
-                    .cross_axis_alignment(CrossAxisAlignment::Center)
-                    .padding(Padding::from_vh(9.0, 8.0)),
-                    settings_tab_button("阅读", SettingsTab::Reading, tab),
-                    settings_tab_button("字体", SettingsTab::Font, tab),
-                    settings_tab_button("AI", SettingsTab::Ai, tab),
-                    settings_tab_button("AI Chat", SettingsTab::AiChat, tab),
-                    settings_tab_button("翻译", SettingsTab::Translation, tab),
-                    settings_tab_button("插件", SettingsTab::Plugins, tab),
-                    FlexSpacer::Flex(1.0),
-                ))
-                .gap(3.px())
-                .cross_axis_alignment(CrossAxisAlignment::Fill)
-                .padding(8.0),
-            )
-            .expand(),
-        )))
-        .width(136.px())
-        .expand_height(),
+        settings_sidebar(language, tab),
         flex_col((
             settings_dialog_header(title),
             divider(),
             body.flex(1.0),
             divider(),
-            sized_box(
-                flex_row((
-                    FlexSpacer::Flex(1.0),
-                    secondary_action_button("取消", DesktopReader::close_overlay),
-                    primary_action_button("应用", DesktopReader::apply_settings),
-                ))
-                .gap(8.px())
-                .cross_axis_alignment(CrossAxisAlignment::Center),
-            )
-            .height(DIALOG_FOOTER_HEIGHT.px())
-            .expand_width()
-            .padding(Padding::horizontal(CONTENT_PADDING_HORIZONTAL)),
+            settings_footer(language),
         ))
         .must_fill_major_axis(true)
         .flex(1.0),
     ))
+}
+
+fn settings_sidebar(language: AppLanguage, tab: SettingsTab) -> impl WidgetView<DesktopReader> {
+    sized_box(zstack((
+        sized_box(label(""))
+            .expand()
+            .background_color(UI_SURFACE_MUTED)
+            .corner_radius(RADIUS_LARGE),
+        sized_box(label(""))
+            .width(RADIUS_DIALOG.px())
+            .expand_height()
+            .background_color(UI_SURFACE_MUTED)
+            .alignment(UnitPoint::RIGHT),
+        sized_box(
+            flex_col((
+                flex_row((
+                    icon_label(Icon::Settings, 17.0, UI_MUTED),
+                    label(language.text("设置", "Settings"))
+                        .font(UI_FONT_STACK)
+                        .text_size(15.0)
+                        .weight(FontWeight::BOLD)
+                        .color(UI_TEXT),
+                ))
+                .gap(9.px())
+                .cross_axis_alignment(CrossAxisAlignment::Center)
+                .padding(Padding::from_vh(9.0, 8.0)),
+                settings_tab_button(language.text("通用", "General"), SettingsTab::General, tab),
+                settings_tab_button(language.text("阅读", "Reading"), SettingsTab::Reading, tab),
+                settings_tab_button(language.text("字体", "Font"), SettingsTab::Font, tab),
+                settings_tab_button(
+                    language.text("云盘", "Cloud drive"),
+                    SettingsTab::Cloud,
+                    tab,
+                ),
+                settings_tab_button("AI", SettingsTab::Ai, tab),
+                settings_tab_button("AI Chat", SettingsTab::AiChat, tab),
+                settings_tab_button(
+                    language.text("翻译", "Translation"),
+                    SettingsTab::Translation,
+                    tab,
+                ),
+                settings_tab_button(language.text("插件", "Plugins"), SettingsTab::Plugins, tab),
+                FlexSpacer::Flex(1.0),
+            ))
+            .gap(3.px())
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .padding(8.0),
+        )
+        .expand(),
+    )))
+    .width(136.px())
+    .expand_height()
+}
+
+fn settings_footer(language: AppLanguage) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        flex_row((
+            FlexSpacer::Flex(1.0),
+            secondary_action_button(
+                language.text("取消", "Cancel"),
+                DesktopReader::close_overlay,
+            ),
+            primary_action_button(
+                language.text("应用", "Apply"),
+                DesktopReader::apply_settings,
+            ),
+        ))
+        .gap(8.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(DIALOG_FOOTER_HEIGHT.px())
+    .expand_width()
+    .padding(Padding::horizontal(CONTENT_PADDING_HORIZONTAL))
 }
 
 fn settings_dialog_header(title: &'static str) -> impl WidgetView<DesktopReader> {
@@ -209,17 +262,112 @@ fn settings_tab_button(
     .expand_width()
 }
 
-fn reading_settings_content(spread: SpreadMode) -> impl WidgetView<DesktopReader> {
+fn general_settings_content(language: AppLanguage) -> impl WidgetView<DesktopReader> {
     flex_col((
-        label("页面布局")
+        settings_section_label(language.text("语言与地区", "Language & region")),
+        flex_col((language_settings_row(language),))
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .background_color(UI_SURFACE)
+            .border(UI_BORDER, 1.0)
+            .corner_radius(RADIUS_MEDIUM),
+        prose(language.text(
+            "界面语言也会作为翻译目标语言的默认值。你仍可在“翻译”中选择固定语言。",
+            "The interface language is also the default translation target. You can still choose a fixed language under Translation.",
+        ))
+        .text_size(10.5)
+        .text_color(UI_MUTED),
+    ))
+    .gap(CONTENT_GAP.px())
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+    .padding(Padding::from_vh(
+        CONTENT_PADDING_VERTICAL,
+        CONTENT_PADDING_HORIZONTAL,
+    ))
+}
+
+fn language_settings_row(language: AppLanguage) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        flex_row((
+            label(language.text("界面语言", "Interface language"))
+                .text_size(13.0)
+                .color(UI_TEXT_SOFT),
+            FlexSpacer::Flex(1.0),
+            language_choice("简体中文", AppLanguage::SimplifiedChinese, language),
+            language_choice("English", AppLanguage::English, language),
+        ))
+        .gap(6.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(SETTINGS_ROW_HEIGHT.px())
+    .expand_width()
+    .padding(Padding::horizontal(12.0))
+}
+
+fn language_choice(
+    text: &'static str,
+    value: AppLanguage,
+    selected: AppLanguage,
+) -> impl WidgetView<DesktopReader> {
+    let active = value == selected;
+    sized_box(
+        button(
+            label(text)
+                .text_size(12.0)
+                .weight(if active {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
+            move |state: &mut DesktopReader| state.ui.draft_language = value,
+        )
+        .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
+        .active_background_color(UI_ACCENT_SOFT)
+        .border_color(if active { UI_ACCENT_BORDER } else { UI_BORDER })
+        .hovered_border_color(UI_ACCENT_BORDER)
+        .corner_radius(RADIUS_SMALL)
+        .padding(Padding::from_vh(5.0, 9.0)),
+    )
+    .height(CONTROL_HEIGHT.px())
+}
+
+fn toggle_sync_enabled(state: &mut DesktopReader) {
+    state.ui.draft_sync_settings.enabled = !state.ui.draft_sync_settings.enabled;
+}
+
+fn set_sync_base_url(state: &mut DesktopReader, value: String) {
+    state.ui.draft_sync_settings.base_url = value;
+}
+
+fn set_sync_username(state: &mut DesktopReader, value: String) {
+    state.ui.draft_sync_settings.username = value;
+}
+
+fn set_sync_password(state: &mut DesktopReader, value: String) {
+    state.ui.draft_sync_password = value;
+}
+
+fn set_sync_device_name(state: &mut DesktopReader, value: String) {
+    state.ui.draft_sync_settings.device_name = value;
+}
+
+fn reading_settings_content(
+    spread: SpreadMode,
+    language: AppLanguage,
+) -> impl WidgetView<DesktopReader> {
+    flex_col((
+        label(language.text("页面布局", "Page layout"))
             .font(UI_FONT_STACK)
             .text_size(12.0)
             .weight(FontWeight::BOLD)
             .color(UI_MUTED),
         sized_box(flex_col((
-            settings_value_row("阅读模式", "分页"),
+            settings_value_row(
+                language.text("阅读模式", "Reading mode"),
+                language.text("分页", "Paginated"),
+            ),
             divider(),
-            spread_settings_row(spread),
+            spread_settings_row(spread, language),
         )))
         .background_color(UI_SURFACE)
         .border(UI_BORDER, 1.0)
@@ -233,7 +381,10 @@ fn reading_settings_content(spread: SpreadMode) -> impl WidgetView<DesktopReader
     ))
 }
 
-fn font_settings_content(typography: &ReaderTypography) -> impl WidgetView<DesktopReader> + use<> {
+fn font_settings_content(
+    typography: &ReaderTypography,
+    language: AppLanguage,
+) -> impl WidgetView<DesktopReader> + use<> {
     let preview_font = typography.default_stack();
     let preview_size = typography.font_size.min(24.0);
     let preview_weight = FontWeight::new(f32::from(typography.font_weight));
@@ -244,14 +395,14 @@ fn font_settings_content(typography: &ReaderTypography) -> impl WidgetView<Deskt
 
     portal(
         flex_col((
-            settings_section_label("字号与字重"),
-            typography_metrics_card(font_size, minimum_font_size, font_weight),
-            settings_section_label("字体"),
+            settings_section_label(language.text("字号与字重", "Size & weight")),
+            typography_metrics_card(font_size, minimum_font_size, font_weight, language),
+            settings_section_label(language.text("字体", "Font")),
             flex_col((
-                default_font_row(default_font),
+                default_font_row(default_font, language),
                 divider(),
                 font_family_settings_row(
-                    "中文字体",
+                    language.text("中文字体", "CJK font"),
                     typography.default_cjk_font.clone(),
                     FontPickerKind::Cjk,
                 ),
@@ -260,22 +411,22 @@ fn font_settings_content(typography: &ReaderTypography) -> impl WidgetView<Deskt
             .background_color(UI_SURFACE)
             .border(UI_BORDER, 1.0)
             .corner_radius(RADIUS_MEDIUM),
-            settings_section_label("字型"),
+            settings_section_label(language.text("字型", "Font families")),
             flex_col((
                 font_family_settings_row(
-                    "衬线字体",
+                    language.text("衬线字体", "Serif font"),
                     typography.serif_font.clone(),
                     FontPickerKind::Serif,
                 ),
                 divider(),
                 font_family_settings_row(
-                    "无衬线字体",
+                    language.text("无衬线字体", "Sans-serif font"),
                     typography.sans_serif_font.clone(),
                     FontPickerKind::SansSerif,
                 ),
                 divider(),
                 font_family_settings_row(
-                    "等宽字体",
+                    language.text("等宽字体", "Monospace font"),
                     typography.monospace_font.clone(),
                     FontPickerKind::Monospace,
                 ),
@@ -286,15 +437,18 @@ fn font_settings_content(typography: &ReaderTypography) -> impl WidgetView<Deskt
             .corner_radius(RADIUS_MEDIUM),
             sized_box(
                 flex_col((
-                    label("字体预览")
+                    label(language.text("字体预览", "Font preview"))
                         .font(UI_FONT_STACK)
                         .text_size(11.0)
                         .color(UI_MUTED),
-                    label("阅读让思想抵达更远的地方 Reading 0123")
-                        .font(ui_font_stack(preview_font))
-                        .text_size(preview_size)
-                        .weight(preview_weight)
-                        .color(UI_TEXT),
+                    label(language.text(
+                        "阅读让思想抵达更远的地方 Reading 0123",
+                        "Reading carries ideas farther 阅读 0123",
+                    ))
+                    .font(ui_font_stack(preview_font))
+                    .text_size(preview_size)
+                    .weight(preview_weight)
+                    .color(UI_TEXT),
                 ))
                 .gap(6.px())
                 .cross_axis_alignment(CrossAxisAlignment::Start),
@@ -317,10 +471,11 @@ fn typography_metrics_card(
     font_size: f32,
     minimum_font_size: f32,
     font_weight: u16,
+    language: AppLanguage,
 ) -> impl WidgetView<DesktopReader> {
     flex_col((
         typography_stepper_row(
-            "默认字号",
+            language.text("默认字号", "Default size"),
             format!("{font_size:.0} px"),
             |state: &mut DesktopReader| {
                 let minimum = state.ui.draft_typography.minimum_font_size;
@@ -334,7 +489,7 @@ fn typography_metrics_card(
         ),
         divider(),
         typography_stepper_row(
-            "最小字号",
+            language.text("最小字号", "Minimum size"),
             format!("{minimum_font_size:.0} px"),
             |state: &mut DesktopReader| {
                 state.ui.draft_typography.minimum_font_size =
@@ -348,7 +503,7 @@ fn typography_metrics_card(
         ),
         divider(),
         typography_stepper_row(
-            "字体粗细",
+            language.text("字体粗细", "Font weight"),
             font_weight.to_string(),
             |state: &mut DesktopReader| {
                 state.ui.draft_typography.font_weight = state
@@ -430,16 +585,27 @@ fn stepper_button(
     .height(CONTROL_HEIGHT_COMPACT.px())
 }
 
-fn default_font_row(selected: ReaderDefaultFont) -> impl WidgetView<DesktopReader> {
+fn default_font_row(
+    selected: ReaderDefaultFont,
+    language: AppLanguage,
+) -> impl WidgetView<DesktopReader> {
     sized_box(
         flex_row((
-            label("默认字体")
+            label(language.text("默认字体", "Default font"))
                 .font(UI_FONT_STACK)
                 .text_size(13.0)
                 .color(UI_TEXT_SOFT),
             FlexSpacer::Flex(1.0),
-            default_font_choice("衬线", ReaderDefaultFont::Serif, selected),
-            default_font_choice("无衬线", ReaderDefaultFont::SansSerif, selected),
+            default_font_choice(
+                language.text("衬线", "Serif"),
+                ReaderDefaultFont::Serif,
+                selected,
+            ),
+            default_font_choice(
+                language.text("无衬线", "Sans serif"),
+                ReaderDefaultFont::SansSerif,
+                selected,
+            ),
         ))
         .gap(6.px())
         .cross_axis_alignment(CrossAxisAlignment::Center),
@@ -517,6 +683,7 @@ fn font_picker_content(
     kind: FontPickerKind,
     typography: &ReaderTypography,
     available_families: &[String],
+    language: AppLanguage,
 ) -> impl WidgetView<DesktopReader> + use<> {
     let selected = selected_font_family(typography, kind).to_owned();
     let rows = font_candidates(kind, available_families)
@@ -530,7 +697,7 @@ fn font_picker_content(
                 button(
                     flex_row((
                         icon_label(Icon::ChevronLeft, 14.0, UI_MUTED),
-                        label("返回字体设置")
+                        label(language.text("返回字体设置", "Back to font settings"))
                             .font(UI_FONT_STACK)
                             .text_size(12.0)
                             .color(UI_TEXT_SOFT),
@@ -710,14 +877,13 @@ fn ui_font_stack(source: String) -> FontStack<'static> {
 
 #[derive(Clone, Copy)]
 enum AiSettingField {
-    ProviderName(usize),
-    ProviderBaseUrl(usize),
-    ProviderApiKey(usize),
-    ProviderModel {
+    Name(usize),
+    BaseUrl(usize),
+    ApiKey(usize),
+    Model {
         provider_index: usize,
         model_index: usize,
     },
-    TargetLanguage,
 }
 
 #[derive(Clone, Copy)]
@@ -726,13 +892,16 @@ enum AiFeature {
     Translation,
 }
 
-fn ai_settings_content(settings: PluginSettings) -> impl WidgetView<DesktopReader> + use<> {
+fn ai_settings_content(
+    settings: PluginSettings,
+    language: AppLanguage,
+) -> impl WidgetView<DesktopReader> + use<> {
     let provider_count = settings.providers.len();
     let provider_cards = settings
         .providers
         .into_iter()
         .enumerate()
-        .map(|(index, provider)| ai_provider_card(index, provider, provider_count > 1))
+        .map(|(index, provider)| ai_provider_card(index, provider, provider_count > 1, language))
         .collect::<Vec<_>>();
     portal(
         flex_col((
@@ -740,12 +909,16 @@ fn ai_settings_content(settings: PluginSettings) -> impl WidgetView<DesktopReade
             flex_col(provider_cards)
                 .gap(CONTENT_GAP.px())
                 .cross_axis_alignment(CrossAxisAlignment::Fill),
-            secondary_action_button("新增 Provider", |state: &mut DesktopReader| {
-                state.ui.draft_plugin_settings.add_provider();
-            }),
-            prose(
+            secondary_action_button(
+                language.text("新增 Provider", "Add provider"),
+                |state: &mut DesktopReader| {
+                    state.ui.draft_plugin_settings.add_provider();
+                },
+            ),
+            prose(language.text(
                 "每个 Provider 可以维护多个模型。API Key 只保存在当前运行内存中，不会写入 plugins.json；默认 Provider 也可以通过 REBOOK_AI_API_KEY 环境变量提供密钥。",
-            )
+                "Each provider can contain multiple models. API keys are kept only in memory and are never written to plugins.json. The default provider can also read REBOOK_AI_API_KEY.",
+            ))
             .text_size(10.5)
             .text_color(UI_MUTED),
         ))
@@ -762,6 +935,7 @@ fn ai_provider_card(
     index: usize,
     provider: AiProvider,
     can_remove_provider: bool,
+    language: AppLanguage,
 ) -> impl WidgetView<DesktopReader> {
     let AiProvider {
         name,
@@ -780,7 +954,7 @@ fn ai_provider_card(
         .into_iter()
         .enumerate()
         .map(|(model_index, model)| {
-            ai_provider_model_row(index, model_index, model, model_count > 1)
+            ai_provider_model_row(index, model_index, model, model_count > 1, language)
         })
         .collect::<Vec<_>>();
     let remove_provider: Box<AnyWidgetView<DesktopReader>> = if can_remove_provider {
@@ -808,38 +982,42 @@ fn ai_provider_card(
         .padding(Padding::from_vh(7.0, 10.0)),
         divider(),
         ai_settings_input_row(
-            "名称",
+            language.text("名称", "Name"),
             name,
-            "例如 OpenAI、Ollama",
-            AiSettingField::ProviderName(index),
+            language.text("例如 OpenAI、Ollama", "For example OpenAI or Ollama"),
+            AiSettingField::Name(index),
         ),
         divider(),
         ai_settings_input_row(
-            "API 地址",
+            language.text("API 地址", "API URL"),
             base_url,
             "https://api.openai.com/v1",
-            AiSettingField::ProviderBaseUrl(index),
+            AiSettingField::BaseUrl(index),
         ),
         divider(),
         ai_settings_input_row(
-            "API Key（仅本次会话）",
+            language.text("API Key（仅本次会话）", "API key (this session only)"),
             api_key,
             "sk-…",
-            AiSettingField::ProviderApiKey(index),
+            AiSettingField::ApiKey(index),
         ),
         divider(),
         flex_col((
-            label("模型")
+            label(language.text("模型", "Models"))
                 .font(UI_FONT_STACK)
                 .text_size(11.5)
                 .weight(FontWeight::BOLD)
                 .color(UI_MUTED),
             flex_col(model_rows).cross_axis_alignment(CrossAxisAlignment::Fill),
-            secondary_action_button("新增模型", move |state: &mut DesktopReader| {
-                if let Some(provider) = state.ui.draft_plugin_settings.providers.get_mut(index) {
-                    provider.models.push(String::new());
-                }
-            }),
+            secondary_action_button(
+                language.text("新增模型", "Add model"),
+                move |state: &mut DesktopReader| {
+                    if let Some(provider) = state.ui.draft_plugin_settings.providers.get_mut(index)
+                    {
+                        provider.models.push(String::new());
+                    }
+                },
+            ),
         ))
         .gap(6.px())
         .cross_axis_alignment(CrossAxisAlignment::Fill)
@@ -856,6 +1034,7 @@ fn ai_provider_model_row(
     model_index: usize,
     value: String,
     can_remove: bool,
+    language: AppLanguage,
 ) -> impl WidgetView<DesktopReader> {
     let remove: Box<AnyWidgetView<DesktopReader>> = if can_remove {
         icon_button(Icon::X, false, move |state: &mut DesktopReader| {
@@ -870,23 +1049,29 @@ fn ai_provider_model_row(
     };
     sized_box(
         flex_row((
-            label(format!("模型 {}", model_index + 1))
-                .font(UI_FONT_STACK)
-                .text_size(11.5)
-                .color(UI_TEXT_SOFT),
+            label(match language {
+                AppLanguage::SimplifiedChinese => format!("模型 {}", model_index + 1),
+                AppLanguage::English => format!("Model {}", model_index + 1),
+            })
+            .font(UI_FONT_STACK)
+            .text_size(11.5)
+            .color(UI_TEXT_SOFT),
             FlexSpacer::Flex(1.0),
             sized_box(
                 text_input(value, move |state: &mut DesktopReader, value| {
                     set_ai_setting(
                         state,
-                        AiSettingField::ProviderModel {
+                        AiSettingField::Model {
                             provider_index,
                             model_index,
                         },
                         value,
                     );
                 })
-                .placeholder("模型 ID，例如 gpt-4o-mini")
+                .placeholder(language.text(
+                    "模型 ID，例如 gpt-4o-mini",
+                    "Model ID, for example gpt-4o-mini",
+                ))
                 .text_color(UI_TEXT)
                 .caret_color(UI_ACCENT)
                 .background_color(UI_SURFACE_MUTED)
@@ -945,22 +1130,22 @@ fn ai_settings_input_row(
 
 fn set_ai_setting(state: &mut DesktopReader, field: AiSettingField, value: String) {
     match field {
-        AiSettingField::ProviderName(index) => {
+        AiSettingField::Name(index) => {
             if let Some(provider) = state.ui.draft_plugin_settings.providers.get_mut(index) {
                 provider.name = value;
             }
         }
-        AiSettingField::ProviderBaseUrl(index) => {
+        AiSettingField::BaseUrl(index) => {
             if let Some(provider) = state.ui.draft_plugin_settings.providers.get_mut(index) {
                 provider.base_url = value;
             }
         }
-        AiSettingField::ProviderApiKey(index) => {
+        AiSettingField::ApiKey(index) => {
             if let Some(provider) = state.ui.draft_plugin_settings.providers.get_mut(index) {
                 provider.api_key = value;
             }
         }
-        AiSettingField::ProviderModel {
+        AiSettingField::Model {
             provider_index,
             model_index,
         } => {
@@ -992,18 +1177,21 @@ fn set_ai_setting(state: &mut DesktopReader, field: AiSettingField, value: Strin
                 }
             }
         }
-        AiSettingField::TargetLanguage => {
-            state.ui.draft_plugin_settings.target_language = value;
-        }
     }
 }
 
-fn ai_chat_settings_content(settings: &PluginSettings) -> impl WidgetView<DesktopReader> + use<> {
+fn ai_chat_settings_content(
+    settings: &PluginSettings,
+    language: AppLanguage,
+) -> impl WidgetView<DesktopReader> + use<'_> {
     portal(
         flex_col((
-            settings_section_label("AI Chat 模型"),
-            ai_model_choices(settings, AiFeature::Chat),
-            prose("AI Chat 会使用这里选中的 Provider 和模型进行书籍问答、检索与解释。")
+            settings_section_label(language.text("AI Chat 模型", "AI Chat model")),
+            ai_model_choices(settings, AiFeature::Chat, language),
+            prose(language.text(
+                "AI Chat 会使用这里选中的 Provider 和模型进行书籍问答、检索与解释。",
+                "AI Chat uses the selected provider and model for book Q&A, search, and explanations.",
+            ))
                 .text_size(10.5)
                 .text_color(UI_MUTED),
         ))
@@ -1018,29 +1206,27 @@ fn ai_chat_settings_content(settings: &PluginSettings) -> impl WidgetView<Deskto
 
 fn translation_settings_content(
     settings: &PluginSettings,
-) -> impl WidgetView<DesktopReader> + use<> {
-    let target_language = settings.target_language.clone();
+    language: AppLanguage,
+) -> impl WidgetView<DesktopReader> + use<'_> {
     let translation_mode = settings.translation_mode;
     portal(
         flex_col((
-            settings_section_label("翻译模型"),
-            ai_model_choices(settings, AiFeature::Translation),
-            settings_section_label("输出"),
+            settings_section_label(language.text("翻译模型", "Translation model")),
+            ai_model_choices(settings, AiFeature::Translation, language),
+            settings_section_label(language.text("输出", "Output")),
             flex_col((
-                ai_settings_input_row(
-                    "目标语言",
-                    target_language,
-                    "简体中文",
-                    AiSettingField::TargetLanguage,
-                ),
+                translation_target_settings_row(&settings.target_language, language),
                 divider(),
-                translation_mode_settings_row(translation_mode),
+                translation_mode_settings_row(translation_mode, language),
             ))
             .cross_axis_alignment(CrossAxisAlignment::Fill)
             .background_color(UI_SURFACE)
             .border(UI_BORDER, 1.0)
             .corner_radius(RADIUS_MEDIUM),
-            prose("点击阅读器顶部的翻译按钮后，会使用这里的模型、目标语言和显示方式翻译正文。")
+            prose(language.text(
+                "点击阅读器顶部的翻译按钮后，会使用这里的模型、目标语言和显示方式翻译正文。",
+                "Use the Translate button in the reader toolbar to translate the book with this model, target language, and display mode.",
+            ))
                 .text_size(10.5)
                 .text_color(UI_MUTED),
         ))
@@ -1053,13 +1239,86 @@ fn translation_settings_content(
     )
 }
 
-fn translation_mode_settings_row(mode: TranslationMode) -> impl WidgetView<DesktopReader> {
+fn translation_target_settings_row(
+    target_language: &str,
+    language: AppLanguage,
+) -> impl WidgetView<DesktopReader> {
     sized_box(
         flex_row((
-            label("显示方式").text_size(13.0).color(UI_TEXT_SOFT),
+            label(language.text("目标语言", "Target language"))
+                .text_size(13.0)
+                .color(UI_TEXT_SOFT),
             FlexSpacer::Flex(1.0),
-            translation_mode_choice("替换", TranslationMode::Replace, mode),
-            translation_mode_choice("双行翻译", TranslationMode::Bilingual, mode),
+            translation_target_choice(
+                language.text("跟随界面", "Interface"),
+                TARGET_LANGUAGE_INTERFACE,
+                target_language,
+            ),
+            translation_target_choice(
+                "简体中文",
+                TARGET_LANGUAGE_SIMPLIFIED_CHINESE,
+                target_language,
+            ),
+            translation_target_choice("English", TARGET_LANGUAGE_ENGLISH, target_language),
+        ))
+        .gap(6.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+    )
+    .height(SETTINGS_ROW_HEIGHT.px())
+    .expand_width()
+    .padding(Padding::horizontal(12.0))
+}
+
+fn translation_target_choice(
+    text: &'static str,
+    value: &'static str,
+    selected: &str,
+) -> impl WidgetView<DesktopReader> {
+    let active = value == selected;
+    sized_box(
+        button(
+            label(text)
+                .text_size(11.5)
+                .weight(if active {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
+            move |state: &mut DesktopReader| {
+                state.ui.draft_plugin_settings.target_language = value.into();
+            },
+        )
+        .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
+        .active_background_color(UI_ACCENT_SOFT)
+        .border_color(if active { UI_ACCENT_BORDER } else { UI_BORDER })
+        .hovered_border_color(UI_ACCENT_BORDER)
+        .corner_radius(RADIUS_SMALL)
+        .padding(Padding::from_vh(5.0, 8.0)),
+    )
+    .height(CONTROL_HEIGHT.px())
+}
+
+fn translation_mode_settings_row(
+    mode: TranslationMode,
+    language: AppLanguage,
+) -> impl WidgetView<DesktopReader> {
+    sized_box(
+        flex_row((
+            label(language.text("显示方式", "Display mode"))
+                .text_size(13.0)
+                .color(UI_TEXT_SOFT),
+            FlexSpacer::Flex(1.0),
+            translation_mode_choice(
+                language.text("替换", "Replace"),
+                TranslationMode::Replace,
+                mode,
+            ),
+            translation_mode_choice(
+                language.text("双行翻译", "Bilingual"),
+                TranslationMode::Bilingual,
+                mode,
+            ),
         ))
         .gap(6.px())
         .cross_axis_alignment(CrossAxisAlignment::Center),
@@ -1102,6 +1361,7 @@ fn translation_mode_choice(
 fn ai_model_choices(
     settings: &PluginSettings,
     feature: AiFeature,
+    language: AppLanguage,
 ) -> Box<AnyWidgetView<DesktopReader>> {
     let choices = settings
         .providers
@@ -1115,6 +1375,7 @@ fn ai_model_choices(
                         &provider.name,
                         model.to_owned(),
                         feature,
+                        language,
                         match feature {
                             AiFeature::Chat => {
                                 settings.chat_provider == provider.id
@@ -1132,10 +1393,13 @@ fn ai_model_choices(
         .collect::<Vec<_>>();
     if choices.is_empty() {
         sized_box(
-            label("请先在 AI 页面为 Provider 添加模型")
-                .font(UI_FONT_STACK)
-                .text_size(12.0)
-                .color(UI_MUTED),
+            label(language.text(
+                "请先在 AI 页面为 Provider 添加模型",
+                "Add a model to a provider on the AI page first",
+            ))
+            .font(UI_FONT_STACK)
+            .text_size(12.0)
+            .color(UI_MUTED),
         )
         .height(SETTINGS_ROW_HEIGHT.px())
         .expand_width()
@@ -1157,6 +1421,7 @@ fn ai_model_choice_button(
     provider_name: &str,
     model: String,
     feature: AiFeature,
+    language: AppLanguage,
     active: bool,
 ) -> impl WidgetView<DesktopReader> {
     let display = format!(
@@ -1181,10 +1446,14 @@ fn ai_model_choice_button(
                     })
                     .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
                 FlexSpacer::Flex(1.0),
-                label(if active { "已选择" } else { "选择" })
-                    .font(UI_FONT_STACK)
-                    .text_size(10.5)
-                    .color(if active { UI_ACCENT } else { UI_MUTED }),
+                label(if active {
+                    language.text("已选择", "Selected")
+                } else {
+                    language.text("选择", "Select")
+                })
+                .font(UI_FONT_STACK)
+                .text_size(10.5)
+                .color(if active { UI_ACCENT } else { UI_MUTED }),
             )),
             move |state: &mut DesktopReader| match feature {
                 AiFeature::Chat => {
@@ -1220,27 +1489,43 @@ fn ai_model_choice_button(
     .expand_width()
 }
 
-fn plugin_settings_content() -> impl WidgetView<DesktopReader> + use<> {
+fn plugin_settings_content(language: AppLanguage) -> impl WidgetView<DesktopReader> + use<> {
     let plugin_cards = BUILTIN_PLUGINS
         .into_iter()
         .map(|plugin| {
             flex_row((
                 icon_label(Icon::Blocks, 15.0, UI_ACCENT),
                 flex_col((
-                    label(plugin.name)
-                        .font(UI_FONT_STACK)
-                        .text_size(12.0)
-                        .weight(FontWeight::BOLD)
-                        .color(UI_TEXT_SOFT),
-                    label(plugin.description)
-                        .font(UI_FONT_STACK)
-                        .text_size(10.5)
-                        .color(UI_MUTED),
+                    label(match (language, plugin.id) {
+                        (AppLanguage::English, "rebook.search") => "Full-text search",
+                        (AppLanguage::English, "rebook.ai-chat") => "AI Chat",
+                        (AppLanguage::English, "rebook.translation") => "Translation",
+                        _ => plugin.name,
+                    })
+                    .font(UI_FONT_STACK)
+                    .text_size(12.0)
+                    .weight(FontWeight::BOLD)
+                    .color(UI_TEXT_SOFT),
+                    label(match (language, plugin.id) {
+                        (AppLanguage::English, "rebook.search") => {
+                            "Search book content and jump to the source"
+                        }
+                        (AppLanguage::English, "rebook.ai-chat") => {
+                            "Search, explain, and answer questions about the book"
+                        }
+                        (AppLanguage::English, "rebook.translation") => {
+                            "Translate book content while preserving source anchors"
+                        }
+                        _ => plugin.description,
+                    })
+                    .font(UI_FONT_STACK)
+                    .text_size(10.5)
+                    .color(UI_MUTED),
                 ))
                 .gap(2.px())
                 .cross_axis_alignment(CrossAxisAlignment::Start)
                 .flex(1.0),
-                value_badge("已启用"),
+                value_badge(language.text("已启用", "Enabled")),
             ))
             .gap(9.px())
             .cross_axis_alignment(CrossAxisAlignment::Center)
@@ -1249,7 +1534,7 @@ fn plugin_settings_content() -> impl WidgetView<DesktopReader> + use<> {
         .collect::<Vec<_>>();
     portal(
         flex_col((
-            label("内置插件")
+            label(language.text("内置插件", "Built-in plugins"))
                 .font(UI_FONT_STACK)
                 .text_size(12.0)
                 .weight(FontWeight::BOLD)
@@ -1283,13 +1568,18 @@ fn settings_value_row(name: &'static str, value: &'static str) -> impl WidgetVie
     .padding(Padding::horizontal(12.0))
 }
 
-fn spread_settings_row(spread: SpreadMode) -> impl WidgetView<DesktopReader> {
+fn spread_settings_row(
+    spread: SpreadMode,
+    language: AppLanguage,
+) -> impl WidgetView<DesktopReader> {
     sized_box(
         flex_row((
-            label("分页方式").text_size(13.0).color(UI_TEXT_SOFT),
+            label(language.text("分页方式", "Page spread"))
+                .text_size(13.0)
+                .color(UI_TEXT_SOFT),
             FlexSpacer::Flex(1.0),
-            spread_choice("单栏", SpreadMode::Single, spread),
-            spread_choice("双栏", SpreadMode::Double, spread),
+            spread_choice(language.text("单栏", "Single"), SpreadMode::Single, spread),
+            spread_choice(language.text("双栏", "Double"), SpreadMode::Double, spread),
         ))
         .gap(6.px())
         .cross_axis_alignment(CrossAxisAlignment::Center),

@@ -28,6 +28,9 @@ pub use translation::{BlockTranslation, TranslationBlockInput, TranslationBookSo
 const SETTINGS_FILE: &str = "plugins.json";
 const DEFAULT_PROVIDER_ID: &str = "openai";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
+pub(crate) const TARGET_LANGUAGE_INTERFACE: &str = "interface";
+pub(crate) const TARGET_LANGUAGE_SIMPLIFIED_CHINESE: &str = "zh-CN";
+pub(crate) const TARGET_LANGUAGE_ENGLISH: &str = "en";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PluginManifest {
@@ -111,7 +114,7 @@ impl Default for PluginSettings {
             chat_model: DEFAULT_MODEL.into(),
             translation_provider: DEFAULT_PROVIDER_ID.into(),
             translation_model: DEFAULT_MODEL.into(),
-            target_language: "简体中文".into(),
+            target_language: TARGET_LANGUAGE_INTERFACE.into(),
             translation_mode: TranslationMode::Bilingual,
             legacy_base_url: None,
             legacy_api_key: None,
@@ -201,9 +204,7 @@ impl PluginSettings {
             &mut self.translation_provider,
             &mut self.translation_model,
         );
-        if self.target_language.trim().is_empty() {
-            self.target_language = "简体中文".into();
-        }
+        self.target_language = normalize_target_language(&self.target_language);
     }
 
     pub fn add_provider(&mut self) {
@@ -271,6 +272,15 @@ impl PluginSettings {
 
     pub fn translation_endpoint(&self) -> Result<(&AiProvider, &str), String> {
         self.endpoint(&self.translation_provider, &self.translation_model, "翻译")
+    }
+
+    pub(crate) fn resolved_target_language(&self, interface_language: &str) -> String {
+        match self.target_language.as_str() {
+            TARGET_LANGUAGE_INTERFACE => interface_language.to_owned(),
+            TARGET_LANGUAGE_SIMPLIFIED_CHINESE => "简体中文".into(),
+            TARGET_LANGUAGE_ENGLISH => "English".into(),
+            custom => custom.to_owned(),
+        }
     }
 
     fn endpoint<'a>(
@@ -348,6 +358,17 @@ fn normalized_models(models: Vec<String>) -> Vec<String> {
     models
 }
 
+fn normalize_target_language(value: &str) -> String {
+    match value.trim() {
+        "" | TARGET_LANGUAGE_INTERFACE => TARGET_LANGUAGE_INTERFACE.into(),
+        "简体中文" | TARGET_LANGUAGE_SIMPLIFIED_CHINESE => {
+            TARGET_LANGUAGE_SIMPLIFIED_CHINESE.into()
+        }
+        "English" | TARGET_LANGUAGE_ENGLISH => TARGET_LANGUAGE_ENGLISH.into(),
+        custom => custom.to_owned(),
+    }
+}
+
 fn normalize_selection(providers: &[AiProvider], provider_id: &mut String, model: &mut String) {
     let provider = providers
         .iter()
@@ -400,7 +421,8 @@ mod tests {
         );
         assert_eq!(settings.chat_model, "qwen-chat");
         assert_eq!(settings.translation_model, "qwen-translate");
-        assert_eq!(settings.target_language, "English");
+        assert_eq!(settings.target_language, TARGET_LANGUAGE_ENGLISH);
+        assert_eq!(settings.resolved_target_language("简体中文"), "English");
         assert_eq!(settings.translation_mode, TranslationMode::Bilingual);
     }
 
@@ -414,6 +436,21 @@ mod tests {
         let restored: PluginSettings = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.translation_mode, TranslationMode::Replace);
+    }
+
+    #[test]
+    fn translation_target_defaults_to_interface_language_and_migrates_labels() {
+        let settings = PluginSettings::default();
+        assert_eq!(settings.target_language, TARGET_LANGUAGE_INTERFACE);
+        assert_eq!(settings.resolved_target_language("English"), "English");
+
+        let mut legacy = PluginSettings {
+            target_language: "简体中文".into(),
+            ..PluginSettings::default()
+        };
+        legacy.normalize();
+        assert_eq!(legacy.target_language, TARGET_LANGUAGE_SIMPLIFIED_CHINESE);
+        assert_eq!(legacy.resolved_target_language("English"), "简体中文");
     }
 
     #[test]

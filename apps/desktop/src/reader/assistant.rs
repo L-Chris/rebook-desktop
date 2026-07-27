@@ -23,10 +23,13 @@ impl DesktopReader {
         }
         let query = self.search.query.trim().to_owned();
         if query.is_empty() {
-            self.search.status = "请输入搜索内容".into();
+            self.search.status = self
+                .language
+                .text("请输入搜索内容", "Enter a search query")
+                .into();
             return;
         }
-        self.search.status = "正在搜索…".into();
+        self.search.status = self.language.text("正在搜索…", "Searching…").into();
         self.search.results.clear();
         self.focused_mark = None;
         self.search.task.begin(SearchTask {
@@ -43,9 +46,18 @@ impl DesktopReader {
         match message.result {
             Ok(results) => {
                 self.search.status = if results.is_empty() {
-                    "没有找到匹配内容".into()
+                    self.language
+                        .text("没有找到匹配内容", "No matches found")
+                        .into()
                 } else {
-                    format!("找到 {} 处结果", results.len())
+                    match self.language {
+                        crate::preferences::AppLanguage::SimplifiedChinese => {
+                            format!("找到 {} 处结果", results.len())
+                        }
+                        crate::preferences::AppLanguage::English => {
+                            format!("Found {} matches", results.len())
+                        }
+                    }
                 };
                 self.search.results = results;
             }
@@ -62,7 +74,13 @@ impl DesktopReader {
                 self.focused_mark = Some(FocusedMark::search(result.range.clone()));
                 self.apply_snapshot(navigation.snapshot, SnapshotEffects::navigation());
             }
-            Err(error) => self.search.status = format!("搜索结果跳转失败：{error}"),
+            Err(error) => {
+                self.search.status = format!(
+                    "{}: {error}",
+                    self.language
+                        .text("搜索结果跳转失败", "Failed to open search result")
+                );
+            }
         }
     }
 
@@ -124,10 +142,16 @@ impl DesktopReader {
         let Some(selection) = self.selection.clone() else {
             return;
         };
-        let question = format!(
-            "请结合当前段落和章节语境解释选中的内容。说明它的直接含义、在本段中的作用，以及理解它所需的背景；不要脱离原文进行无依据推测。\n\n选中文字：\n{}",
-            selection.text.trim()
-        );
+        let question = match self.language {
+            crate::preferences::AppLanguage::SimplifiedChinese => format!(
+                "请结合当前段落和章节语境解释选中的内容。说明它的直接含义、在本段中的作用，以及理解它所需的背景；不要脱离原文进行无依据推测。\n\n选中文字：\n{}",
+                selection.text.trim()
+            ),
+            crate::preferences::AppLanguage::English => format!(
+                "Explain the selected text in the context of the current paragraph and section. Cover its direct meaning, its role in the passage, and any background needed to understand it. Do not speculate beyond the source.\n\nSelected text:\n{}",
+                selection.text.trim()
+            ),
+        };
         self.focused_mark = Some(FocusedMark::assistant(selection.ranges.clone()));
         self.cancel_text_selection();
         self.ui.assistant_panel = Some(AssistantPanel::Chat);
@@ -153,6 +177,7 @@ impl DesktopReader {
             history,
             question,
             current_section: self.snapshot.location.section_index,
+            response_language: self.language.translation_target().into(),
         });
     }
 
@@ -166,7 +191,13 @@ impl DesktopReader {
                     let transaction = match self.rewrite_source.apply_rewrites(&response.rewrites) {
                         Ok(transaction) => transaction,
                         Err(error) => {
-                            self.chat.error = Some(format!("应用正文改写失败：{error}"));
+                            self.chat.error = Some(format!(
+                                "{}: {error}",
+                                self.language.text(
+                                    "应用正文改写失败",
+                                    "Failed to apply the content rewrite"
+                                )
+                            ));
                             return;
                         }
                     };
@@ -182,11 +213,27 @@ impl DesktopReader {
                         }
                         Err(error) => {
                             let rollback_error = self.rewrite_source.rollback(transaction).err();
-                            self.chat.error = Some(match rollback_error {
-                                Some(rollback_error) => format!(
+                            self.chat.error = Some(match (self.language, rollback_error) {
+                                (
+                                    crate::preferences::AppLanguage::SimplifiedChinese,
+                                    Some(rollback_error),
+                                ) => format!(
                                     "应用正文改写失败：{error}；回滚也失败：{rollback_error}"
                                 ),
-                                None => format!("应用正文改写失败：{error}"),
+                                (
+                                    crate::preferences::AppLanguage::English,
+                                    Some(rollback_error),
+                                ) => {
+                                    format!(
+                                        "Failed to apply the content rewrite: {error}; rollback also failed: {rollback_error}"
+                                    )
+                                }
+                                (crate::preferences::AppLanguage::SimplifiedChinese, None) => {
+                                    format!("应用正文改写失败：{error}")
+                                }
+                                (crate::preferences::AppLanguage::English, None) => {
+                                    format!("Failed to apply the content rewrite: {error}")
+                                }
                             });
                             return;
                         }
@@ -273,9 +320,12 @@ impl DesktopReader {
             return;
         }
         self.translation.clear_error();
+        let mut settings = self.plugin_settings.clone();
+        settings.target_language =
+            settings.resolved_target_language(self.language.translation_target());
         self.translation.task.begin(TranslationTask {
             section_index,
-            settings: self.plugin_settings.clone(),
+            settings,
             blocks,
         });
     }
@@ -302,7 +352,11 @@ impl DesktopReader {
                 self.queue_current_section_translation();
             }
             Err(error) => {
-                self.error = Some(format!("翻译正文失败：{error}"));
+                self.error = Some(format!(
+                    "{}: {error}",
+                    self.language
+                        .text("翻译正文失败", "Failed to translate book content")
+                ));
                 self.translation.show_error(error, Instant::now());
             }
         }
@@ -319,9 +373,14 @@ impl DesktopReader {
                     },
                 );
             }
-            Err(error) => self
-                .translation
-                .show_error(format!("刷新翻译正文失败：{error}"), Instant::now()),
+            Err(error) => self.translation.show_error(
+                format!(
+                    "{}: {error}",
+                    self.language
+                        .text("刷新翻译正文失败", "Failed to refresh translated content")
+                ),
+                Instant::now(),
+            ),
         }
     }
 }

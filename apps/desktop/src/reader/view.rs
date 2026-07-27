@@ -112,6 +112,7 @@ pub(crate) fn app_view(state: &mut DesktopReader) -> impl WidgetView<DesktopRead
                             payload.history,
                             payload.question,
                             payload.current_section,
+                            payload.response_language,
                         )
                         .await;
                         let _ = proxy.message(ChatTaskMessage { id, result });
@@ -243,7 +244,7 @@ fn reader_workspace(
     let menu_content: Box<AnyWidgetView<DesktopReader>> = if menu_visible {
         flex_col((
             FlexSpacer::Fixed((TOOLBAR_HEIGHT + 8.0).px()),
-            reader_menu().transform(Affine::translate((
+            reader_menu(state.language).transform(Affine::translate((
                 0.0,
                 -8.0 * f64::from(1.0 - menu_progress),
             ))),
@@ -284,14 +285,17 @@ fn translation_status_notice(state: &DesktopReader) -> Box<AnyWidgetView<Desktop
     let content: Box<AnyWidgetView<DesktopReader>> = if state.translation.task.is_pending() {
         notice_card(
             NoticeTone::Info,
-            "正在翻译",
-            "当前章节完成后会自动刷新正文。",
+            state.language.text("正在翻译", "Translating"),
+            state.language.text(
+                "当前章节完成后会自动刷新正文。",
+                "The current section will refresh when translation completes.",
+            ),
         )
         .boxed()
     } else if let Some(error) = &state.translation.error {
         dismissible_notice(
             NoticeTone::Error,
-            "无法完成翻译",
+            state.language.text("无法完成翻译", "Translation failed"),
             error.clone(),
             DesktopReader::dismiss_translation_notice,
         )
@@ -456,7 +460,7 @@ fn toc_view(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
     sized_box(
         flex_col((
             sidebar_toolbar(state.ui.sidebar_pinned, state.ui.sidebar_tab),
-            sidebar_book_summary(cover, &title, &author, format),
+            sidebar_book_summary(cover, &title, &author, format, state.language),
             divider(),
             panel.flex(1.0),
         ))
@@ -517,9 +521,9 @@ fn search_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<>
         flex_col((
             icon_label(Icon::Search, 24.0, UI_MUTED),
             label(if busy {
-                "正在扫描正文…"
+                state.language.text("正在扫描正文…", "Scanning book…")
             } else {
-                "搜索书中内容"
+                state.language.text("搜索书中内容", "Search this book")
             })
             .font(UI_FONT_STACK)
             .text_size(12.5)
@@ -547,7 +551,7 @@ fn search_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<>
                 state.search.query = value;
                 state.start_search();
             })
-            .placeholder("搜索全文…")
+            .placeholder(state.language.text("搜索全文…", "Search full text…"))
             .text_color(UI_TEXT)
             .caret_color(UI_ACCENT)
             .background_color(Color::TRANSPARENT)
@@ -634,21 +638,25 @@ fn highlights_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + u
                 })
                 .unwrap_or(0);
             let selected = selected_id.as_deref() == Some(&highlight.id);
-            highlight_row_view(highlight, section_index, selected)
+            highlight_row_view(highlight, section_index, selected, state.language)
         })
         .collect::<Vec<_>>();
     let count = state.highlights.len();
     let content: Box<AnyWidgetView<DesktopReader>> = if rows.is_empty() {
         flex_col((
             icon_label(Icon::Highlighter, 24.0, UI_MUTED),
-            label("还没有高亮")
+            label(state.language.text("还没有高亮", "No highlights yet"))
                 .font(UI_FONT_STACK)
                 .text_size(13.0)
                 .color(UI_MUTED),
-            label("拖选正文后即可添加")
-                .font(UI_FONT_STACK)
-                .text_size(11.5)
-                .color(UI_MUTED),
+            label(
+                state
+                    .language
+                    .text("拖选正文后即可添加", "Select text in the book to add one"),
+            )
+            .font(UI_FONT_STACK)
+            .text_size(11.5)
+            .color(UI_MUTED),
         ))
         .gap(8.px())
         .cross_axis_alignment(CrossAxisAlignment::Center)
@@ -665,16 +673,19 @@ fn highlights_panel(state: &DesktopReader) -> impl WidgetView<DesktopReader> + u
 
     flex_col((
         flex_row((
-            label("高亮")
+            label(state.language.text("高亮", "Highlights"))
                 .font(UI_FONT_STACK)
                 .text_size(13.0)
                 .weight(FontWeight::BOLD)
                 .color(UI_TEXT),
             FlexSpacer::Flex(1.0),
-            label(format!("{count} 条"))
-                .font(UI_FONT_STACK)
-                .text_size(11.5)
-                .color(UI_MUTED),
+            label(match state.language {
+                crate::preferences::AppLanguage::SimplifiedChinese => format!("{count} 条"),
+                crate::preferences::AppLanguage::English => format!("{count}"),
+            })
+            .font(UI_FONT_STACK)
+            .text_size(11.5)
+            .color(UI_MUTED),
         ))
         .padding(Padding::from_vh(8.0, 8.0)),
         content.flex(1.0),
@@ -687,6 +698,7 @@ fn highlight_row_view(
     highlight: StoredHighlight,
     section_index: usize,
     selected: bool,
+    language: crate::preferences::AppLanguage,
 ) -> impl WidgetView<DesktopReader> + use<> {
     let navigate_id = highlight.id.clone();
     let remove_id = highlight.id;
@@ -706,10 +718,17 @@ fn highlight_row_view(
                 .corner_radius(3.0),
             button(
                 flex_col((
-                    label(format!("第 {} 章", section_index + 1))
-                        .font(UI_FONT_STACK)
-                        .text_size(11.0)
-                        .color(UI_MUTED),
+                    label(match language {
+                        crate::preferences::AppLanguage::SimplifiedChinese => {
+                            format!("第 {} 章", section_index + 1)
+                        }
+                        crate::preferences::AppLanguage::English => {
+                            format!("Chapter {}", section_index + 1)
+                        }
+                    })
+                    .font(UI_FONT_STACK)
+                    .text_size(11.0)
+                    .color(UI_MUTED),
                     label(quote)
                         .font(UI_FONT_STACK)
                         .text_size(12.5)
@@ -756,7 +775,7 @@ fn highlight_row_view(
 fn sidebar_book_metadata(state: &DesktopReader) -> (String, String) {
     let title = state.display_metadata.title.clone();
     let author = if state.display_metadata.authors.is_empty() {
-        "未知作者".to_owned()
+        state.language.text("未知作者", "Unknown author").to_owned()
     } else {
         state.display_metadata.authors.join(" / ")
     };
@@ -768,6 +787,7 @@ fn sidebar_book_summary(
     title: &str,
     author: &str,
     format: BookFormat,
+    language: crate::preferences::AppLanguage,
 ) -> impl WidgetView<DesktopReader> + use<> {
     let title = wrap_display_text(
         title,
@@ -779,7 +799,7 @@ fn sidebar_book_summary(
         SIDEBAR_AUTHOR_MAX_DISPLAY_UNITS,
     );
     flex_row((
-        sidebar_book_cover(cover, format),
+        sidebar_book_cover(cover, format, language),
         flex_col((
             prose(title)
                 .text_size(13.5)
@@ -803,6 +823,7 @@ fn sidebar_book_summary(
 fn sidebar_book_cover(
     cover: Option<ImageData>,
     format: BookFormat,
+    language: crate::preferences::AppLanguage,
 ) -> Box<AnyWidgetView<DesktopReader>> {
     if let Some(cover) = cover {
         sized_box(image(cover).fit(ObjectFit::Contain))
@@ -815,7 +836,7 @@ fn sidebar_book_cover(
     } else {
         sized_box(
             flex_col((
-                label("电子书")
+                label(language.text("电子书", "E-book"))
                     .text_size(10.0)
                     .weight(FontWeight::BOLD)
                     .color(UI_ACCENT),
@@ -1002,11 +1023,19 @@ pub(super) fn icon_button(
     .height(32.px())
 }
 
-fn reader_menu() -> impl WidgetView<DesktopReader> {
+fn reader_menu(language: crate::preferences::AppLanguage) -> impl WidgetView<DesktopReader> {
     sized_box(flex_col((
-        menu_row(Icon::Library, "返回书架", DesktopReader::request_exit),
+        menu_row(
+            Icon::Library,
+            language.text("返回书架", "Back to shelf"),
+            DesktopReader::request_exit,
+        ),
         divider(),
-        menu_row(Icon::Settings, "设置", DesktopReader::open_settings),
+        menu_row(
+            Icon::Settings,
+            language.text("设置", "Settings"),
+            DesktopReader::open_settings,
+        ),
     )))
     .width(180.px())
     .background_color(UI_SURFACE)

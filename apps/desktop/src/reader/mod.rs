@@ -17,8 +17,8 @@ use crate::plugins::{
     BlockTranslation, BookSearchResult, ChatResponse, ChatTurn, PluginSettings, RewriteBookSource,
     TranslationBlockInput, TranslationBookSource,
 };
-use crate::preferences;
-use crate::sync::SyncStore;
+use crate::preferences::{self, AppLanguage, ReaderPreferences};
+use crate::sync::{SyncSettings, SyncStore};
 use crate::ui::decode_image;
 
 const INITIAL_WIDTH: u32 = 1200;
@@ -77,14 +77,22 @@ pub(super) fn open_reader(
     let highlight_store = HighlightStore::from_repository(local_store.clone())?;
     let highlights = highlight_store.for_book(&book_id);
     let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
-    let typography = preferences::load_reader_typography().unwrap_or_else(|error| {
-        tracing::warn!(%error, "failed to load reader typography; using defaults");
-        ReaderTypography::default()
+    let reader_preferences = preferences::load_reader_preferences().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to load reader preferences; using defaults");
+        ReaderPreferences::default()
     });
     let style = ReaderStyle {
-        typography,
+        typography: reader_preferences.typography.clone(),
         ..ReaderStyle::default()
     };
+    let sync_settings = SyncSettings::load_default().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to load WebDAV settings; using defaults");
+        SyncSettings::new_device()
+    });
+    let sync_password = sync_settings.load_password().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to load WebDAV credential");
+        String::new()
+    });
     let mut reader =
         ReaderSession::open_with_fonts(Arc::clone(&source), viewport, style, reader_fonts)?;
     let progress_store = Some(local_store);
@@ -114,6 +122,9 @@ pub(super) fn open_reader(
             progress_store,
             plugin_settings,
             available_font_families,
+            language: reader_preferences.language,
+            sync_settings,
+            sync_password,
         },
     ))
 }
@@ -163,6 +174,9 @@ pub(super) struct DesktopReader {
     selected_highlight_id: Option<String>,
     focused_mark: Option<FocusedMark>,
     plugin_settings: PluginSettings,
+    language: AppLanguage,
+    sync_settings: SyncSettings,
+    sync_password: String,
     available_font_families: Arc<[String]>,
     search: SearchUiState,
     chat: ChatUiState,
@@ -190,6 +204,9 @@ struct DesktopReaderResources {
     progress_store: Option<SyncStore>,
     plugin_settings: PluginSettings,
     available_font_families: Arc<[String]>,
+    language: AppLanguage,
+    sync_settings: SyncSettings,
+    sync_password: String,
 }
 
 #[derive(Clone)]
@@ -256,6 +273,7 @@ struct ChatTask {
     history: Vec<ChatTurn>,
     question: String,
     current_section: usize,
+    response_language: String,
 }
 
 type ChatTaskMessage = TaskResult<ChatResponse>;
@@ -371,8 +389,10 @@ enum ReaderOverlay {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SettingsTab {
     #[default]
+    General,
     Reading,
     Font,
+    Cloud,
     Ai,
     AiChat,
     Translation,
@@ -388,12 +408,12 @@ enum FontPickerKind {
 }
 
 impl FontPickerKind {
-    const fn title(self) -> &'static str {
+    const fn title(self, language: AppLanguage) -> &'static str {
         match self {
-            Self::Cjk => "中文字体",
-            Self::Serif => "衬线字体",
-            Self::SansSerif => "无衬线字体",
-            Self::Monospace => "等宽字体",
+            Self::Cjk => language.text("中文字体", "CJK font"),
+            Self::Serif => language.text("衬线字体", "Serif font"),
+            Self::SansSerif => language.text("无衬线字体", "Sans-serif font"),
+            Self::Monospace => language.text("等宽字体", "Monospace font"),
         }
     }
 }
@@ -500,6 +520,9 @@ struct ReaderUiState {
     draft_typography: ReaderTypography,
     font_picker: Option<FontPickerKind>,
     draft_plugin_settings: PluginSettings,
+    draft_language: AppLanguage,
+    draft_sync_settings: SyncSettings,
+    draft_sync_password: String,
     assistant_panel: Option<AssistantPanel>,
     toolbar_motion: Motion,
     sidebar_motion: Motion,
@@ -562,6 +585,9 @@ impl DesktopReader {
             progress_store,
             plugin_settings,
             available_font_families,
+            language,
+            sync_settings,
+            sync_password,
         } = resources;
         let draft_style = reader.style();
         let error = reader
@@ -598,11 +624,14 @@ impl DesktopReader {
                 toolbar_hovered: false,
                 toolbar_hide_at: None,
                 overlay: ReaderOverlay::None,
-                settings_tab: SettingsTab::Reading,
+                settings_tab: SettingsTab::General,
                 draft_spread: draft_style.spread,
                 draft_typography: draft_style.typography,
                 font_picker: None,
                 draft_plugin_settings: plugin_settings.clone(),
+                draft_language: language,
+                draft_sync_settings: sync_settings.clone(),
+                draft_sync_password: String::new(),
                 assistant_panel: None,
                 toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
                 sidebar_motion: Motion::settled(1.0),
@@ -616,6 +645,9 @@ impl DesktopReader {
                 expanded_toc,
             },
             plugin_settings,
+            language,
+            sync_settings,
+            sync_password,
             available_font_families,
             canvas_size: None,
             scene_revision: 0,
@@ -640,11 +672,11 @@ fn logical_dimension(value: f64) -> u32 {
 mod tests {
     use super::settings_view::font_candidates;
     use super::{
-        Arc, BookDisplayMetadata, FontPickerKind, HashSet, Instant, MOTION_DURATION, Motion,
-        MotionCurve, NOTICE_AUTO_DISMISS_DELAY, PluginSettings, ReaderOverlay, ReaderTypography,
-        ReaderUiState, SETTINGS_MOTION_DURATION, SettingsTab, SidebarTab, SpreadMode,
-        TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TranslationUiState, logical_dimension,
-        resolve_book_display_metadata,
+        AppLanguage, Arc, BookDisplayMetadata, FontPickerKind, HashSet, Instant, MOTION_DURATION,
+        Motion, MotionCurve, NOTICE_AUTO_DISMISS_DELAY, PluginSettings, ReaderOverlay,
+        ReaderTypography, ReaderUiState, SETTINGS_MOTION_DURATION, SettingsTab, SidebarTab,
+        SpreadMode, SyncSettings, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TranslationUiState,
+        logical_dimension, resolve_book_display_metadata,
     };
 
     #[test]
@@ -712,6 +744,9 @@ mod tests {
             draft_typography: ReaderTypography::default(),
             font_picker: None,
             draft_plugin_settings: PluginSettings::default(),
+            draft_language: AppLanguage::default(),
+            draft_sync_settings: SyncSettings::new_device(),
+            draft_sync_password: String::new(),
             assistant_panel: None,
             toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
             sidebar_motion: Motion::settled(0.0),
