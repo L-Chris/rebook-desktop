@@ -1,3 +1,4 @@
+use xilem::masonry::properties::PlaceholderColor;
 use xilem::masonry::properties::types::{AsUnit, UnitPoint};
 use xilem::style::{Padding, Style};
 use xilem::view::{
@@ -176,6 +177,7 @@ fn settings_input_row<State: 'static>(
             .placeholder(placeholder)
             .text_color(UI_TEXT)
             .caret_color(UI_ACCENT)
+            .prop(PlaceholderColor::new(UI_MUTED))
             .background_color(UI_SURFACE_MUTED)
             .border_color(UI_BORDER)
             .border_width(1.0)

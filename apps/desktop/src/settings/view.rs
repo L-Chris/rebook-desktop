@@ -4,11 +4,12 @@ use std::collections::HashSet;
 use lucide_icons::Icon;
 use rebook_layout::{ReaderDefaultFont, ReaderTypography, SpreadMode};
 use xilem::masonry::parley::style::FontStack;
+use xilem::masonry::properties::PlaceholderColor;
 use xilem::masonry::properties::types::{AsUnit, UnitPoint};
 use xilem::style::{Padding, Style};
 use xilem::view::{
-    CrossAxisAlignment, FlexExt, FlexSpacer, ZStackExt, flex_col, flex_row, label, portal, prose,
-    sized_box, text_input, zstack,
+    CrossAxisAlignment, FlexExt, FlexSpacer, MainAxisAlignment, ZStackExt, flex_col, flex_row,
+    label, portal, prose, sized_box, text_input, zstack,
 };
 use xilem::{Affine, AnyWidgetView, Color, FontWeight, WidgetView};
 
@@ -276,6 +277,7 @@ fn general_settings_content(language: AppLanguage) -> impl WidgetView<SettingsFe
     ))
     .gap(CONTENT_GAP.px())
     .cross_axis_alignment(CrossAxisAlignment::Fill)
+    .main_axis_alignment(MainAxisAlignment::Start)
     .padding(Padding::from_vh(
         CONTENT_PADDING_VERTICAL,
         CONTENT_PADDING_HORIZONTAL,
@@ -1059,6 +1061,7 @@ fn ai_provider_model_row(
                 ))
                 .text_color(UI_TEXT)
                 .caret_color(UI_ACCENT)
+                .prop(PlaceholderColor::new(UI_MUTED))
                 .background_color(UI_SURFACE_MUTED)
                 .border_color(UI_BORDER)
                 .border_width(1.0)
@@ -1096,6 +1099,7 @@ fn ai_settings_input_row(
                 .placeholder(placeholder)
                 .text_color(UI_TEXT)
                 .caret_color(UI_ACCENT)
+                .prop(PlaceholderColor::new(UI_MUTED))
                 .background_color(UI_SURFACE_MUTED)
                 .border_color(UI_BORDER)
                 .border_width(1.0)
