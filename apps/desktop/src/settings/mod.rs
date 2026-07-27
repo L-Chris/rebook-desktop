@@ -220,7 +220,7 @@ fn persist_settings(
     plugin_settings.save_default().map_err(|error| {
         format!(
             "{}: {error}",
-            language.text("保存插件设置失败", "Failed to save plugin settings")
+            language.text("保存 AI 设置失败", "Failed to save AI settings")
         )
     })?;
     preferences::save_reader_preferences(&ReaderPreferences {
@@ -266,7 +266,6 @@ enum SettingsTab {
     Ai,
     AiChat,
     Translation,
-    Plugins,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

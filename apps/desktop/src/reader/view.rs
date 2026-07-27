@@ -17,10 +17,10 @@ use xilem::{Affine, AnyWidgetView, Color, FontWeight, WidgetView};
 use crate::highlights::StoredHighlight;
 use crate::plugins::{BookSearchResult, chat_with_book, search_book, translate_blocks};
 use crate::ui::{
-    NoticeTone, UI_ACCENT, UI_ACCENT_BORDER, UI_ACCENT_SOFT, UI_BACKGROUND, UI_BORDER,
-    UI_FONT_STACK, UI_MUTED, UI_SIDEBAR, UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT, UI_TEXT_SOFT,
-    button, dismissible_notice, divider, ellipsize_display_text, icon_label, notice_card, ui_color,
-    wrap_display_text,
+    NOTICE_WIDTH, NoticeTone, UI_ACCENT, UI_ACCENT_BORDER, UI_ACCENT_SOFT, UI_BACKGROUND,
+    UI_BORDER, UI_FONT_STACK, UI_MUTED, UI_SIDEBAR, UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT,
+    UI_TEXT_SOFT, button, dismissible_notice, divider, ellipsize_display_text, icon_label,
+    notice_card, ui_color, wrap_display_text,
 };
 
 use super::assistant_view::assistant_panel;
@@ -295,7 +295,7 @@ fn translation_status_notice(state: &DesktopReader) -> Box<AnyWidgetView<Desktop
         return sized_box(label("")).width(0.px()).height(0.px()).boxed();
     };
     sized_box(content)
-        .width(356.px())
+        .width(NOTICE_WIDTH.px())
         .transform(Affine::translate((-16.0, TOOLBAR_HEIGHT + 12.0)))
         .boxed()
 }

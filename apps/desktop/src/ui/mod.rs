@@ -1,11 +1,13 @@
 mod button;
 mod dialog;
 mod feedback;
+mod help_tooltip;
 mod theme;
 
 pub(crate) use button::button;
 pub(crate) use dialog::confirmation_dialog;
-pub(crate) use feedback::{NoticeTone, dismissible_notice, notice_card};
+pub(crate) use feedback::{NOTICE_WIDTH, NoticeTone, dismissible_notice, notice_card};
+pub(crate) use help_tooltip::help_tooltip;
 pub(crate) use theme::{
     CONTENT_GAP, CONTENT_PADDING_HORIZONTAL, CONTENT_PADDING_VERTICAL, CONTROL_HEIGHT,
     CONTROL_HEIGHT_COMPACT, DIALOG_FOOTER_HEIGHT, DIALOG_HEADER_HEIGHT, RADIUS_DIALOG,

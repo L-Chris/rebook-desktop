@@ -13,6 +13,7 @@ use std::io;
 use std::path::PathBuf;
 
 use directories::ProjectDirs;
+use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::write_json_atomic;
@@ -26,36 +27,12 @@ pub use search::{BookSearchResult, search_book};
 pub use translation::{BlockTranslation, TranslationBlockInput, TranslationBookSource};
 
 const SETTINGS_FILE: &str = "plugins.json";
+const AI_CREDENTIAL_SERVICE: &str = "Rebook AI";
 const DEFAULT_PROVIDER_ID: &str = "openai";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
 pub(crate) const TARGET_LANGUAGE_INTERFACE: &str = "interface";
 pub(crate) const TARGET_LANGUAGE_SIMPLIFIED_CHINESE: &str = "zh-CN";
 pub(crate) const TARGET_LANGUAGE_ENGLISH: &str = "en";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PluginManifest {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub description: &'static str,
-}
-
-pub const BUILTIN_PLUGINS: [PluginManifest; 3] = [
-    PluginManifest {
-        id: "rebook.search",
-        name: "全文搜索",
-        description: "按语义正文搜索并跳转到原文",
-    },
-    PluginManifest {
-        id: "rebook.ai-chat",
-        name: "AI 对话",
-        description: "围绕当前书籍检索、解释和问答",
-    },
-    PluginManifest {
-        id: "rebook.translation",
-        name: "翻译",
-        description: "翻译选中文字并保留原文锚点",
-    },
-];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -64,8 +41,8 @@ pub struct AiProvider {
     pub name: String,
     pub base_url: String,
     pub models: Vec<String>,
-    /// Secrets are deliberately session-only. The initial value can be supplied
-    /// through `REBOOK_AI_API_KEY`, and edits are never serialized to disk.
+    /// Secrets are excluded from JSON and stored in Windows Credential Manager.
+    /// `REBOOK_AI_API_KEY` can override the default provider at runtime.
     #[serde(skip)]
     pub api_key: String,
 }
@@ -132,6 +109,8 @@ impl PluginSettings {
             Err(error) => return Err(error),
         };
         settings.migrate_legacy();
+        settings.normalize();
+        settings.load_api_keys()?;
         if let Ok(value) = env::var("REBOOK_AI_BASE_URL")
             && !value.trim().is_empty()
             && let Some(provider) = settings.providers.first_mut()
@@ -170,7 +149,8 @@ impl PluginSettings {
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "插件设置路径没有父目录"))?;
         fs::create_dir_all(parent)?;
-        write_json_atomic(&path, &settings)
+        write_json_atomic(&path, &settings)?;
+        settings.save_api_keys()
     }
 
     pub fn normalize(&mut self) {
@@ -343,6 +323,38 @@ impl PluginSettings {
             self.translation_provider.clone_from(&provider.id);
         }
     }
+
+    fn load_api_keys(&mut self) -> io::Result<()> {
+        for provider in &mut self.providers {
+            match ai_credential_entry(&provider.id)?.get_password() {
+                Ok(api_key) => provider.api_key = api_key,
+                Err(keyring::Error::NoEntry) => {}
+                Err(error) => return Err(io::Error::other(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn save_api_keys(&self) -> io::Result<()> {
+        for provider in &self.providers {
+            let entry = ai_credential_entry(&provider.id)?;
+            if provider.api_key.trim().is_empty() {
+                match entry.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => {}
+                    Err(error) => return Err(io::Error::other(error)),
+                }
+            } else {
+                entry
+                    .set_password(provider.api_key.trim())
+                    .map_err(io::Error::other)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn ai_credential_entry(provider_id: &str) -> io::Result<Entry> {
+    Entry::new(AI_CREDENTIAL_SERVICE, provider_id).map_err(io::Error::other)
 }
 
 fn normalized_models(models: Vec<String>) -> Vec<String> {
@@ -470,14 +482,14 @@ mod tests {
     }
 
     #[test]
-    fn builtin_plugin_ids_are_stable_and_unique() {
-        let ids = BUILTIN_PLUGINS
-            .iter()
-            .map(|plugin| plugin.id)
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(ids.len(), BUILTIN_PLUGINS.len());
-        assert!(ids.contains("rebook.search"));
-        assert!(ids.contains("rebook.ai-chat"));
-        assert!(ids.contains("rebook.translation"));
+    fn configured_api_key_survives_normalization_and_enables_translation() {
+        let mut settings = PluginSettings::default();
+        settings.providers[0].api_key = "  secret-key  ".into();
+
+        settings.normalize();
+
+        let (provider, model) = settings.translation_endpoint().unwrap();
+        assert_eq!(provider.api_key, "  secret-key  ");
+        assert_eq!(model, DEFAULT_MODEL);
     }
 }

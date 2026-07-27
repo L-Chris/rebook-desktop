@@ -719,6 +719,10 @@ fn clip_text(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
     use super::*;
 
     #[test]
@@ -789,5 +793,79 @@ mod tests {
                 | "getCharacterRelationships"
                 | "getStoryEntities"
         )));
+    }
+
+    #[test]
+    fn configured_api_key_is_used_for_translation_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            assert!(request.contains("authorization: Bearer secret-key"));
+
+            let body =
+                r#"{"choices":[{"message":{"role":"assistant","content":"{\"0\":\"你好\"}"}}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let mut settings = PluginSettings::default();
+        settings.providers[0].base_url = format!("http://{address}/v1");
+        settings.providers[0].api_key = "secret-key".into();
+        settings.target_language = "简体中文".into();
+        let translations = xilem::tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(translate_blocks(
+                settings,
+                vec![TranslationBlockInput {
+                    block_index: 4,
+                    text: "Hello".into(),
+                }],
+            ))
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(
+            translations,
+            [BlockTranslation {
+                block_index: 4,
+                text: "你好".into(),
+            }]
+        );
     }
 }

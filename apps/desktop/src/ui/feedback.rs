@@ -11,6 +11,8 @@ use xilem::{AnyWidgetView, Color, FontWeight, WidgetView};
 use super::button::button;
 use super::theme::{UI_BORDER, UI_FONT_STACK, UI_MUTED, UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT};
 
+pub(crate) const NOTICE_WIDTH: f64 = 332.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NoticeTone {
     Info,
@@ -114,7 +116,7 @@ fn notice_layout<State: 'static>(
                     .text_size(12.0)
                     .weight(FontWeight::BOLD)
                     .color(UI_TEXT),
-                wrapped_ui_text::<State>(message, 48, 11.5, UI_MUTED),
+                wrapped_ui_text::<State>(message, 36, 11.5, UI_MUTED),
             ))
             .gap(2.px())
             .cross_axis_alignment(CrossAxisAlignment::Start)

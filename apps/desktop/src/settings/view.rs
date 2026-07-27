@@ -9,13 +9,13 @@ use xilem::masonry::properties::types::{AsUnit, UnitPoint};
 use xilem::style::{Padding, Style};
 use xilem::view::{
     CrossAxisAlignment, FlexExt, FlexSpacer, MainAxisAlignment, ZStackExt, flex_col, flex_row,
-    label, portal, prose, sized_box, text_input, zstack,
+    label, portal, sized_box, text_input, zstack,
 };
 use xilem::{Affine, AnyWidgetView, Color, FontWeight, WidgetView};
 
 use crate::plugins::{
-    AiProvider, BUILTIN_PLUGINS, PluginSettings, TARGET_LANGUAGE_ENGLISH,
-    TARGET_LANGUAGE_INTERFACE, TARGET_LANGUAGE_SIMPLIFIED_CHINESE, TranslationMode,
+    AiProvider, PluginSettings, TARGET_LANGUAGE_ENGLISH, TARGET_LANGUAGE_INTERFACE,
+    TARGET_LANGUAGE_SIMPLIFIED_CHINESE, TranslationMode,
 };
 use crate::preferences::AppLanguage;
 use crate::sync::{SyncSettingsCallbacks, sync_settings_content};
@@ -24,7 +24,7 @@ use crate::ui::{
     CONTROL_HEIGHT_COMPACT, DIALOG_FOOTER_HEIGHT, DIALOG_HEADER_HEIGHT, RADIUS_DIALOG,
     RADIUS_LARGE, RADIUS_MEDIUM, RADIUS_SMALL, SETTINGS_ROW_HEIGHT, UI_ACCENT, UI_ACCENT_BORDER,
     UI_ACCENT_SOFT, UI_BORDER, UI_FONT_STACK, UI_MUTED, UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT,
-    UI_TEXT_SOFT, button, divider, icon_label,
+    UI_TEXT_SOFT, button, divider, help_tooltip, icon_label,
 };
 
 use super::{FontPickerKind, SettingsFeature, SettingsTab};
@@ -75,7 +75,6 @@ fn settings_content(state: &SettingsFeature) -> impl WidgetView<SettingsFeature>
         SettingsTab::Ai => "AI",
         SettingsTab::AiChat => "AI Chat",
         SettingsTab::Translation => language.text("翻译", "Translation"),
-        SettingsTab::Plugins => language.text("插件", "Plugins"),
     };
     let body: Box<AnyWidgetView<SettingsFeature>> = match tab {
         SettingsTab::General => general_settings_content(language).boxed(),
@@ -109,7 +108,6 @@ fn settings_content(state: &SettingsFeature) -> impl WidgetView<SettingsFeature>
         SettingsTab::Translation => {
             translation_settings_content(&state.draft_plugin_settings, language).boxed()
         }
-        SettingsTab::Plugins => plugin_settings_content(language).boxed(),
     };
 
     flex_row((
@@ -117,7 +115,7 @@ fn settings_content(state: &SettingsFeature) -> impl WidgetView<SettingsFeature>
         flex_col((
             settings_dialog_header(title),
             divider(),
-            body.flex(1.0),
+            sized_box(portal(body)).expand().flex(1.0),
             divider(),
             settings_footer(language),
         ))
@@ -165,7 +163,6 @@ fn settings_sidebar(language: AppLanguage, tab: SettingsTab) -> impl WidgetView<
                     SettingsTab::Translation,
                     tab,
                 ),
-                settings_tab_button(language.text("插件", "Plugins"), SettingsTab::Plugins, tab),
                 FlexSpacer::Flex(1.0),
             ))
             .gap(3.px())
@@ -262,18 +259,18 @@ fn settings_tab_button(
 
 fn general_settings_content(language: AppLanguage) -> impl WidgetView<SettingsFeature> {
     flex_col((
-        settings_section_label(language.text("语言与地区", "Language & region")),
+        settings_section_header(
+            language.text("语言与地区", "Language & region"),
+            language.text(
+                "界面语言也会作为翻译目标语言的默认值；也可以在“翻译”中选择固定语言。",
+                "The interface language is also the default translation target; a fixed language can be selected under Translation.",
+            ),
+        ),
         flex_col((language_settings_row(language),))
             .cross_axis_alignment(CrossAxisAlignment::Fill)
             .background_color(UI_SURFACE)
             .border(UI_BORDER, 1.0)
             .corner_radius(RADIUS_MEDIUM),
-        prose(language.text(
-            "界面语言也会作为翻译目标语言的默认值。你仍可在“翻译”中选择固定语言。",
-            "The interface language is also the default translation target. You can still choose a fixed language under Translation.",
-        ))
-        .text_size(10.5)
-        .text_color(UI_MUTED),
     ))
     .gap(CONTENT_GAP.px())
     .cross_axis_alignment(CrossAxisAlignment::Fill)
@@ -392,78 +389,76 @@ fn font_settings_content(
     let minimum_font_size = typography.minimum_font_size;
     let font_weight = typography.font_weight;
 
-    portal(
+    flex_col((
+        settings_section_label(language.text("字号与字重", "Size & weight")),
+        typography_metrics_card(font_size, minimum_font_size, font_weight, language),
+        settings_section_label(language.text("字体", "Font")),
         flex_col((
-            settings_section_label(language.text("字号与字重", "Size & weight")),
-            typography_metrics_card(font_size, minimum_font_size, font_weight, language),
-            settings_section_label(language.text("字体", "Font")),
-            flex_col((
-                default_font_row(default_font, language),
-                divider(),
-                font_family_settings_row(
-                    language.text("中文字体", "CJK font"),
-                    typography.default_cjk_font.clone(),
-                    FontPickerKind::Cjk,
-                ),
-            ))
-            .cross_axis_alignment(CrossAxisAlignment::Fill)
-            .background_color(UI_SURFACE)
-            .border(UI_BORDER, 1.0)
-            .corner_radius(RADIUS_MEDIUM),
-            settings_section_label(language.text("字型", "Font families")),
-            flex_col((
-                font_family_settings_row(
-                    language.text("衬线字体", "Serif font"),
-                    typography.serif_font.clone(),
-                    FontPickerKind::Serif,
-                ),
-                divider(),
-                font_family_settings_row(
-                    language.text("无衬线字体", "Sans-serif font"),
-                    typography.sans_serif_font.clone(),
-                    FontPickerKind::SansSerif,
-                ),
-                divider(),
-                font_family_settings_row(
-                    language.text("等宽字体", "Monospace font"),
-                    typography.monospace_font.clone(),
-                    FontPickerKind::Monospace,
-                ),
-            ))
-            .cross_axis_alignment(CrossAxisAlignment::Fill)
-            .background_color(UI_SURFACE)
-            .border(UI_BORDER, 1.0)
-            .corner_radius(RADIUS_MEDIUM),
-            sized_box(
-                flex_col((
-                    label(language.text("字体预览", "Font preview"))
-                        .font(UI_FONT_STACK)
-                        .text_size(11.0)
-                        .color(UI_MUTED),
-                    label(language.text(
-                        "阅读让思想抵达更远的地方 Reading 0123",
-                        "Reading carries ideas farther 阅读 0123",
-                    ))
-                    .font(ui_font_stack(preview_font))
-                    .text_size(preview_size)
-                    .weight(preview_weight)
-                    .color(UI_TEXT),
-                ))
-                .gap(6.px())
-                .cross_axis_alignment(CrossAxisAlignment::Start),
-            )
-            .background_color(UI_SURFACE_MUTED)
-            .border(UI_BORDER, 1.0)
-            .corner_radius(RADIUS_MEDIUM)
-            .padding(Padding::from_vh(10.0, 12.0)),
+            default_font_row(default_font, language),
+            divider(),
+            font_family_settings_row(
+                language.text("中文字体", "CJK font"),
+                typography.default_cjk_font.clone(),
+                FontPickerKind::Cjk,
+            ),
         ))
-        .gap(CONTENT_GAP.px())
         .cross_axis_alignment(CrossAxisAlignment::Fill)
-        .padding(Padding::from_vh(
-            CONTENT_PADDING_VERTICAL,
-            CONTENT_PADDING_HORIZONTAL,
-        )),
-    )
+        .background_color(UI_SURFACE)
+        .border(UI_BORDER, 1.0)
+        .corner_radius(RADIUS_MEDIUM),
+        settings_section_label(language.text("字型", "Font families")),
+        flex_col((
+            font_family_settings_row(
+                language.text("衬线字体", "Serif font"),
+                typography.serif_font.clone(),
+                FontPickerKind::Serif,
+            ),
+            divider(),
+            font_family_settings_row(
+                language.text("无衬线字体", "Sans-serif font"),
+                typography.sans_serif_font.clone(),
+                FontPickerKind::SansSerif,
+            ),
+            divider(),
+            font_family_settings_row(
+                language.text("等宽字体", "Monospace font"),
+                typography.monospace_font.clone(),
+                FontPickerKind::Monospace,
+            ),
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Fill)
+        .background_color(UI_SURFACE)
+        .border(UI_BORDER, 1.0)
+        .corner_radius(RADIUS_MEDIUM),
+        sized_box(
+            flex_col((
+                label(language.text("字体预览", "Font preview"))
+                    .font(UI_FONT_STACK)
+                    .text_size(11.0)
+                    .color(UI_MUTED),
+                label(language.text(
+                    "阅读让思想抵达更远的地方 Reading 0123",
+                    "Reading carries ideas farther 阅读 0123",
+                ))
+                .font(ui_font_stack(preview_font))
+                .text_size(preview_size)
+                .weight(preview_weight)
+                .color(UI_TEXT),
+            ))
+            .gap(6.px())
+            .cross_axis_alignment(CrossAxisAlignment::Start),
+        )
+        .background_color(UI_SURFACE_MUTED)
+        .border(UI_BORDER, 1.0)
+        .corner_radius(RADIUS_MEDIUM)
+        .padding(Padding::from_vh(10.0, 12.0)),
+    ))
+    .gap(CONTENT_GAP.px())
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+    .padding(Padding::from_vh(
+        CONTENT_PADDING_VERTICAL,
+        CONTENT_PADDING_HORIZONTAL,
+    ))
 }
 
 fn typography_metrics_card(
@@ -532,6 +527,15 @@ fn settings_section_label(text: &'static str) -> impl WidgetView<SettingsFeature
         .text_size(12.0)
         .weight(FontWeight::BOLD)
         .color(UI_MUTED)
+}
+
+fn settings_section_header(
+    text: &'static str,
+    help: &'static str,
+) -> impl WidgetView<SettingsFeature> {
+    flex_row((settings_section_label(text), help_tooltip(help)))
+        .gap(6.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center)
 }
 
 fn typography_stepper_row(
@@ -688,42 +692,40 @@ fn font_picker_content(
         .map(|family| font_picker_row(family, &selected, kind))
         .collect::<Vec<_>>();
 
-    portal(
-        flex_col((
-            sized_box(
-                button(
-                    flex_row((
-                        icon_label(Icon::ChevronLeft, 14.0, UI_MUTED),
-                        label(language.text("返回字体设置", "Back to font settings"))
-                            .font(UI_FONT_STACK)
-                            .text_size(12.0)
-                            .color(UI_TEXT_SOFT),
-                    ))
-                    .gap(6.px())
-                    .cross_axis_alignment(CrossAxisAlignment::Center),
-                    |state: &mut SettingsFeature| state.font_picker = None,
-                )
-                .background_color(Color::TRANSPARENT)
-                .active_background_color(UI_SURFACE_MUTED)
-                .border_color(Color::TRANSPARENT)
-                .hovered_border_color(Color::TRANSPARENT)
-                .border_width(0.0)
-                .padding(Padding::from_vh(6.0, 8.0)),
+    flex_col((
+        sized_box(
+            button(
+                flex_row((
+                    icon_label(Icon::ChevronLeft, 14.0, UI_MUTED),
+                    label(language.text("返回字体设置", "Back to font settings"))
+                        .font(UI_FONT_STACK)
+                        .text_size(12.0)
+                        .color(UI_TEXT_SOFT),
+                ))
+                .gap(6.px())
+                .cross_axis_alignment(CrossAxisAlignment::Center),
+                |state: &mut SettingsFeature| state.font_picker = None,
             )
-            .height(CONTROL_HEIGHT.px()),
-            flex_col(rows)
-                .cross_axis_alignment(CrossAxisAlignment::Fill)
-                .background_color(UI_SURFACE)
-                .border(UI_BORDER, 1.0)
-                .corner_radius(RADIUS_MEDIUM),
-        ))
-        .gap(CONTENT_GAP.px())
-        .cross_axis_alignment(CrossAxisAlignment::Fill)
-        .padding(Padding::from_vh(
-            CONTENT_PADDING_VERTICAL,
-            CONTENT_PADDING_HORIZONTAL,
-        )),
-    )
+            .background_color(Color::TRANSPARENT)
+            .active_background_color(UI_SURFACE_MUTED)
+            .border_color(Color::TRANSPARENT)
+            .hovered_border_color(Color::TRANSPARENT)
+            .border_width(0.0)
+            .padding(Padding::from_vh(6.0, 8.0)),
+        )
+        .height(CONTROL_HEIGHT.px()),
+        flex_col(rows)
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .background_color(UI_SURFACE)
+            .border(UI_BORDER, 1.0)
+            .corner_radius(RADIUS_MEDIUM),
+    ))
+    .gap(CONTENT_GAP.px())
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+    .padding(Padding::from_vh(
+        CONTENT_PADDING_VERTICAL,
+        CONTENT_PADDING_HORIZONTAL,
+    ))
 }
 
 fn selected_font_family(typography: &ReaderTypography, kind: FontPickerKind) -> &str {
@@ -892,9 +894,14 @@ fn ai_settings_content(
         .enumerate()
         .map(|(index, provider)| ai_provider_card(index, provider, provider_count > 1, language))
         .collect::<Vec<_>>();
-    portal(
-        flex_col((
-            settings_section_label("Providers"),
+    flex_col((
+            settings_section_header(
+                "Providers",
+                language.text(
+                    "每个 Provider 可以配置多个模型；API Key 会安全保存到 Windows 凭据管理器，也可以通过 REBOOK_AI_API_KEY 环境变量覆盖默认 Provider。",
+                    "Each provider can contain multiple models. API keys are stored securely in Windows Credential Manager and REBOOK_AI_API_KEY can override the default provider.",
+                ),
+            ),
             flex_col(provider_cards)
                 .gap(CONTENT_GAP.px())
                 .cross_axis_alignment(CrossAxisAlignment::Fill),
@@ -904,20 +911,13 @@ fn ai_settings_content(
                     state.draft_plugin_settings.add_provider();
                 },
             ),
-            prose(language.text(
-                "每个 Provider 可以维护多个模型。API Key 只保存在当前运行内存中，不会写入 plugins.json；默认 Provider 也可以通过 REBOOK_AI_API_KEY 环境变量提供密钥。",
-                "Each provider can contain multiple models. API keys are kept only in memory and are never written to plugins.json. The default provider can also read REBOOK_AI_API_KEY.",
-            ))
-            .text_size(10.5)
-            .text_color(UI_MUTED),
         ))
         .gap(CONTENT_GAP.px())
         .cross_axis_alignment(CrossAxisAlignment::Fill)
         .padding(Padding::from_vh(
             CONTENT_PADDING_VERTICAL,
             CONTENT_PADDING_HORIZONTAL,
-        )),
-    )
+        ))
 }
 
 fn ai_provider_card(
@@ -985,7 +985,7 @@ fn ai_provider_card(
         ),
         divider(),
         ai_settings_input_row(
-            language.text("API Key（仅本次会话）", "API key (this session only)"),
+            language.text("API Key", "API key"),
             api_key,
             "sk-…",
             AiSettingField::ApiKey(index),
@@ -1171,24 +1171,22 @@ fn ai_chat_settings_content(
     settings: &PluginSettings,
     language: AppLanguage,
 ) -> impl WidgetView<SettingsFeature> + use<'_> {
-    portal(
-        flex_col((
-            settings_section_label(language.text("AI Chat 模型", "AI Chat model")),
+    flex_col((
+            settings_section_header(
+                language.text("AI Chat 模型", "AI Chat model"),
+                language.text(
+                    "AI Chat 会使用这里选中的 Provider 和模型进行书籍问答、检索与解释。",
+                    "AI Chat uses the selected provider and model for book Q&A, search, and explanations.",
+                ),
+            ),
             ai_model_choices(settings, AiFeature::Chat, language),
-            prose(language.text(
-                "AI Chat 会使用这里选中的 Provider 和模型进行书籍问答、检索与解释。",
-                "AI Chat uses the selected provider and model for book Q&A, search, and explanations.",
-            ))
-                .text_size(10.5)
-                .text_color(UI_MUTED),
         ))
         .gap(CONTENT_GAP.px())
         .cross_axis_alignment(CrossAxisAlignment::Fill)
         .padding(Padding::from_vh(
             CONTENT_PADDING_VERTICAL,
             CONTENT_PADDING_HORIZONTAL,
-        )),
-    )
+        ))
 }
 
 fn translation_settings_content(
@@ -1196,9 +1194,14 @@ fn translation_settings_content(
     language: AppLanguage,
 ) -> impl WidgetView<SettingsFeature> + use<'_> {
     let translation_mode = settings.translation_mode;
-    portal(
-        flex_col((
-            settings_section_label(language.text("翻译模型", "Translation model")),
+    flex_col((
+            settings_section_header(
+                language.text("翻译模型", "Translation model"),
+                language.text(
+                    "点击阅读器顶部的翻译按钮后，会使用这里的模型、目标语言和显示方式翻译正文；文字型 PDF 也支持翻译。",
+                    "The reader Translate button uses this model, target language, and display mode. Text-based PDFs are supported as well.",
+                ),
+            ),
             ai_model_choices(settings, AiFeature::Translation, language),
             settings_section_label(language.text("输出", "Output")),
             flex_col((
@@ -1210,20 +1213,13 @@ fn translation_settings_content(
             .background_color(UI_SURFACE)
             .border(UI_BORDER, 1.0)
             .corner_radius(RADIUS_MEDIUM),
-            prose(language.text(
-                "点击阅读器顶部的翻译按钮后，会使用这里的模型、目标语言和显示方式翻译正文。",
-                "Use the Translate button in the reader toolbar to translate the book with this model, target language, and display mode.",
-            ))
-                .text_size(10.5)
-                .text_color(UI_MUTED),
         ))
         .gap(CONTENT_GAP.px())
         .cross_axis_alignment(CrossAxisAlignment::Fill)
         .padding(Padding::from_vh(
             CONTENT_PADDING_VERTICAL,
             CONTENT_PADDING_HORIZONTAL,
-        )),
-    )
+        ))
 }
 
 fn translation_target_settings_row(
@@ -1471,71 +1467,6 @@ fn ai_model_choice_button(
     )
     .height(40.px())
     .expand_width()
-}
-
-fn plugin_settings_content(language: AppLanguage) -> impl WidgetView<SettingsFeature> + use<> {
-    let plugin_cards = BUILTIN_PLUGINS
-        .into_iter()
-        .map(|plugin| {
-            flex_row((
-                icon_label(Icon::Blocks, 15.0, UI_ACCENT),
-                flex_col((
-                    label(match (language, plugin.id) {
-                        (AppLanguage::English, "rebook.search") => "Full-text search",
-                        (AppLanguage::English, "rebook.ai-chat") => "AI Chat",
-                        (AppLanguage::English, "rebook.translation") => "Translation",
-                        _ => plugin.name,
-                    })
-                    .font(UI_FONT_STACK)
-                    .text_size(12.0)
-                    .weight(FontWeight::BOLD)
-                    .color(UI_TEXT_SOFT),
-                    label(match (language, plugin.id) {
-                        (AppLanguage::English, "rebook.search") => {
-                            "Search book content and jump to the source"
-                        }
-                        (AppLanguage::English, "rebook.ai-chat") => {
-                            "Search, explain, and answer questions about the book"
-                        }
-                        (AppLanguage::English, "rebook.translation") => {
-                            "Translate book content while preserving source anchors"
-                        }
-                        _ => plugin.description,
-                    })
-                    .font(UI_FONT_STACK)
-                    .text_size(10.5)
-                    .color(UI_MUTED),
-                ))
-                .gap(2.px())
-                .cross_axis_alignment(CrossAxisAlignment::Start)
-                .flex(1.0),
-                value_badge(language.text("已启用", "Enabled")),
-            ))
-            .gap(9.px())
-            .cross_axis_alignment(CrossAxisAlignment::Center)
-            .padding(Padding::from_vh(7.0, 10.0))
-        })
-        .collect::<Vec<_>>();
-    portal(
-        flex_col((
-            label(language.text("内置插件", "Built-in plugins"))
-                .font(UI_FONT_STACK)
-                .text_size(12.0)
-                .weight(FontWeight::BOLD)
-                .color(UI_MUTED),
-            flex_col(plugin_cards)
-                .cross_axis_alignment(CrossAxisAlignment::Fill)
-                .background_color(UI_SURFACE)
-                .border(UI_BORDER, 1.0)
-                .corner_radius(RADIUS_MEDIUM),
-        ))
-        .gap(CONTENT_GAP.px())
-        .cross_axis_alignment(CrossAxisAlignment::Fill)
-        .padding(Padding::from_vh(
-            CONTENT_PADDING_VERTICAL,
-            CONTENT_PADDING_HORIZONTAL,
-        )),
-    )
 }
 
 fn settings_value_row(name: &'static str, value: &'static str) -> impl WidgetView<SettingsFeature> {

@@ -3,7 +3,7 @@ mod width_probe;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lucide_icons::Icon;
 use xilem::core::fork;
@@ -13,7 +13,7 @@ use xilem::masonry::properties::types::{AsUnit, UnitPoint};
 use xilem::style::{Padding, Style};
 use xilem::view::{
     CrossAxisAlignment, FlexExt, FlexSpacer, ObjectFit, ZStackExt, flex_col, flex_row, image,
-    label, portal, prose, sized_box, task_raw, text_input, zstack,
+    label, portal, prose, sized_box, task, task_raw, text_input, zstack,
 };
 use xilem::{Affine, AnyWidgetView, Color, FontWeight, WidgetView};
 
@@ -24,9 +24,9 @@ use crate::reader::{BookDisplayMetadata, DesktopReader, open_reader};
 use crate::settings::AppliedSettings;
 use crate::sync::{LocalSyncBook, SyncReport, SyncSettings, SyncStore, run_sync};
 use crate::ui::{
-    NoticeTone, UI_ACCENT, UI_ACCENT_BORDER, UI_ACCENT_SOFT, UI_BACKGROUND, UI_BORDER, UI_MUTED,
-    UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT, UI_TEXT_SOFT, button, confirmation_dialog, decode_image,
-    divider, ellipsize_display_text, icon_label, notice_card,
+    NOTICE_WIDTH, NoticeTone, UI_ACCENT, UI_ACCENT_BORDER, UI_ACCENT_SOFT, UI_BACKGROUND,
+    UI_BORDER, UI_MUTED, UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT, UI_TEXT_SOFT, button,
+    confirmation_dialog, decode_image, divider, ellipsize_display_text, icon_label, notice_card,
 };
 use width_probe::shelf_width_probe;
 
@@ -36,6 +36,8 @@ const SHELF_CARD_GAP: f64 = 24.0;
 const SHELF_ROW_GAP: f64 = 28.0;
 const SHELF_TITLE_MAX_DISPLAY_UNITS: usize = 18;
 const INITIAL_SHELF_GRID_WIDTH: f64 = 1144.0;
+const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
+const NOTICE_TIMER_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(crate) struct ShelfFeature {
     shelf: ShelfState,
@@ -53,6 +55,7 @@ struct ShelfState {
     grid_width: f64,
     query: String,
     notice: Option<String>,
+    notice_dismiss_at: Option<Instant>,
     error: Option<String>,
     remove_confirmation: Option<ShelfRemoveConfirmation>,
 }
@@ -170,7 +173,7 @@ impl ShelfFeature {
         match self.shelf.library.import_files(paths) {
             Ok(summary) => {
                 self.shelf.refresh_covers();
-                self.shelf.notice = Some(
+                self.shelf.show_notice(
                     match (self.language, summary.imported, summary.duplicates) {
                         (AppLanguage::SimplifiedChinese, 0, duplicates) => {
                             format!("所选的 {duplicates} 本书已在书架中")
@@ -194,7 +197,7 @@ impl ShelfFeature {
                 );
             }
             Err(error) => {
-                self.shelf.notice = None;
+                self.shelf.clear_notice();
                 self.shelf.error = Some(format!(
                     "{}: {error}",
                     self.language.text("导入失败", "Import failed")
@@ -212,7 +215,7 @@ impl ShelfFeature {
                     tracing::warn!(%error, "failed to persist local book removal tombstone");
                 }
                 self.shelf.covers.remove(id);
-                self.shelf.notice = Some(
+                self.shelf.show_notice(
                     self.language
                         .text("已从本地书架移除", "Removed from the local shelf")
                         .into(),
@@ -356,7 +359,7 @@ impl ShelfFeature {
                         report.merged_annotations
                     ),
                 };
-                self.shelf.notice = Some(self.sync.status.clone());
+                self.shelf.show_notice(self.sync.status.clone());
                 self.shelf.error = None;
             }
             Err(error) => {
@@ -421,6 +424,7 @@ impl ShelfState {
             grid_width: INITIAL_SHELF_GRID_WIDTH,
             query: String::new(),
             notice: None,
+            notice_dismiss_at: None,
             error: None,
             remove_confirmation: None,
         };
@@ -441,6 +445,26 @@ impl ShelfState {
             })
             .collect();
     }
+
+    fn show_notice(&mut self, message: String) {
+        self.notice = Some(message);
+        self.notice_dismiss_at = Some(Instant::now() + NOTICE_AUTO_DISMISS_DELAY);
+    }
+
+    fn clear_notice(&mut self) {
+        self.notice = None;
+        self.notice_dismiss_at = None;
+    }
+
+    fn dismiss_notice_if_due(&mut self, now: Instant) {
+        if notice_is_due(self.notice_dismiss_at, now) {
+            self.clear_notice();
+        }
+    }
+}
+
+fn notice_is_due(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_some_and(|deadline| now >= deadline)
 }
 
 pub(crate) fn view(state: &mut ShelfFeature) -> Box<AnyWidgetView<ShelfFeature>> {
@@ -467,6 +491,24 @@ fn shelf_app_view(state: &mut ShelfFeature) -> impl WidgetView<ShelfFeature> + u
                     }
                 },
                 ShelfFeature::complete_sync,
+            )
+        }),
+    );
+    let view = fork(
+        view,
+        state.shelf.notice_dismiss_at.map(|_| {
+            task(
+                |proxy| async move {
+                    let mut timer = xilem::tokio::time::interval(NOTICE_TIMER_INTERVAL);
+                    timer.set_missed_tick_behavior(xilem::tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        timer.tick().await;
+                        if proxy.message(Instant::now()).is_err() {
+                            break;
+                        }
+                    }
+                },
+                |state: &mut ShelfFeature, now| state.shelf.dismiss_notice_if_due(now),
             )
         }),
     );
@@ -600,7 +642,7 @@ fn shelf_feedback_notice(state: &ShelfFeature) -> Box<AnyWidgetView<ShelfFeature
     };
 
     sized_box(content)
-        .width(380.px())
+        .width(NOTICE_WIDTH.px())
         .transform(Affine::translate((-16.0, 76.0)))
         .boxed()
 }
@@ -956,8 +998,8 @@ fn cover_color(id: &str) -> Color {
 #[cfg(test)]
 mod tests {
     use super::{
-        LibraryBook, PathBuf, SHELF_CARD_GAP, SHELF_CARD_WIDTH, book_matches_query,
-        ellipsize_shelf_title, shelf_column_count,
+        Duration, Instant, LibraryBook, PathBuf, SHELF_CARD_GAP, SHELF_CARD_WIDTH,
+        book_matches_query, ellipsize_shelf_title, notice_is_due, shelf_column_count,
     };
     use crate::ui::{display_character_units, wrap_display_text};
 
@@ -1021,5 +1063,15 @@ mod tests {
             shelf_column_count(SHELF_CARD_WIDTH * 6.0 + SHELF_CARD_GAP * 5.0),
             6
         );
+    }
+
+    #[test]
+    fn shelf_notices_expire_at_their_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(3);
+
+        assert!(!notice_is_due(None, now));
+        assert!(!notice_is_due(Some(deadline), now));
+        assert!(notice_is_due(Some(deadline), deadline));
     }
 }

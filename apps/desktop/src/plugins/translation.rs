@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use rebook_publication::{
-    Block, Book, BookSource, Inline, PublicationError, PublicationUrl, RasterResource, Resource,
-    Section, TextRun, TextStyle,
+    Block, BlockStyle, Book, BookSource, Inline, PublicationError, PublicationUrl, RasterResource,
+    Resource, Section, SectionAnchor, SourceRange, TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 
 use super::TranslationMode;
@@ -91,10 +91,15 @@ impl TranslationBookSource {
             .iter()
             .enumerate()
             .filter_map(|(block_index, block)| {
-                let Block::Text(block) = block else {
-                    return None;
+                let text = match block {
+                    Block::Text(block) => text_block_text(block),
+                    Block::Image(image) => image
+                        .text_layer
+                        .as_ref()
+                        .map(|layer| layer.text.clone())
+                        .unwrap_or_default(),
+                    Block::Separator | Block::PageBreak => String::new(),
                 };
-                let text = text_block_text(block);
                 (!text.trim().is_empty()).then_some(TranslationBlockInput { block_index, text })
             })
             .collect())
@@ -143,51 +148,60 @@ impl BookSource for TranslationBookSource {
                 rendered.push(block);
                 continue;
             };
-            let Block::Text(mut original) = block else {
-                rendered.push(block);
-                continue;
-            };
-            let style = original
-                .content
-                .iter()
-                .find_map(|inline| match inline {
-                    Inline::Text(run) => Some(run.style),
-                    Inline::Break => None,
-                })
-                .unwrap_or_default();
-            match state.mode {
-                TranslationMode::Replace => {
-                    original.content = replacement_content(translation, style);
-                    if let Some(source) = &mut original.source {
-                        source.end.spine = source.start.spine.clone();
-                        source.end.node.clone_from(&source.start.node);
-                        source.end.text_offset = source.start.text_offset.saturating_add(
-                            u64::try_from(translation.chars().count()).unwrap_or(u64::MAX),
-                        );
-                        for anchor in &mut section.anchors {
-                            if anchor.source.spine == source.start.spine
-                                && anchor.source.node == source.start.node
-                            {
-                                anchor.source.text_offset = anchor
-                                    .source
-                                    .text_offset
-                                    .clamp(source.start.text_offset, source.end.text_offset);
-                            }
+            match block {
+                Block::Text(mut original) => {
+                    let style = original
+                        .content
+                        .iter()
+                        .find_map(|inline| match inline {
+                            Inline::Text(run) => Some(run.style),
+                            Inline::Break => None,
+                        })
+                        .unwrap_or_default();
+                    match state.mode {
+                        TranslationMode::Replace => {
+                            original.content = replacement_content(translation, style);
+                            update_translated_source(
+                                original.source.as_mut(),
+                                translation,
+                                &mut section.anchors,
+                            );
+                            rendered.push(Block::Text(original));
+                        }
+                        TranslationMode::Bilingual => {
+                            let mut translated = original.clone();
+                            let original_margin_after = original.style.margin_after;
+                            original.style.margin_after = original_margin_after.min(6.0);
+                            translated.content = replacement_content(translation, style);
+                            translated.source = None;
+                            translated.style.margin_before = 0.0;
+                            translated.style.margin_after = original_margin_after;
+                            rendered.push(Block::Text(original));
+                            rendered.push(Block::Text(translated));
                         }
                     }
-                    rendered.push(Block::Text(original));
                 }
-                TranslationMode::Bilingual => {
-                    let mut translated = original.clone();
-                    let original_margin_after = original.style.margin_after;
-                    original.style.margin_after = original_margin_after.min(6.0);
-                    translated.content = replacement_content(translation, style);
-                    translated.source = None;
-                    translated.style.margin_before = 0.0;
-                    translated.style.margin_after = original_margin_after;
-                    rendered.push(Block::Text(original));
-                    rendered.push(Block::Text(translated));
+                Block::Image(image) if image.text_layer.is_some() => {
+                    let translated = translated_fixed_page_block(
+                        translation,
+                        (state.mode == TranslationMode::Replace)
+                            .then(|| image.source.clone())
+                            .flatten(),
+                    );
+                    if state.mode == TranslationMode::Replace {
+                        let mut translated = translated;
+                        update_translated_source(
+                            translated.source.as_mut(),
+                            translation,
+                            &mut section.anchors,
+                        );
+                        rendered.push(Block::Text(translated));
+                    } else {
+                        rendered.push(Block::Image(image));
+                        rendered.push(Block::Text(translated));
+                    }
                 }
+                other => rendered.push(other),
             }
         }
         section.blocks = rendered;
@@ -203,6 +217,43 @@ impl BookSource for TranslationBookSource {
         href: &PublicationUrl,
     ) -> Result<Option<RasterResource>, PublicationError> {
         self.inner.raster_resource(href)
+    }
+}
+
+fn translated_fixed_page_block(text: &str, source: Option<SourceRange>) -> TextBlock {
+    TextBlock {
+        kind: TextBlockKind::Paragraph,
+        content: replacement_content(text, TextStyle::default()),
+        style: BlockStyle {
+            margin_before: 16.0,
+            margin_after: 16.0,
+            ..BlockStyle::default()
+        },
+        source,
+    }
+}
+
+fn update_translated_source(
+    source: Option<&mut SourceRange>,
+    translation: &str,
+    anchors: &mut [SectionAnchor],
+) {
+    let Some(source) = source else {
+        return;
+    };
+    source.end.spine = source.start.spine.clone();
+    source.end.node.clone_from(&source.start.node);
+    source.end.text_offset = source
+        .start
+        .text_offset
+        .saturating_add(u64::try_from(translation.chars().count()).unwrap_or(u64::MAX));
+    for anchor in anchors {
+        if anchor.source.spine == source.start.spine && anchor.source.node == source.start.node {
+            anchor.source.text_offset = anchor
+                .source
+                .text_offset
+                .clamp(source.start.text_offset, source.end.text_offset);
+        }
     }
 }
 
@@ -226,8 +277,9 @@ fn replacement_content(text: &str, style: TextStyle) -> Vec<Inline> {
 #[cfg(test)]
 mod tests {
     use rebook_publication::{
-        BlockStyle, Metadata, PublicationId, SourceAnchor, SourceRange, SpineItem, SpineItemId,
-        TextBlock, TextBlockKind,
+        BlockStyle, FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan, ImageBlock,
+        ImageStyle, Metadata, PublicationId, RenditionLayout, SourceAnchor, SourceRange, SpineItem,
+        SpineItemId, TextBlock, TextBlockKind,
     };
 
     use super::*;
@@ -297,6 +349,66 @@ mod tests {
         })
     }
 
+    fn fixed_page_source() -> Arc<dyn BookSource> {
+        let spine = SpineItemId::new("pdf-page").unwrap();
+        let href = PublicationUrl::parse("page.xhtml").unwrap();
+        let image_href = PublicationUrl::parse("page.png").unwrap();
+        Arc::new(TestSource {
+            book: Book {
+                id: PublicationId::new("translation-pdf-test").unwrap(),
+                metadata: Metadata {
+                    layout: RenditionLayout::PrePaginated,
+                    ..Metadata::default()
+                },
+                cover: None,
+                sections: vec![SpineItem {
+                    id: spine.clone(),
+                    href: href.clone(),
+                    media_type: "application/pdf".into(),
+                    linear: true,
+                    properties: Vec::new(),
+                }],
+                table_of_contents: Vec::new(),
+            },
+            section: Section {
+                id: spine.clone(),
+                href,
+                blocks: vec![Block::Image(ImageBlock {
+                    href: image_href,
+                    alt: "PDF page".into(),
+                    style: ImageStyle::default(),
+                    source: Some(SourceRange {
+                        start: SourceAnchor {
+                            spine: spine.clone(),
+                            node: "pdf-page-text".into(),
+                            text_offset: 0,
+                        },
+                        end: SourceAnchor {
+                            spine,
+                            node: "pdf-page-text".into(),
+                            text_offset: 9,
+                        },
+                    }),
+                    text_layer: Some(FixedPageTextLayer {
+                        width: 100.0,
+                        height: 100.0,
+                        text: "Hello PDF".into(),
+                        spans: vec![FixedPageTextSpan {
+                            char_range: 0..9,
+                            rect: FixedPageTextRect {
+                                x: 10.0,
+                                y: 10.0,
+                                width: 60.0,
+                                height: 12.0,
+                            },
+                        }],
+                    }),
+                })],
+                anchors: Vec::new(),
+            },
+        })
+    }
+
     fn block_text(block: &Block) -> String {
         let Block::Text(block) = block else {
             panic!("expected text block");
@@ -337,6 +449,41 @@ mod tests {
         assert_eq!(bilingual.blocks.len(), 2);
         assert_eq!(block_text(&bilingual.blocks[0]), "Hello");
         assert_eq!(block_text(&bilingual.blocks[1]), "你好");
+        assert!(matches!(&bilingual.blocks[1], Block::Text(block) if block.source.is_none()));
+    }
+
+    #[test]
+    fn translates_fixed_page_text_layers_for_text_based_pdfs() {
+        let source = TranslationBookSource::new(fixed_page_source(), TranslationMode::Replace);
+        let blocks = source.translatable_blocks(0).unwrap();
+        assert_eq!(
+            blocks,
+            [TranslationBlockInput {
+                block_index: 0,
+                text: "Hello PDF".into(),
+            }]
+        );
+        source
+            .store_section(
+                0,
+                &[BlockTranslation {
+                    block_index: 0,
+                    text: "你好，PDF".into(),
+                }],
+            )
+            .unwrap();
+        source.set_enabled(true).unwrap();
+
+        let replaced = source.parse_section(0).unwrap();
+        assert_eq!(replaced.blocks.len(), 1);
+        assert_eq!(block_text(&replaced.blocks[0]), "你好，PDF");
+        assert!(matches!(&replaced.blocks[0], Block::Text(block) if block.source.is_some()));
+
+        source.set_mode(TranslationMode::Bilingual).unwrap();
+        let bilingual = source.parse_section(0).unwrap();
+        assert_eq!(bilingual.blocks.len(), 2);
+        assert!(matches!(&bilingual.blocks[0], Block::Image(_)));
+        assert_eq!(block_text(&bilingual.blocks[1]), "你好，PDF");
         assert!(matches!(&bilingual.blocks[1], Block::Text(block) if block.source.is_none()));
     }
 }

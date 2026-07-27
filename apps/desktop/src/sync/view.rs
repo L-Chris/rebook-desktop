@@ -2,8 +2,8 @@ use xilem::masonry::properties::PlaceholderColor;
 use xilem::masonry::properties::types::{AsUnit, UnitPoint};
 use xilem::style::{Padding, Style};
 use xilem::view::{
-    CrossAxisAlignment, FlexSpacer, ZStackExt, flex_col, flex_row, label, prose, sized_box,
-    text_input, zstack,
+    CrossAxisAlignment, FlexSpacer, ZStackExt, flex_col, flex_row, label, sized_box, text_input,
+    zstack,
 };
 use xilem::{AnyWidgetView, FontWeight, WidgetView};
 
@@ -12,6 +12,7 @@ use crate::ui::{
     CONTENT_GAP, CONTENT_PADDING_HORIZONTAL, CONTENT_PADDING_VERTICAL, CONTROL_HEIGHT,
     RADIUS_MEDIUM, RADIUS_SMALL, SETTINGS_ROW_HEIGHT, UI_ACCENT, UI_ACCENT_BORDER, UI_BORDER,
     UI_FONT_STACK, UI_MUTED, UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT, UI_TEXT_SOFT, button,
+    help_tooltip,
 };
 
 use super::SyncSettings;
@@ -74,13 +75,13 @@ pub(crate) fn sync_settings_content<State: 'static>(
     .width(276.px());
 
     flex_col((
-        settings_section_label::<State>(language.text("同步", "Sync")),
-        prose(language.text(
-            "桌面端会直接连接 WebDAV；密码只保存到 Windows 凭据管理器。",
-            "Rebook Desktop connects directly to WebDAV. The password is stored only in Windows Credential Manager.",
-        ))
-        .text_size(10.5)
-        .text_color(UI_MUTED),
+        settings_section_header::<State>(
+            language.text("同步", "Sync"),
+            language.text(
+                "桌面端会直接连接 WebDAV；密码只保存到 Windows 凭据管理器。",
+                "Rebook Desktop connects directly to WebDAV. The password is stored only in Windows Credential Manager.",
+            ),
+        ),
         flex_col((
             settings_row(language.text("自动同步", "Automatic sync"), toggle.boxed()),
             settings_divider::<State>(),
@@ -136,6 +137,15 @@ fn settings_section_label<State: 'static>(text: &'static str) -> impl WidgetView
         .text_size(12.0)
         .weight(FontWeight::BOLD)
         .color(UI_MUTED)
+}
+
+fn settings_section_header<State: 'static>(
+    text: &'static str,
+    help: &'static str,
+) -> impl WidgetView<State> {
+    flex_row((settings_section_label::<State>(text), help_tooltip(help)))
+        .gap(6.px())
+        .cross_axis_alignment(CrossAxisAlignment::Center)
 }
 
 fn settings_divider<State: 'static>() -> impl WidgetView<State> {
