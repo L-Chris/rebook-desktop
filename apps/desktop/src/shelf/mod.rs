@@ -21,14 +21,10 @@ use crate::async_task::{TaskResult, TaskSlot};
 use crate::library::{LibraryBook, LocalLibrary};
 use crate::preferences::{self, AppLanguage};
 use crate::reader::{BookDisplayMetadata, DesktopReader, open_reader};
-use crate::sync::{
-    LocalSyncBook, SyncReport, SyncSettings, SyncSettingsCallbacks, SyncStore, run_sync,
-    sync_settings_content,
-};
+use crate::settings::AppliedSettings;
+use crate::sync::{LocalSyncBook, SyncReport, SyncSettings, SyncStore, run_sync};
 use crate::ui::{
-    CONTENT_GAP, CONTENT_PADDING_HORIZONTAL, CONTENT_PADDING_VERTICAL, CONTROL_HEIGHT,
-    DIALOG_FOOTER_HEIGHT, DIALOG_HEADER_HEIGHT, NoticeTone, RADIUS_DIALOG, RADIUS_SMALL, UI_ACCENT,
-    UI_ACCENT_BORDER, UI_ACCENT_SOFT, UI_BACKGROUND, UI_BORDER, UI_FONT_STACK, UI_MUTED,
+    NoticeTone, UI_ACCENT, UI_ACCENT_BORDER, UI_ACCENT_SOFT, UI_BACKGROUND, UI_BORDER, UI_MUTED,
     UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT, UI_TEXT_SOFT, button, confirmation_dialog, decode_image,
     divider, ellipsize_display_text, icon_label, notice_card,
 };
@@ -48,9 +44,7 @@ pub(crate) struct ShelfFeature {
     local_store: Option<SyncStore>,
     sync: SyncUiState,
     language: AppLanguage,
-    draft_language: AppLanguage,
-    settings_tab: ShelfSettingsTab,
-    settings_open: bool,
+    settings_requested: bool,
 }
 
 struct ShelfState {
@@ -66,8 +60,6 @@ struct ShelfState {
 struct SyncUiState {
     settings: SyncSettings,
     password: String,
-    draft_settings: SyncSettings,
-    draft_password: String,
     task: TaskSlot<SyncTask>,
     status: String,
 }
@@ -80,13 +72,6 @@ struct SyncTask {
 }
 
 type SyncTaskMessage = TaskResult<SyncReport>;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ShelfSettingsTab {
-    #[default]
-    General,
-    Cloud,
-}
 
 #[derive(Clone, Debug)]
 struct ShelfRemoveConfirmation {
@@ -132,17 +117,13 @@ impl ShelfFeature {
             reader_fonts,
             local_store,
             sync: SyncUiState {
-                draft_settings: settings.clone(),
-                draft_password: password.clone(),
                 settings,
                 password,
                 task: TaskSlot::default(),
                 status: String::new(),
             },
             language,
-            draft_language: language,
-            settings_tab: ShelfSettingsTab::General,
-            settings_open: false,
+            settings_requested: false,
         }
     }
 
@@ -272,66 +253,18 @@ impl ShelfFeature {
         self.remove_book(&confirmation.id);
     }
 
-    fn open_settings(&mut self) {
-        self.settings_tab = ShelfSettingsTab::General;
-        self.open_settings_dialog();
+    fn request_settings(&mut self) {
+        self.settings_requested = true;
     }
 
-    fn open_settings_dialog(&mut self) {
-        self.sync.draft_settings.clone_from(&self.sync.settings);
-        self.sync.draft_password.clear();
-        self.draft_language = self.language;
-        self.settings_open = true;
+    pub(crate) fn take_settings_request(&mut self) -> bool {
+        std::mem::take(&mut self.settings_requested)
     }
 
-    fn close_settings(&mut self) {
-        self.settings_open = false;
-    }
-
-    fn apply_settings(&mut self) {
-        let language = self.draft_language;
-        let mut settings = self.sync.draft_settings.clone();
-        settings.normalize();
-        if settings.enabled
-            && let Err(error) = settings.validate()
-        {
-            self.shelf.error = Some(format!(
-                "{}: {error}",
-                language.text("云盘设置无效", "Invalid cloud settings")
-            ));
-            return;
-        }
-        if let Err(error) = preferences::save_app_language(language) {
-            self.shelf.error = Some(format!(
-                "{}: {error}",
-                language.text("保存通用设置失败", "Failed to save general settings")
-            ));
-            return;
-        }
-        if let Err(error) = settings.save_default() {
-            self.shelf.error = Some(format!(
-                "{}: {error}",
-                language.text("保存云盘设置失败", "Failed to save cloud settings")
-            ));
-            return;
-        }
-        if !self.sync.draft_password.is_empty() {
-            if let Err(error) = settings.save_password(&self.sync.draft_password) {
-                self.shelf.error = Some(format!(
-                    "{}: {error}",
-                    language.text(
-                        "保存 Windows 凭据失败",
-                        "Failed to save the Windows credential"
-                    )
-                ));
-                return;
-            }
-            self.sync.password.clone_from(&self.sync.draft_password);
-        }
-        self.language = language;
-        self.sync.settings = settings;
-        self.settings_open = false;
-        self.shelf.error = None;
+    pub(crate) fn apply_global_settings(&mut self, settings: &AppliedSettings) {
+        self.language = settings.language;
+        self.sync.settings.clone_from(&settings.sync_settings);
+        self.sync.password.clone_from(&settings.sync_password);
         self.start_sync();
     }
 
@@ -637,18 +570,7 @@ fn shelf_view(state: &mut ShelfFeature) -> impl WidgetView<ShelfFeature> + use<>
                 .boxed()
             },
         );
-    let settings_dialog: Box<AnyWidgetView<ShelfFeature>> = if state.settings_open {
-        shelf_settings_dialog(state).boxed()
-    } else {
-        sized_box(label("")).width(0.px()).height(0.px()).boxed()
-    };
-    sized_box(zstack((
-        shelf,
-        feedback_layer,
-        remove_dialog,
-        settings_dialog,
-    )))
-    .expand()
+    sized_box(zstack((shelf, feedback_layer, remove_dialog))).expand()
 }
 
 fn shelf_feedback_notice(state: &ShelfFeature) -> Box<AnyWidgetView<ShelfFeature>> {
@@ -726,7 +648,7 @@ fn shelf_toolbar(
                 .width(1.px())
                 .height(24.px())
                 .background_color(UI_BORDER),
-            shelf_icon_button(Icon::Settings, ShelfFeature::open_settings),
+            shelf_icon_button(Icon::Settings, ShelfFeature::request_settings),
             sync_enabled.then(|| {
                 shelf_icon_button(
                     if syncing {
@@ -746,288 +668,6 @@ fn shelf_toolbar(
     .expand_width()
     .background_color(UI_SURFACE)
     .padding(Padding::horizontal(20.0))
-}
-
-#[allow(clippy::too_many_lines)]
-fn shelf_settings_dialog(state: &ShelfFeature) -> impl WidgetView<ShelfFeature> + use<> {
-    let language = state.draft_language;
-    let tab = state.settings_tab;
-    let title = match tab {
-        ShelfSettingsTab::General => language.text("通用", "General"),
-        ShelfSettingsTab::Cloud => language.text("云盘", "Cloud drive"),
-    };
-    let body: Box<AnyWidgetView<ShelfFeature>> = match tab {
-        ShelfSettingsTab::General => shelf_general_settings_content(language).boxed(),
-        ShelfSettingsTab::Cloud => sync_settings_content(
-            &state.sync.draft_settings,
-            state.sync.draft_password.clone(),
-            !state.sync.password.is_empty(),
-            language,
-            &SyncSettingsCallbacks {
-                toggle_enabled: toggle_sync_enabled,
-                set_base_url: set_sync_base_url,
-                set_username: set_sync_username,
-                set_password: set_sync_password,
-                set_device_name: set_sync_device_name,
-            },
-        ),
-    };
-
-    let panel = sized_box(
-        flex_col((
-            sized_box(
-                flex_row((
-                    flex_row((
-                        icon_label(Icon::Settings, 17.0, UI_MUTED),
-                        label(language.text("设置", "Settings"))
-                            .font(UI_FONT_STACK)
-                            .text_size(15.0)
-                            .weight(FontWeight::BOLD)
-                            .color(UI_TEXT),
-                    ))
-                    .gap(9.px())
-                    .cross_axis_alignment(CrossAxisAlignment::Center),
-                    FlexSpacer::Flex(1.0),
-                    label(title)
-                        .font(UI_FONT_STACK)
-                        .text_size(12.0)
-                        .color(UI_MUTED),
-                    shelf_icon_button(Icon::X, ShelfFeature::close_settings),
-                ))
-                .cross_axis_alignment(CrossAxisAlignment::Center),
-            )
-            .height(DIALOG_HEADER_HEIGHT.px())
-            .expand_width()
-            .padding(Padding::horizontal(CONTENT_PADDING_HORIZONTAL)),
-            divider(),
-            flex_row((shelf_settings_sidebar(language, tab), body.flex(1.0)))
-                .gap(0.px())
-                .flex(1.0),
-            divider(),
-            sized_box(
-                flex_row((
-                    FlexSpacer::Flex(1.0),
-                    sized_box(
-                        button(
-                            label(language.text("取消", "Cancel"))
-                                .font(UI_FONT_STACK)
-                                .text_size(12.5)
-                                .color(UI_TEXT_SOFT),
-                            ShelfFeature::close_settings,
-                        )
-                        .background_color(UI_SURFACE)
-                        .active_background_color(UI_SURFACE_MUTED)
-                        .border_color(UI_BORDER)
-                        .corner_radius(RADIUS_SMALL)
-                        .padding(Padding::from_vh(5.0, 12.0)),
-                    )
-                    .height(CONTROL_HEIGHT.px()),
-                    sized_box(
-                        button(
-                            label(language.text("应用", "Apply"))
-                                .font(UI_FONT_STACK)
-                                .text_size(12.5)
-                                .weight(FontWeight::BOLD)
-                                .color(UI_SURFACE),
-                            ShelfFeature::apply_settings,
-                        )
-                        .background_color(UI_ACCENT)
-                        .active_background_color(UI_TEXT)
-                        .border_color(UI_ACCENT)
-                        .corner_radius(RADIUS_SMALL)
-                        .padding(Padding::from_vh(5.0, 12.0)),
-                    )
-                    .height(CONTROL_HEIGHT.px()),
-                ))
-                .gap(8.px())
-                .cross_axis_alignment(CrossAxisAlignment::Center),
-            )
-            .height(DIALOG_FOOTER_HEIGHT.px())
-            .expand_width()
-            .padding(Padding::horizontal(CONTENT_PADDING_HORIZONTAL)),
-        ))
-        .cross_axis_alignment(CrossAxisAlignment::Fill)
-        .must_fill_major_axis(true),
-    )
-    .width(660.px())
-    .height(500.px())
-    .background_color(UI_SURFACE)
-    .border(UI_BORDER, 1.0)
-    .corner_radius(RADIUS_DIALOG);
-
-    sized_box(zstack((
-        sized_box(
-            button(label(""), ShelfFeature::close_settings)
-                .background_color(Color::TRANSPARENT)
-                .active_background_color(Color::TRANSPARENT)
-                .border_color(Color::TRANSPARENT)
-                .hovered_border_color(Color::TRANSPARENT)
-                .border_width(0.0)
-                .padding(0.0),
-        )
-        .expand()
-        .background_color(Color::from_rgba8(31, 45, 61, 89)),
-        panel,
-    )))
-    .expand()
-}
-
-fn shelf_settings_sidebar(
-    language: AppLanguage,
-    selected: ShelfSettingsTab,
-) -> impl WidgetView<ShelfFeature> {
-    sized_box(
-        flex_col((
-            shelf_settings_tab_button(
-                language.text("通用", "General"),
-                ShelfSettingsTab::General,
-                selected,
-            ),
-            shelf_settings_tab_button(
-                language.text("云盘", "Cloud drive"),
-                ShelfSettingsTab::Cloud,
-                selected,
-            ),
-            FlexSpacer::Flex(1.0),
-        ))
-        .gap(3.px())
-        .cross_axis_alignment(CrossAxisAlignment::Fill)
-        .padding(8.0),
-    )
-    .width(136.px())
-    .expand_height()
-    .background_color(UI_SURFACE_MUTED)
-}
-
-fn shelf_settings_tab_button(
-    text: &'static str,
-    value: ShelfSettingsTab,
-    selected: ShelfSettingsTab,
-) -> impl WidgetView<ShelfFeature> {
-    let active = value == selected;
-    sized_box(
-        button(
-            flex_row((
-                label(text)
-                    .font(UI_FONT_STACK)
-                    .text_size(13.0)
-                    .weight(if active {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .color(if active { UI_TEXT } else { UI_TEXT_SOFT }),
-                FlexSpacer::Flex(1.0),
-            )),
-            move |state: &mut ShelfFeature| state.settings_tab = value,
-        )
-        .background_color(if active {
-            UI_SURFACE
-        } else {
-            Color::TRANSPARENT
-        })
-        .active_background_color(UI_ACCENT_SOFT)
-        .border_color(if active {
-            UI_BORDER
-        } else {
-            Color::TRANSPARENT
-        })
-        .hovered_border_color(UI_BORDER)
-        .corner_radius(RADIUS_SMALL)
-        .padding(Padding::horizontal(10.0)),
-    )
-    .height(CONTROL_HEIGHT.px())
-    .expand_width()
-}
-
-fn shelf_general_settings_content(language: AppLanguage) -> impl WidgetView<ShelfFeature> {
-    flex_col((
-        label(language.text("语言与地区", "Language & region"))
-            .font(UI_FONT_STACK)
-            .text_size(12.0)
-            .weight(FontWeight::BOLD)
-            .color(UI_MUTED),
-        sized_box(
-            flex_row((
-                label(language.text("界面语言", "Interface language"))
-                    .font(UI_FONT_STACK)
-                    .text_size(13.0)
-                    .color(UI_TEXT_SOFT),
-                FlexSpacer::Flex(1.0),
-                shelf_language_choice("简体中文", AppLanguage::SimplifiedChinese, language),
-                shelf_language_choice("English", AppLanguage::English, language),
-            ))
-            .gap(6.px())
-            .cross_axis_alignment(CrossAxisAlignment::Center),
-        )
-        .height(52.px())
-        .expand_width()
-        .background_color(UI_SURFACE)
-        .border(UI_BORDER, 1.0)
-        .corner_radius(RADIUS_SMALL)
-        .padding(Padding::horizontal(12.0)),
-        prose(language.text(
-            "界面语言也会作为翻译目标语言的默认值。",
-            "The interface language is also the default translation target.",
-        ))
-        .text_size(10.5)
-        .text_color(UI_MUTED),
-    ))
-    .gap(CONTENT_GAP.px())
-    .cross_axis_alignment(CrossAxisAlignment::Fill)
-    .padding(Padding::from_vh(
-        CONTENT_PADDING_VERTICAL,
-        CONTENT_PADDING_HORIZONTAL,
-    ))
-}
-
-fn shelf_language_choice(
-    text: &'static str,
-    value: AppLanguage,
-    selected: AppLanguage,
-) -> impl WidgetView<ShelfFeature> {
-    let active = value == selected;
-    sized_box(
-        button(
-            label(text)
-                .font(UI_FONT_STACK)
-                .text_size(12.0)
-                .weight(if active {
-                    FontWeight::BOLD
-                } else {
-                    FontWeight::NORMAL
-                })
-                .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
-            move |state: &mut ShelfFeature| state.draft_language = value,
-        )
-        .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
-        .active_background_color(UI_ACCENT_SOFT)
-        .border_color(if active { UI_ACCENT_BORDER } else { UI_BORDER })
-        .hovered_border_color(UI_ACCENT_BORDER)
-        .corner_radius(RADIUS_SMALL)
-        .padding(Padding::from_vh(5.0, 9.0)),
-    )
-    .height(CONTROL_HEIGHT.px())
-}
-
-fn toggle_sync_enabled(state: &mut ShelfFeature) {
-    state.sync.draft_settings.enabled = !state.sync.draft_settings.enabled;
-}
-
-fn set_sync_base_url(state: &mut ShelfFeature, value: String) {
-    state.sync.draft_settings.base_url = value;
-}
-
-fn set_sync_username(state: &mut ShelfFeature, value: String) {
-    state.sync.draft_settings.username = value;
-}
-
-fn set_sync_password(state: &mut ShelfFeature, value: String) {
-    state.sync.draft_password = value;
-}
-
-fn set_sync_device_name(state: &mut ShelfFeature, value: String) {
-    state.sync.draft_settings.device_name = value;
 }
 
 fn shelf_grid(

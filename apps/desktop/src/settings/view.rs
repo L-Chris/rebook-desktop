@@ -26,26 +26,23 @@ use crate::ui::{
     UI_TEXT_SOFT, button, divider, icon_label,
 };
 
-use super::view::{
-    animated_scrim, icon_button, modal_scrim_color, primary_action_button, secondary_action_button,
-    value_badge,
-};
-use super::{DesktopReader, FontPickerKind, SettingsTab};
+use super::{FontPickerKind, SettingsFeature, SettingsTab};
 
 const SETTINGS_WIDTH: f64 = 660.0;
 const SETTINGS_HEIGHT: f64 = 500.0;
+const MODAL_SCRIM_ALPHA: f32 = 0.35;
 
 pub(super) fn settings_overlay(
-    state: &DesktopReader,
+    state: &SettingsFeature,
     progress: f32,
-) -> impl WidgetView<DesktopReader> + use<> {
+) -> impl WidgetView<SettingsFeature> + use<> {
     // Keep glyphs and one-pixel borders at their native scale throughout the
     // transition. Scaling the complete dialog makes text shimmer as Vello
     // resamples it on every frame, which reads as dropped frames on Windows.
     let offset = 8.0 * f64::from(1.0 - progress);
     let dialog_transform = Affine::translate((0.0, offset));
     sized_box(zstack((
-        animated_scrim(modal_scrim_color(progress), DesktopReader::close_overlay),
+        animated_scrim(modal_scrim_color(progress), SettingsFeature::close_overlay),
         sized_box(settings_dialog(state))
             .width(SETTINGS_WIDTH.px())
             .height(SETTINGS_HEIGHT.px())
@@ -57,16 +54,16 @@ pub(super) fn settings_overlay(
     .expand()
 }
 
-fn settings_dialog(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
+fn settings_dialog(state: &SettingsFeature) -> impl WidgetView<SettingsFeature> + use<> {
     settings_content(state)
 }
 
-fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<> {
-    let language = state.ui.draft_language;
-    let spread = state.ui.draft_spread;
-    let typography = &state.ui.draft_typography;
-    let font_picker = state.ui.font_picker;
-    let tab = state.ui.settings_tab;
+fn settings_content(state: &SettingsFeature) -> impl WidgetView<SettingsFeature> + use<> {
+    let language = state.draft_language;
+    let spread = state.draft_spread;
+    let typography = &state.draft_typography;
+    let font_picker = state.font_picker;
+    let tab = state.settings_tab;
     let title = match tab {
         SettingsTab::General => language.text("通用", "General"),
         SettingsTab::Reading => language.text("阅读", "Reading"),
@@ -79,7 +76,7 @@ fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + u
         SettingsTab::Translation => language.text("翻译", "Translation"),
         SettingsTab::Plugins => language.text("插件", "Plugins"),
     };
-    let body: Box<AnyWidgetView<DesktopReader>> = match tab {
+    let body: Box<AnyWidgetView<SettingsFeature>> = match tab {
         SettingsTab::General => general_settings_content(language).boxed(),
         SettingsTab::Reading => reading_settings_content(spread, language).boxed(),
         SettingsTab::Font => match font_picker {
@@ -90,9 +87,9 @@ fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + u
             None => font_settings_content(typography, language).boxed(),
         },
         SettingsTab::Cloud => sync_settings_content(
-            &state.ui.draft_sync_settings,
-            state.ui.draft_sync_password.clone(),
-            !state.sync_password.is_empty(),
+            &state.draft_sync_settings,
+            state.draft_sync_password.clone(),
+            !state.applied.sync_password.is_empty(),
             language,
             &SyncSettingsCallbacks {
                 toggle_enabled: toggle_sync_enabled,
@@ -103,13 +100,13 @@ fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + u
             },
         ),
         SettingsTab::Ai => {
-            ai_settings_content(state.ui.draft_plugin_settings.clone(), language).boxed()
+            ai_settings_content(state.draft_plugin_settings.clone(), language).boxed()
         }
         SettingsTab::AiChat => {
-            ai_chat_settings_content(&state.ui.draft_plugin_settings, language).boxed()
+            ai_chat_settings_content(&state.draft_plugin_settings, language).boxed()
         }
         SettingsTab::Translation => {
-            translation_settings_content(&state.ui.draft_plugin_settings, language).boxed()
+            translation_settings_content(&state.draft_plugin_settings, language).boxed()
         }
         SettingsTab::Plugins => plugin_settings_content(language).boxed(),
     };
@@ -128,7 +125,7 @@ fn settings_content(state: &DesktopReader) -> impl WidgetView<DesktopReader> + u
     ))
 }
 
-fn settings_sidebar(language: AppLanguage, tab: SettingsTab) -> impl WidgetView<DesktopReader> {
+fn settings_sidebar(language: AppLanguage, tab: SettingsTab) -> impl WidgetView<SettingsFeature> {
     sized_box(zstack((
         sized_box(label(""))
             .expand()
@@ -180,17 +177,17 @@ fn settings_sidebar(language: AppLanguage, tab: SettingsTab) -> impl WidgetView<
     .expand_height()
 }
 
-fn settings_footer(language: AppLanguage) -> impl WidgetView<DesktopReader> {
+fn settings_footer(language: AppLanguage) -> impl WidgetView<SettingsFeature> {
     sized_box(
         flex_row((
             FlexSpacer::Flex(1.0),
             secondary_action_button(
                 language.text("取消", "Cancel"),
-                DesktopReader::close_overlay,
+                SettingsFeature::close_overlay,
             ),
             primary_action_button(
                 language.text("应用", "Apply"),
-                DesktopReader::apply_settings,
+                SettingsFeature::apply_settings,
             ),
         ))
         .gap(8.px())
@@ -201,7 +198,7 @@ fn settings_footer(language: AppLanguage) -> impl WidgetView<DesktopReader> {
     .padding(Padding::horizontal(CONTENT_PADDING_HORIZONTAL))
 }
 
-fn settings_dialog_header(title: &'static str) -> impl WidgetView<DesktopReader> {
+fn settings_dialog_header(title: &'static str) -> impl WidgetView<SettingsFeature> {
     sized_box(
         flex_row((
             label(title)
@@ -210,7 +207,7 @@ fn settings_dialog_header(title: &'static str) -> impl WidgetView<DesktopReader>
                 .weight(FontWeight::BOLD)
                 .color(UI_TEXT),
             FlexSpacer::Flex(1.0),
-            icon_button(Icon::X, false, DesktopReader::close_overlay),
+            icon_button(Icon::X, false, SettingsFeature::close_overlay),
         ))
         .cross_axis_alignment(CrossAxisAlignment::Center),
     )
@@ -222,7 +219,7 @@ fn settings_tab_button(
     text: &'static str,
     value: SettingsTab,
     selected: SettingsTab,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     let active = value == selected;
     sized_box(
         button(
@@ -238,9 +235,9 @@ fn settings_tab_button(
                     .color(if active { UI_TEXT } else { UI_TEXT_SOFT }),
                 FlexSpacer::Flex(1.0),
             )),
-            move |state: &mut DesktopReader| {
-                state.ui.settings_tab = value;
-                state.ui.font_picker = None;
+            move |state: &mut SettingsFeature| {
+                state.settings_tab = value;
+                state.font_picker = None;
             },
         )
         .background_color(if active {
@@ -262,7 +259,7 @@ fn settings_tab_button(
     .expand_width()
 }
 
-fn general_settings_content(language: AppLanguage) -> impl WidgetView<DesktopReader> {
+fn general_settings_content(language: AppLanguage) -> impl WidgetView<SettingsFeature> {
     flex_col((
         settings_section_label(language.text("语言与地区", "Language & region")),
         flex_col((language_settings_row(language),))
@@ -285,7 +282,7 @@ fn general_settings_content(language: AppLanguage) -> impl WidgetView<DesktopRea
     ))
 }
 
-fn language_settings_row(language: AppLanguage) -> impl WidgetView<DesktopReader> {
+fn language_settings_row(language: AppLanguage) -> impl WidgetView<SettingsFeature> {
     sized_box(
         flex_row((
             label(language.text("界面语言", "Interface language"))
@@ -307,7 +304,7 @@ fn language_choice(
     text: &'static str,
     value: AppLanguage,
     selected: AppLanguage,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     let active = value == selected;
     sized_box(
         button(
@@ -319,7 +316,7 @@ fn language_choice(
                     FontWeight::NORMAL
                 })
                 .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
-            move |state: &mut DesktopReader| state.ui.draft_language = value,
+            move |state: &mut SettingsFeature| state.draft_language = value,
         )
         .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
         .active_background_color(UI_ACCENT_SOFT)
@@ -331,30 +328,30 @@ fn language_choice(
     .height(CONTROL_HEIGHT.px())
 }
 
-fn toggle_sync_enabled(state: &mut DesktopReader) {
-    state.ui.draft_sync_settings.enabled = !state.ui.draft_sync_settings.enabled;
+fn toggle_sync_enabled(state: &mut SettingsFeature) {
+    state.draft_sync_settings.enabled = !state.draft_sync_settings.enabled;
 }
 
-fn set_sync_base_url(state: &mut DesktopReader, value: String) {
-    state.ui.draft_sync_settings.base_url = value;
+fn set_sync_base_url(state: &mut SettingsFeature, value: String) {
+    state.draft_sync_settings.base_url = value;
 }
 
-fn set_sync_username(state: &mut DesktopReader, value: String) {
-    state.ui.draft_sync_settings.username = value;
+fn set_sync_username(state: &mut SettingsFeature, value: String) {
+    state.draft_sync_settings.username = value;
 }
 
-fn set_sync_password(state: &mut DesktopReader, value: String) {
-    state.ui.draft_sync_password = value;
+fn set_sync_password(state: &mut SettingsFeature, value: String) {
+    state.draft_sync_password = value;
 }
 
-fn set_sync_device_name(state: &mut DesktopReader, value: String) {
-    state.ui.draft_sync_settings.device_name = value;
+fn set_sync_device_name(state: &mut SettingsFeature, value: String) {
+    state.draft_sync_settings.device_name = value;
 }
 
 fn reading_settings_content(
     spread: SpreadMode,
     language: AppLanguage,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     flex_col((
         label(language.text("页面布局", "Page layout"))
             .font(UI_FONT_STACK)
@@ -384,7 +381,7 @@ fn reading_settings_content(
 fn font_settings_content(
     typography: &ReaderTypography,
     language: AppLanguage,
-) -> impl WidgetView<DesktopReader> + use<> {
+) -> impl WidgetView<SettingsFeature> + use<> {
     let preview_font = typography.default_stack();
     let preview_size = typography.font_size.min(24.0);
     let preview_weight = FontWeight::new(f32::from(typography.font_weight));
@@ -472,31 +469,31 @@ fn typography_metrics_card(
     minimum_font_size: f32,
     font_weight: u16,
     language: AppLanguage,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     flex_col((
         typography_stepper_row(
             language.text("默认字号", "Default size"),
             format!("{font_size:.0} px"),
-            |state: &mut DesktopReader| {
-                let minimum = state.ui.draft_typography.minimum_font_size;
-                state.ui.draft_typography.font_size =
-                    (state.ui.draft_typography.font_size - 1.0).max(minimum);
+            |state: &mut SettingsFeature| {
+                let minimum = state.draft_typography.minimum_font_size;
+                state.draft_typography.font_size =
+                    (state.draft_typography.font_size - 1.0).max(minimum);
             },
-            |state: &mut DesktopReader| {
-                state.ui.draft_typography.font_size =
-                    (state.ui.draft_typography.font_size + 1.0).min(120.0);
+            |state: &mut SettingsFeature| {
+                state.draft_typography.font_size =
+                    (state.draft_typography.font_size + 1.0).min(120.0);
             },
         ),
         divider(),
         typography_stepper_row(
             language.text("最小字号", "Minimum size"),
             format!("{minimum_font_size:.0} px"),
-            |state: &mut DesktopReader| {
-                state.ui.draft_typography.minimum_font_size =
-                    (state.ui.draft_typography.minimum_font_size - 1.0).max(1.0);
+            |state: &mut SettingsFeature| {
+                state.draft_typography.minimum_font_size =
+                    (state.draft_typography.minimum_font_size - 1.0).max(1.0);
             },
-            |state: &mut DesktopReader| {
-                let typography = &mut state.ui.draft_typography;
+            |state: &mut SettingsFeature| {
+                let typography = &mut state.draft_typography;
                 typography.minimum_font_size = (typography.minimum_font_size + 1.0).min(120.0);
                 typography.font_size = typography.font_size.max(typography.minimum_font_size);
             },
@@ -505,17 +502,15 @@ fn typography_metrics_card(
         typography_stepper_row(
             language.text("字体粗细", "Font weight"),
             font_weight.to_string(),
-            |state: &mut DesktopReader| {
-                state.ui.draft_typography.font_weight = state
-                    .ui
+            |state: &mut SettingsFeature| {
+                state.draft_typography.font_weight = state
                     .draft_typography
                     .font_weight
                     .saturating_sub(100)
                     .max(100);
             },
-            |state: &mut DesktopReader| {
-                state.ui.draft_typography.font_weight = state
-                    .ui
+            |state: &mut SettingsFeature| {
+                state.draft_typography.font_weight = state
                     .draft_typography
                     .font_weight
                     .saturating_add(100)
@@ -529,7 +524,7 @@ fn typography_metrics_card(
     .corner_radius(RADIUS_MEDIUM)
 }
 
-fn settings_section_label(text: &'static str) -> impl WidgetView<DesktopReader> {
+fn settings_section_label(text: &'static str) -> impl WidgetView<SettingsFeature> {
     label(text)
         .font(UI_FONT_STACK)
         .text_size(12.0)
@@ -540,9 +535,9 @@ fn settings_section_label(text: &'static str) -> impl WidgetView<DesktopReader> 
 fn typography_stepper_row(
     name: &'static str,
     value: String,
-    decrease: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
-    increase: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
-) -> impl WidgetView<DesktopReader> {
+    decrease: impl Fn(&mut SettingsFeature) + Send + Sync + 'static,
+    increase: impl Fn(&mut SettingsFeature) + Send + Sync + 'static,
+) -> impl WidgetView<SettingsFeature> {
     sized_box(
         flex_row((
             label(name)
@@ -570,8 +565,8 @@ fn typography_stepper_row(
 
 fn stepper_button(
     icon: Icon,
-    callback: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
-) -> impl WidgetView<DesktopReader> {
+    callback: impl Fn(&mut SettingsFeature) + Send + Sync + 'static,
+) -> impl WidgetView<SettingsFeature> {
     sized_box(
         button(icon_label(icon, 13.0, UI_TEXT_SOFT), callback)
             .background_color(UI_SURFACE_MUTED)
@@ -588,7 +583,7 @@ fn stepper_button(
 fn default_font_row(
     selected: ReaderDefaultFont,
     language: AppLanguage,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     sized_box(
         flex_row((
             label(language.text("默认字体", "Default font"))
@@ -619,7 +614,7 @@ fn default_font_choice(
     text: &'static str,
     value: ReaderDefaultFont,
     selected: ReaderDefaultFont,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     let active = value == selected;
     sized_box(
         button(
@@ -632,7 +627,7 @@ fn default_font_choice(
                     FontWeight::NORMAL
                 })
                 .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
-            move |state: &mut DesktopReader| state.ui.draft_typography.default_font = value,
+            move |state: &mut SettingsFeature| state.draft_typography.default_font = value,
         )
         .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
         .active_background_color(UI_ACCENT_SOFT)
@@ -648,7 +643,7 @@ fn font_family_settings_row(
     name: &'static str,
     value: String,
     picker: FontPickerKind,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     let display_value = value.clone();
     sized_box(
         button(
@@ -666,7 +661,7 @@ fn font_family_settings_row(
             ))
             .gap(8.px())
             .cross_axis_alignment(CrossAxisAlignment::Center),
-            move |state: &mut DesktopReader| state.ui.font_picker = Some(picker),
+            move |state: &mut SettingsFeature| state.font_picker = Some(picker),
         )
         .background_color(UI_SURFACE)
         .active_background_color(UI_SURFACE_MUTED)
@@ -684,7 +679,7 @@ fn font_picker_content(
     typography: &ReaderTypography,
     available_families: &[String],
     language: AppLanguage,
-) -> impl WidgetView<DesktopReader> + use<> {
+) -> impl WidgetView<SettingsFeature> + use<> {
     let selected = selected_font_family(typography, kind).to_owned();
     let rows = font_candidates(kind, available_families)
         .into_iter()
@@ -704,7 +699,7 @@ fn font_picker_content(
                     ))
                     .gap(6.px())
                     .cross_axis_alignment(CrossAxisAlignment::Center),
-                    |state: &mut DesktopReader| state.ui.font_picker = None,
+                    |state: &mut SettingsFeature| state.font_picker = None,
                 )
                 .background_color(Color::TRANSPARENT)
                 .active_background_color(UI_SURFACE_MUTED)
@@ -742,7 +737,7 @@ fn font_picker_row(
     family: String,
     selected: &str,
     kind: FontPickerKind,
-) -> impl WidgetView<DesktopReader> + use<> {
+) -> impl WidgetView<SettingsFeature> + use<> {
     let active = family.eq_ignore_ascii_case(selected);
     let label_text = family.clone();
     let label_font = family.clone();
@@ -770,30 +765,22 @@ fn font_picker_row(
                 ),
             ))
             .cross_axis_alignment(CrossAxisAlignment::Center),
-            move |state: &mut DesktopReader| {
+            move |state: &mut SettingsFeature| {
                 match kind {
                     FontPickerKind::Cjk => {
-                        state
-                            .ui
-                            .draft_typography
-                            .default_cjk_font
-                            .clone_from(&family);
+                        state.draft_typography.default_cjk_font.clone_from(&family);
                     }
                     FontPickerKind::Serif => {
-                        state.ui.draft_typography.serif_font.clone_from(&family);
+                        state.draft_typography.serif_font.clone_from(&family);
                     }
                     FontPickerKind::SansSerif => {
-                        state
-                            .ui
-                            .draft_typography
-                            .sans_serif_font
-                            .clone_from(&family);
+                        state.draft_typography.sans_serif_font.clone_from(&family);
                     }
                     FontPickerKind::Monospace => {
-                        state.ui.draft_typography.monospace_font.clone_from(&family);
+                        state.draft_typography.monospace_font.clone_from(&family);
                     }
                 }
-                state.ui.font_picker = None;
+                state.font_picker = None;
             },
         )
         .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
@@ -895,7 +882,7 @@ enum AiFeature {
 fn ai_settings_content(
     settings: PluginSettings,
     language: AppLanguage,
-) -> impl WidgetView<DesktopReader> + use<> {
+) -> impl WidgetView<SettingsFeature> + use<> {
     let provider_count = settings.providers.len();
     let provider_cards = settings
         .providers
@@ -911,8 +898,8 @@ fn ai_settings_content(
                 .cross_axis_alignment(CrossAxisAlignment::Fill),
             secondary_action_button(
                 language.text("新增 Provider", "Add provider"),
-                |state: &mut DesktopReader| {
-                    state.ui.draft_plugin_settings.add_provider();
+                |state: &mut SettingsFeature| {
+                    state.draft_plugin_settings.add_provider();
                 },
             ),
             prose(language.text(
@@ -936,7 +923,7 @@ fn ai_provider_card(
     provider: AiProvider,
     can_remove_provider: bool,
     language: AppLanguage,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     let AiProvider {
         name,
         base_url,
@@ -957,9 +944,9 @@ fn ai_provider_card(
             ai_provider_model_row(index, model_index, model, model_count > 1, language)
         })
         .collect::<Vec<_>>();
-    let remove_provider: Box<AnyWidgetView<DesktopReader>> = if can_remove_provider {
-        icon_button(Icon::Trash2, false, move |state: &mut DesktopReader| {
-            state.ui.draft_plugin_settings.remove_provider(index);
+    let remove_provider: Box<AnyWidgetView<SettingsFeature>> = if can_remove_provider {
+        icon_button(Icon::Trash2, false, move |state: &mut SettingsFeature| {
+            state.draft_plugin_settings.remove_provider(index);
         })
         .boxed()
     } else {
@@ -1011,9 +998,8 @@ fn ai_provider_card(
             flex_col(model_rows).cross_axis_alignment(CrossAxisAlignment::Fill),
             secondary_action_button(
                 language.text("新增模型", "Add model"),
-                move |state: &mut DesktopReader| {
-                    if let Some(provider) = state.ui.draft_plugin_settings.providers.get_mut(index)
-                    {
+                move |state: &mut SettingsFeature| {
+                    if let Some(provider) = state.draft_plugin_settings.providers.get_mut(index) {
                         provider.models.push(String::new());
                     }
                 },
@@ -1035,11 +1021,10 @@ fn ai_provider_model_row(
     value: String,
     can_remove: bool,
     language: AppLanguage,
-) -> impl WidgetView<DesktopReader> {
-    let remove: Box<AnyWidgetView<DesktopReader>> = if can_remove {
-        icon_button(Icon::X, false, move |state: &mut DesktopReader| {
+) -> impl WidgetView<SettingsFeature> {
+    let remove: Box<AnyWidgetView<SettingsFeature>> = if can_remove {
+        icon_button(Icon::X, false, move |state: &mut SettingsFeature| {
             state
-                .ui
                 .draft_plugin_settings
                 .remove_model(provider_index, model_index);
         })
@@ -1058,7 +1043,7 @@ fn ai_provider_model_row(
             .color(UI_TEXT_SOFT),
             FlexSpacer::Flex(1.0),
             sized_box(
-                text_input(value, move |state: &mut DesktopReader, value| {
+                text_input(value, move |state: &mut SettingsFeature, value| {
                     set_ai_setting(
                         state,
                         AiSettingField::Model {
@@ -1096,7 +1081,7 @@ fn ai_settings_input_row(
     value: String,
     placeholder: &'static str,
     field: AiSettingField,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     sized_box(
         flex_row((
             label(label_text)
@@ -1105,7 +1090,7 @@ fn ai_settings_input_row(
                 .color(UI_TEXT_SOFT),
             FlexSpacer::Flex(1.0),
             sized_box(
-                text_input(value, move |state: &mut DesktopReader, value| {
+                text_input(value, move |state: &mut SettingsFeature, value| {
                     set_ai_setting(state, field, value);
                 })
                 .placeholder(placeholder)
@@ -1128,20 +1113,20 @@ fn ai_settings_input_row(
     .padding(Padding::horizontal(10.0))
 }
 
-fn set_ai_setting(state: &mut DesktopReader, field: AiSettingField, value: String) {
+fn set_ai_setting(state: &mut SettingsFeature, field: AiSettingField, value: String) {
     match field {
         AiSettingField::Name(index) => {
-            if let Some(provider) = state.ui.draft_plugin_settings.providers.get_mut(index) {
+            if let Some(provider) = state.draft_plugin_settings.providers.get_mut(index) {
                 provider.name = value;
             }
         }
         AiSettingField::BaseUrl(index) => {
-            if let Some(provider) = state.ui.draft_plugin_settings.providers.get_mut(index) {
+            if let Some(provider) = state.draft_plugin_settings.providers.get_mut(index) {
                 provider.base_url = value;
             }
         }
         AiSettingField::ApiKey(index) => {
-            if let Some(provider) = state.ui.draft_plugin_settings.providers.get_mut(index) {
+            if let Some(provider) = state.draft_plugin_settings.providers.get_mut(index) {
                 provider.api_key = value;
             }
         }
@@ -1150,7 +1135,6 @@ fn set_ai_setting(state: &mut DesktopReader, field: AiSettingField, value: Strin
             model_index,
         } => {
             let updated = state
-                .ui
                 .draft_plugin_settings
                 .providers
                 .get_mut(provider_index)
@@ -1161,16 +1145,15 @@ fn set_ai_setting(state: &mut DesktopReader, field: AiSettingField, value: Strin
                     Some((provider_id, previous))
                 });
             if let Some((provider_id, previous)) = updated {
-                if state.ui.draft_plugin_settings.chat_provider == provider_id
-                    && state.ui.draft_plugin_settings.chat_model == previous
+                if state.draft_plugin_settings.chat_provider == provider_id
+                    && state.draft_plugin_settings.chat_model == previous
                 {
-                    state.ui.draft_plugin_settings.chat_model.clone_from(&value);
+                    state.draft_plugin_settings.chat_model.clone_from(&value);
                 }
-                if state.ui.draft_plugin_settings.translation_provider == provider_id
-                    && state.ui.draft_plugin_settings.translation_model == previous
+                if state.draft_plugin_settings.translation_provider == provider_id
+                    && state.draft_plugin_settings.translation_model == previous
                 {
                     state
-                        .ui
                         .draft_plugin_settings
                         .translation_model
                         .clone_from(&value);
@@ -1183,7 +1166,7 @@ fn set_ai_setting(state: &mut DesktopReader, field: AiSettingField, value: Strin
 fn ai_chat_settings_content(
     settings: &PluginSettings,
     language: AppLanguage,
-) -> impl WidgetView<DesktopReader> + use<'_> {
+) -> impl WidgetView<SettingsFeature> + use<'_> {
     portal(
         flex_col((
             settings_section_label(language.text("AI Chat 模型", "AI Chat model")),
@@ -1207,7 +1190,7 @@ fn ai_chat_settings_content(
 fn translation_settings_content(
     settings: &PluginSettings,
     language: AppLanguage,
-) -> impl WidgetView<DesktopReader> + use<'_> {
+) -> impl WidgetView<SettingsFeature> + use<'_> {
     let translation_mode = settings.translation_mode;
     portal(
         flex_col((
@@ -1242,7 +1225,7 @@ fn translation_settings_content(
 fn translation_target_settings_row(
     target_language: &str,
     language: AppLanguage,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     sized_box(
         flex_row((
             label(language.text("目标语言", "Target language"))
@@ -1273,7 +1256,7 @@ fn translation_target_choice(
     text: &'static str,
     value: &'static str,
     selected: &str,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     let active = value == selected;
     sized_box(
         button(
@@ -1285,8 +1268,8 @@ fn translation_target_choice(
                     FontWeight::NORMAL
                 })
                 .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
-            move |state: &mut DesktopReader| {
-                state.ui.draft_plugin_settings.target_language = value.into();
+            move |state: &mut SettingsFeature| {
+                state.draft_plugin_settings.target_language = value.into();
             },
         )
         .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
@@ -1302,7 +1285,7 @@ fn translation_target_choice(
 fn translation_mode_settings_row(
     mode: TranslationMode,
     language: AppLanguage,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     sized_box(
         flex_row((
             label(language.text("显示方式", "Display mode"))
@@ -1332,7 +1315,7 @@ fn translation_mode_choice(
     text: &'static str,
     value: TranslationMode,
     selected: TranslationMode,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     let active = value == selected;
     sized_box(
         button(
@@ -1344,8 +1327,8 @@ fn translation_mode_choice(
                     FontWeight::NORMAL
                 })
                 .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
-            move |state: &mut DesktopReader| {
-                state.ui.draft_plugin_settings.translation_mode = value;
+            move |state: &mut SettingsFeature| {
+                state.draft_plugin_settings.translation_mode = value;
             },
         )
         .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
@@ -1362,7 +1345,7 @@ fn ai_model_choices(
     settings: &PluginSettings,
     feature: AiFeature,
     language: AppLanguage,
-) -> Box<AnyWidgetView<DesktopReader>> {
+) -> Box<AnyWidgetView<SettingsFeature>> {
     let choices = settings
         .providers
         .iter()
@@ -1423,7 +1406,7 @@ fn ai_model_choice_button(
     feature: AiFeature,
     language: AppLanguage,
     active: bool,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     let display = format!(
         "{}  /  {}",
         if provider_name.trim().is_empty() {
@@ -1455,23 +1438,20 @@ fn ai_model_choice_button(
                 .text_size(10.5)
                 .color(if active { UI_ACCENT } else { UI_MUTED }),
             )),
-            move |state: &mut DesktopReader| match feature {
+            move |state: &mut SettingsFeature| match feature {
                 AiFeature::Chat => {
                     state
-                        .ui
                         .draft_plugin_settings
                         .chat_provider
                         .clone_from(&provider_id);
-                    state.ui.draft_plugin_settings.chat_model.clone_from(&model);
+                    state.draft_plugin_settings.chat_model.clone_from(&model);
                 }
                 AiFeature::Translation => {
                     state
-                        .ui
                         .draft_plugin_settings
                         .translation_provider
                         .clone_from(&provider_id);
                     state
-                        .ui
                         .draft_plugin_settings
                         .translation_model
                         .clone_from(&model);
@@ -1489,7 +1469,7 @@ fn ai_model_choice_button(
     .expand_width()
 }
 
-fn plugin_settings_content(language: AppLanguage) -> impl WidgetView<DesktopReader> + use<> {
+fn plugin_settings_content(language: AppLanguage) -> impl WidgetView<SettingsFeature> + use<> {
     let plugin_cards = BUILTIN_PLUGINS
         .into_iter()
         .map(|plugin| {
@@ -1554,7 +1534,7 @@ fn plugin_settings_content(language: AppLanguage) -> impl WidgetView<DesktopRead
     )
 }
 
-fn settings_value_row(name: &'static str, value: &'static str) -> impl WidgetView<DesktopReader> {
+fn settings_value_row(name: &'static str, value: &'static str) -> impl WidgetView<SettingsFeature> {
     sized_box(
         flex_row((
             label(name).text_size(13.0).color(UI_TEXT_SOFT),
@@ -1571,7 +1551,7 @@ fn settings_value_row(name: &'static str, value: &'static str) -> impl WidgetVie
 fn spread_settings_row(
     spread: SpreadMode,
     language: AppLanguage,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     sized_box(
         flex_row((
             label(language.text("分页方式", "Page spread"))
@@ -1593,7 +1573,7 @@ fn spread_choice(
     text: &'static str,
     value: SpreadMode,
     selected: SpreadMode,
-) -> impl WidgetView<DesktopReader> {
+) -> impl WidgetView<SettingsFeature> {
     let active = value == selected;
     sized_box(
         button(
@@ -1605,7 +1585,7 @@ fn spread_choice(
                     FontWeight::NORMAL
                 })
                 .color(if active { UI_ACCENT } else { UI_TEXT_SOFT }),
-            move |state: &mut DesktopReader| state.ui.draft_spread = value,
+            move |state: &mut SettingsFeature| state.draft_spread = value,
         )
         .background_color(if active { UI_ACCENT_SOFT } else { UI_SURFACE })
         .active_background_color(UI_ACCENT_SOFT)
@@ -1616,4 +1596,98 @@ fn spread_choice(
     )
     .width(58.px())
     .height(CONTROL_HEIGHT.px())
+}
+
+fn icon_button(
+    icon: Icon,
+    selected: bool,
+    callback: impl Fn(&mut SettingsFeature) + Send + Sync + 'static,
+) -> impl WidgetView<SettingsFeature> {
+    let background = if selected {
+        UI_SURFACE_MUTED
+    } else {
+        Color::TRANSPARENT
+    };
+    sized_box(
+        button(
+            icon_label(icon, 16.0, if selected { UI_TEXT } else { UI_MUTED }),
+            callback,
+        )
+        .background_color(background)
+        .active_background_color(UI_SURFACE_MUTED)
+        .border_color(Color::TRANSPARENT)
+        .hovered_border_color(Color::TRANSPARENT)
+        .border_width(0.0)
+        .corner_radius(8.0)
+        .padding(0.0),
+    )
+    .width(32.px())
+    .height(32.px())
+}
+
+fn value_badge(text: &'static str) -> impl WidgetView<SettingsFeature> {
+    sized_box(label(text).text_size(12.0).color(UI_TEXT_SOFT))
+        .height(CONTROL_HEIGHT.px())
+        .background_color(UI_SURFACE)
+        .border(UI_BORDER, 1.0)
+        .corner_radius(RADIUS_SMALL)
+        .padding(Padding::from_vh(5.0, 10.0))
+}
+
+fn primary_action_button(
+    text: &'static str,
+    callback: impl Fn(&mut SettingsFeature) + Send + Sync + 'static,
+) -> impl WidgetView<SettingsFeature> {
+    sized_box(
+        button(
+            label(text)
+                .text_size(12.5)
+                .weight(FontWeight::BOLD)
+                .color(UI_SURFACE),
+            callback,
+        )
+        .background_color(UI_ACCENT)
+        .active_background_color(UI_TEXT)
+        .border_color(UI_ACCENT)
+        .corner_radius(RADIUS_SMALL)
+        .padding(Padding::from_vh(5.0, 12.0)),
+    )
+    .height(CONTROL_HEIGHT.px())
+}
+
+fn secondary_action_button(
+    text: &'static str,
+    callback: impl Fn(&mut SettingsFeature) + Send + Sync + 'static,
+) -> impl WidgetView<SettingsFeature> {
+    sized_box(
+        button(label(text).text_size(12.5).color(UI_TEXT_SOFT), callback)
+            .background_color(UI_SURFACE)
+            .active_background_color(UI_SURFACE_MUTED)
+            .border_color(UI_SURFACE)
+            .hovered_border_color(UI_BORDER)
+            .corner_radius(RADIUS_SMALL)
+            .padding(Padding::from_vh(5.0, 10.0)),
+    )
+    .height(CONTROL_HEIGHT.px())
+}
+
+fn animated_scrim(
+    color: Color,
+    callback: impl Fn(&mut SettingsFeature) + Send + Sync + 'static,
+) -> impl WidgetView<SettingsFeature> {
+    sized_box(
+        button(label(""), callback)
+            .background_color(Color::TRANSPARENT)
+            .active_background_color(Color::TRANSPARENT)
+            .border_color(Color::TRANSPARENT)
+            .hovered_border_color(Color::TRANSPARENT)
+            .border_width(0.0)
+            .padding(0.0),
+    )
+    .expand()
+    .background_color(color)
+}
+
+fn modal_scrim_color(progress: f32) -> Color {
+    Color::from_rgb8(0x1f, 0x2d, 0x3d).with_alpha(MODAL_SCRIM_ALPHA * progress)
 }

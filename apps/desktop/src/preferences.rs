@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
-use rebook_layout::ReaderTypography;
+use rebook_layout::{ReaderTypography, SpreadMode};
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::write_json_atomic;
@@ -42,10 +42,21 @@ impl AppLanguage {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ReaderPreferences {
     pub(crate) typography: ReaderTypography,
     pub(crate) language: AppLanguage,
+    pub(crate) spread: SpreadMode,
+}
+
+impl Default for ReaderPreferences {
+    fn default() -> Self {
+        Self {
+            typography: ReaderTypography::default(),
+            language: AppLanguage::default(),
+            spread: SpreadMode::Double,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,6 +66,38 @@ struct StoredReaderPreferences {
     typography: ReaderTypography,
     #[serde(default)]
     language: AppLanguage,
+    #[serde(default = "default_spread")]
+    spread: StoredSpreadMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum StoredSpreadMode {
+    Single,
+    #[default]
+    Double,
+}
+
+impl From<StoredSpreadMode> for SpreadMode {
+    fn from(value: StoredSpreadMode) -> Self {
+        match value {
+            StoredSpreadMode::Single => Self::Single,
+            StoredSpreadMode::Double => Self::Double,
+        }
+    }
+}
+
+impl From<SpreadMode> for StoredSpreadMode {
+    fn from(value: SpreadMode) -> Self {
+        match value {
+            SpreadMode::Single => Self::Single,
+            SpreadMode::Double => Self::Double,
+        }
+    }
+}
+
+const fn default_spread() -> StoredSpreadMode {
+    StoredSpreadMode::Double
 }
 
 pub(crate) fn load_reader_preferences() -> PreferencesResult<ReaderPreferences> {
@@ -67,12 +110,6 @@ pub(crate) fn save_reader_preferences(preferences: &ReaderPreferences) -> Prefer
 
 pub(crate) fn load_app_language() -> PreferencesResult<AppLanguage> {
     Ok(load_reader_preferences()?.language)
-}
-
-pub(crate) fn save_app_language(language: AppLanguage) -> PreferencesResult<()> {
-    let mut preferences = load_reader_preferences()?;
-    preferences.language = language;
-    save_reader_preferences(&preferences)
 }
 
 fn settings_path() -> io::Result<PathBuf> {
@@ -98,6 +135,7 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
     Ok(ReaderPreferences {
         typography,
         language: stored.language,
+        spread: stored.spread.into(),
     })
 }
 
@@ -112,6 +150,7 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
         version: SETTINGS_VERSION,
         typography,
         language: preferences.language,
+        spread: preferences.spread.into(),
     };
     write_json_atomic(path, &stored)?;
     Ok(())
@@ -140,6 +179,7 @@ mod tests {
         let preferences = ReaderPreferences {
             typography,
             language: AppLanguage::English,
+            spread: SpreadMode::Single,
         };
         save_to(&path, &preferences).unwrap();
         let loaded = load_from(path.clone()).unwrap();
@@ -150,6 +190,7 @@ mod tests {
         assert!((loaded.typography.minimum_font_size - 9.0).abs() < f32::EPSILON);
         assert_eq!(loaded.typography.font_weight, 600);
         assert_eq!(loaded.language, AppLanguage::English);
+        assert_eq!(loaded.spread, SpreadMode::Single);
         fs::remove_file(path).unwrap();
     }
 
@@ -158,6 +199,7 @@ mod tests {
         let json = r#"{"version":1}"#;
         let stored: StoredReaderPreferences = serde_json::from_str(json).unwrap();
         assert_eq!(stored.language, AppLanguage::SimplifiedChinese);
+        assert!(matches!(stored.spread, StoredSpreadMode::Double));
     }
 
     fn test_path() -> PathBuf {

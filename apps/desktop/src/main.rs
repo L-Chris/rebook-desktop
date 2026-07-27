@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! Native e-book reader: parser -> reading IR -> page layout -> display list -> Xilem/Vello.
 
 mod app;
@@ -9,6 +11,7 @@ mod persistence;
 mod plugins;
 mod preferences;
 mod reader;
+mod settings;
 mod shelf;
 mod sync;
 mod ui;

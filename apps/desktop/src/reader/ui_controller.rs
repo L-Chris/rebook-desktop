@@ -47,21 +47,13 @@ impl DesktopReader {
             } else {
                 0.0
             });
-        let settings_changed =
-            self.ui
-                .settings_motion
-                .animate_to(if overlay == ReaderOverlay::Settings {
-                    1.0
-                } else {
-                    0.0
-                });
         let now = Instant::now();
         if overlay == ReaderOverlay::Menu {
             self.ui.reveal_toolbar(now);
         } else if was_menu_open && !self.ui.toolbar_hovered {
             self.ui.schedule_toolbar_hide(now);
         }
-        if menu_changed || settings_changed {
+        if menu_changed {
             self.ui.last_motion_tick = Some(now);
         }
     }
@@ -86,7 +78,6 @@ impl DesktopReader {
         self.ui.toolbar_motion.advance(delta);
         self.ui.sidebar_motion.advance(delta);
         self.ui.menu_motion.advance(delta);
-        self.ui.settings_motion.advance(delta);
         self.translation.dismiss_if_due(now);
 
         if sidebar_was_animating && !self.ui.sidebar_motion.is_animating() {

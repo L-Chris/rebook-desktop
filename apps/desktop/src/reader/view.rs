@@ -17,15 +17,14 @@ use xilem::{Affine, AnyWidgetView, Color, FontWeight, WidgetView};
 use crate::highlights::StoredHighlight;
 use crate::plugins::{BookSearchResult, chat_with_book, search_book, translate_blocks};
 use crate::ui::{
-    CONTROL_HEIGHT, NoticeTone, RADIUS_SMALL, UI_ACCENT, UI_ACCENT_BORDER, UI_ACCENT_SOFT,
-    UI_BACKGROUND, UI_BORDER, UI_FONT_STACK, UI_MUTED, UI_SIDEBAR, UI_SURFACE, UI_SURFACE_MUTED,
-    UI_TEXT, UI_TEXT_SOFT, button, dismissible_notice, divider, ellipsize_display_text, icon_label,
-    notice_card, ui_color, wrap_display_text,
+    NoticeTone, UI_ACCENT, UI_ACCENT_BORDER, UI_ACCENT_SOFT, UI_BACKGROUND, UI_BORDER,
+    UI_FONT_STACK, UI_MUTED, UI_SIDEBAR, UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT, UI_TEXT_SOFT,
+    button, dismissible_notice, divider, ellipsize_display_text, icon_label, notice_card, ui_color,
+    wrap_display_text,
 };
 
 use super::assistant_view::assistant_panel;
 use super::render::{ReaderCanvasAction, reader_canvas};
-use super::settings_view::settings_overlay;
 use super::{
     AssistantPanel, ChatTaskMessage, DesktopReader, FocusedMark, ReaderOverlay, SearchTaskMessage,
     SidebarTab, TranslationTaskMessage,
@@ -39,7 +38,6 @@ const TOC_WIDTH: f64 = 240.0;
 const MOTION_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 const MOTION_EPSILON: f32 = 0.001;
 const SIDEBAR_SCRIM_ALPHA: f32 = 0.28;
-const MODAL_SCRIM_ALPHA: f32 = 0.35;
 const SELECTION_TOOLBAR_WIDTH: f64 = 90.0;
 const SELECTION_TOOLBAR_HEIGHT: f64 = 46.0;
 const SELECTION_TOOLBAR_GAP: f64 = 10.0;
@@ -184,14 +182,7 @@ fn reader_shell(state: &DesktopReader) -> impl WidgetView<DesktopReader> + use<>
     } else {
         workspace
     };
-    let settings_progress = state.ui.settings_motion.value.clamp(0.0, 1.0);
-    let settings_layer: Box<AnyWidgetView<DesktopReader>> = if state.ui.settings_motion.is_visible()
-    {
-        settings_overlay(state, settings_progress).boxed()
-    } else {
-        sized_box(label("")).width(0.px()).height(0.px()).boxed()
-    };
-    sized_box(zstack((workspace, settings_layer)))
+    sized_box(workspace)
         .expand()
         .background_color(UI_BACKGROUND)
 }
@@ -1034,7 +1025,7 @@ fn reader_menu(language: crate::preferences::AppLanguage) -> impl WidgetView<Des
         menu_row(
             Icon::Settings,
             language.text("设置", "Settings"),
-            DesktopReader::open_settings,
+            DesktopReader::request_settings,
         ),
     )))
     .width(180.px())
@@ -1094,52 +1085,6 @@ fn progress_bar(progress: f64) -> impl WidgetView<DesktopReader> {
     .expand_width()
 }
 
-pub(super) fn value_badge(text: &'static str) -> impl WidgetView<DesktopReader> {
-    sized_box(label(text).text_size(12.0).color(UI_TEXT_SOFT))
-        .height(CONTROL_HEIGHT.px())
-        .background_color(UI_SURFACE)
-        .border(UI_BORDER, 1.0)
-        .corner_radius(RADIUS_SMALL)
-        .padding(Padding::from_vh(5.0, 10.0))
-}
-
-pub(super) fn primary_action_button(
-    text: &'static str,
-    callback: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
-) -> impl WidgetView<DesktopReader> {
-    sized_box(
-        button(
-            label(text)
-                .text_size(12.5)
-                .weight(FontWeight::BOLD)
-                .color(UI_SURFACE),
-            callback,
-        )
-        .background_color(UI_ACCENT)
-        .active_background_color(UI_TEXT)
-        .border_color(UI_ACCENT)
-        .corner_radius(RADIUS_SMALL)
-        .padding(Padding::from_vh(5.0, 12.0)),
-    )
-    .height(CONTROL_HEIGHT.px())
-}
-
-pub(super) fn secondary_action_button(
-    text: &'static str,
-    callback: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
-) -> impl WidgetView<DesktopReader> {
-    sized_box(
-        button(label(text).text_size(12.5).color(UI_TEXT_SOFT), callback)
-            .background_color(UI_SURFACE)
-            .active_background_color(UI_SURFACE_MUTED)
-            .border_color(UI_SURFACE)
-            .hovered_border_color(UI_BORDER)
-            .corner_radius(RADIUS_SMALL)
-            .padding(Padding::from_vh(5.0, 10.0)),
-    )
-    .height(CONTROL_HEIGHT.px())
-}
-
 pub(super) fn animated_scrim(
     color: Color,
     callback: impl Fn(&mut DesktopReader) + Send + Sync + 'static,
@@ -1174,8 +1119,4 @@ pub(super) fn transparent_catcher(
 
 fn sidebar_scrim_color(progress: f32) -> Color {
     Color::from_rgb8(0, 0, 0).with_alpha(SIDEBAR_SCRIM_ALPHA * progress)
-}
-
-pub(super) fn modal_scrim_color(progress: f32) -> Color {
-    Color::from_rgb8(0x1f, 0x2d, 0x3d).with_alpha(MODAL_SCRIM_ALPHA * progress)
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rebook_formats::{BookFormat, open_file as open_publication_file};
-use rebook_layout::{LayoutViewport, ReaderStyle, ReaderTypography, SpreadMode};
+use rebook_layout::{LayoutViewport, ReaderStyle};
 use rebook_publication::{BookSource, SourceRange};
 use rebook_reader::{PageDirection, ReaderSelection, ReaderSession, ReaderSnapshot, ReaderTextHit};
 use xilem::Color;
@@ -25,7 +25,6 @@ const INITIAL_WIDTH: u32 = 1200;
 const INITIAL_HEIGHT: u32 = 800;
 const MOTION_DURATION: Duration = Duration::from_millis(180);
 const TOOLBAR_MOTION_DURATION: Duration = Duration::from_millis(200);
-const SETTINGS_MOTION_DURATION: Duration = Duration::from_millis(200);
 const TOOLBAR_HIDE_DELAY: Duration = Duration::from_millis(500);
 const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 const MOTION_EPSILON: f32 = 0.001;
@@ -38,7 +37,6 @@ mod interaction;
 mod navigation;
 pub(super) mod render;
 mod settings_controller;
-mod settings_view;
 mod ui_controller;
 mod view;
 
@@ -82,6 +80,7 @@ pub(super) fn open_reader(
         ReaderPreferences::default()
     });
     let style = ReaderStyle {
+        spread: reader_preferences.spread,
         typography: reader_preferences.typography.clone(),
         ..ReaderStyle::default()
     };
@@ -102,7 +101,6 @@ pub(super) fn open_reader(
     {
         tracing::warn!(%error, "failed to restore durable reading locator");
     }
-    let available_font_families = reader.available_font_families().into();
     tracing::debug!(
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         "opened book"
@@ -121,7 +119,6 @@ pub(super) fn open_reader(
             highlights,
             progress_store,
             plugin_settings,
-            available_font_families,
             language: reader_preferences.language,
             sync_settings,
             sync_password,
@@ -177,7 +174,6 @@ pub(super) struct DesktopReader {
     language: AppLanguage,
     sync_settings: SyncSettings,
     sync_password: String,
-    available_font_families: Arc<[String]>,
     search: SearchUiState,
     chat: ChatUiState,
     translation: TranslationUiState,
@@ -187,6 +183,7 @@ pub(super) struct DesktopReader {
     page_scenes: HashMap<PageSceneKey, Arc<PageSceneLayers>>,
     page_scene_lru: VecDeque<PageSceneKey>,
     pending_page_turn: Option<PageDirection>,
+    settings_requested: bool,
     error: Option<String>,
     pub(super) exit_requested: bool,
 }
@@ -203,7 +200,6 @@ struct DesktopReaderResources {
     highlights: Vec<StoredHighlight>,
     progress_store: Option<SyncStore>,
     plugin_settings: PluginSettings,
-    available_font_families: Arc<[String]>,
     language: AppLanguage,
     sync_settings: SyncSettings,
     sync_password: String,
@@ -383,39 +379,6 @@ impl SnapshotEffects {
 enum ReaderOverlay {
     None,
     Menu,
-    Settings,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SettingsTab {
-    #[default]
-    General,
-    Reading,
-    Font,
-    Cloud,
-    Ai,
-    AiChat,
-    Translation,
-    Plugins,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FontPickerKind {
-    Cjk,
-    Serif,
-    SansSerif,
-    Monospace,
-}
-
-impl FontPickerKind {
-    const fn title(self, language: AppLanguage) -> &'static str {
-        match self {
-            Self::Cjk => language.text("中文字体", "CJK font"),
-            Self::Serif => language.text("衬线字体", "Serif font"),
-            Self::SansSerif => language.text("无衬线字体", "Sans-serif font"),
-            Self::Monospace => language.text("等宽字体", "Monospace font"),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -432,19 +395,12 @@ enum AssistantPanel {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum MotionCurve {
-    EaseOut,
-    EnterExit,
-}
-
-#[derive(Clone, Copy, Debug)]
 struct Motion {
     value: f32,
     start: f32,
     target: f32,
     elapsed: Duration,
     duration: Duration,
-    curve: MotionCurve,
 }
 
 impl Motion {
@@ -453,17 +409,12 @@ impl Motion {
     }
 
     const fn settled_with_duration(value: f32, duration: Duration) -> Self {
-        Self::settled_with_curve(value, duration, MotionCurve::EaseOut)
-    }
-
-    const fn settled_with_curve(value: f32, duration: Duration, curve: MotionCurve) -> Self {
         Self {
             value,
             start: value,
             target: value,
             elapsed: Duration::ZERO,
             duration,
-            curve,
         }
     }
 
@@ -487,10 +438,7 @@ impl Motion {
         } else {
             (self.elapsed.as_secs_f32() / self.duration.as_secs_f32()).min(1.0)
         };
-        let eased = match self.curve {
-            MotionCurve::EnterExit if self.target < self.start => progress.powi(2),
-            MotionCurve::EaseOut | MotionCurve::EnterExit => 1.0 - (1.0 - progress).powi(3),
-        };
+        let eased = 1.0 - (1.0 - progress).powi(3);
         self.value = self.start + (self.target - self.start) * eased;
         if progress >= 1.0 {
             self.value = self.target;
@@ -515,19 +463,10 @@ struct ReaderUiState {
     toolbar_hovered: bool,
     toolbar_hide_at: Option<Instant>,
     overlay: ReaderOverlay,
-    settings_tab: SettingsTab,
-    draft_spread: SpreadMode,
-    draft_typography: ReaderTypography,
-    font_picker: Option<FontPickerKind>,
-    draft_plugin_settings: PluginSettings,
-    draft_language: AppLanguage,
-    draft_sync_settings: SyncSettings,
-    draft_sync_password: String,
     assistant_panel: Option<AssistantPanel>,
     toolbar_motion: Motion,
     sidebar_motion: Motion,
     menu_motion: Motion,
-    settings_motion: Motion,
     last_motion_tick: Option<Instant>,
     expanded_toc: HashSet<String>,
 }
@@ -537,7 +476,6 @@ impl ReaderUiState {
         self.toolbar_motion.is_animating()
             || self.sidebar_motion.is_animating()
             || self.menu_motion.is_animating()
-            || self.settings_motion.is_animating()
     }
 
     fn needs_motion_tick(&self) -> bool {
@@ -566,7 +504,7 @@ impl ReaderUiState {
     }
 
     fn overlay_visible(&self) -> bool {
-        self.menu_motion.is_visible() || self.settings_motion.is_visible()
+        self.menu_motion.is_visible()
     }
 }
 
@@ -584,12 +522,10 @@ impl DesktopReader {
             highlights,
             progress_store,
             plugin_settings,
-            available_font_families,
             language,
             sync_settings,
             sync_password,
         } = resources;
-        let draft_style = reader.style();
         let error = reader
             .prefetch_adjacent()
             .err()
@@ -624,23 +560,10 @@ impl DesktopReader {
                 toolbar_hovered: false,
                 toolbar_hide_at: None,
                 overlay: ReaderOverlay::None,
-                settings_tab: SettingsTab::General,
-                draft_spread: draft_style.spread,
-                draft_typography: draft_style.typography,
-                font_picker: None,
-                draft_plugin_settings: plugin_settings.clone(),
-                draft_language: language,
-                draft_sync_settings: sync_settings.clone(),
-                draft_sync_password: String::new(),
                 assistant_panel: None,
                 toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
                 sidebar_motion: Motion::settled(1.0),
                 menu_motion: Motion::settled(0.0),
-                settings_motion: Motion::settled_with_curve(
-                    0.0,
-                    SETTINGS_MOTION_DURATION,
-                    MotionCurve::EnterExit,
-                ),
                 last_motion_tick: None,
                 expanded_toc,
             },
@@ -648,12 +571,12 @@ impl DesktopReader {
             language,
             sync_settings,
             sync_password,
-            available_font_families,
             canvas_size: None,
             scene_revision: 0,
             page_scenes: HashMap::new(),
             page_scene_lru: VecDeque::new(),
             pending_page_turn: None,
+            settings_requested: false,
             error,
             exit_requested: false,
         }
@@ -670,13 +593,10 @@ fn logical_dimension(value: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::settings_view::font_candidates;
     use super::{
-        AppLanguage, Arc, BookDisplayMetadata, FontPickerKind, HashSet, Instant, MOTION_DURATION,
-        Motion, MotionCurve, NOTICE_AUTO_DISMISS_DELAY, PluginSettings, ReaderOverlay,
-        ReaderTypography, ReaderUiState, SETTINGS_MOTION_DURATION, SettingsTab, SidebarTab,
-        SpreadMode, SyncSettings, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION, TranslationUiState,
-        logical_dimension, resolve_book_display_metadata,
+        BookDisplayMetadata, HashSet, Instant, MOTION_DURATION, Motion, NOTICE_AUTO_DISMISS_DELAY,
+        ReaderOverlay, ReaderUiState, SidebarTab, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION,
+        TranslationUiState, logical_dimension, resolve_book_display_metadata,
     };
 
     #[test]
@@ -718,18 +638,6 @@ mod tests {
     }
 
     #[test]
-    fn modal_motion_uses_a_gentler_exit_curve() {
-        let mut motion =
-            Motion::settled_with_curve(1.0, SETTINGS_MOTION_DURATION, MotionCurve::EnterExit);
-
-        motion.animate_to(0.0);
-        motion.advance(SETTINGS_MOTION_DURATION / 2);
-
-        assert!((motion.value - 0.75).abs() < f32::EPSILON);
-        assert!(motion.is_animating());
-    }
-
-    #[test]
     fn toolbar_hide_delay_is_cancelled_when_pointer_returns() {
         let now = Instant::now();
         let mut ui = ReaderUiState {
@@ -739,23 +647,10 @@ mod tests {
             toolbar_hovered: false,
             toolbar_hide_at: None,
             overlay: ReaderOverlay::None,
-            settings_tab: SettingsTab::Reading,
-            draft_spread: SpreadMode::Single,
-            draft_typography: ReaderTypography::default(),
-            font_picker: None,
-            draft_plugin_settings: PluginSettings::default(),
-            draft_language: AppLanguage::default(),
-            draft_sync_settings: SyncSettings::new_device(),
-            draft_sync_password: String::new(),
             assistant_panel: None,
             toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
             sidebar_motion: Motion::settled(0.0),
             menu_motion: Motion::settled(0.0),
-            settings_motion: Motion::settled_with_curve(
-                0.0,
-                SETTINGS_MOTION_DURATION,
-                MotionCurve::EnterExit,
-            ),
             last_motion_tick: None,
             expanded_toc: HashSet::new(),
         };
@@ -768,33 +663,6 @@ mod tests {
         ui.reveal_toolbar(now + TOOLBAR_HIDE_DELAY / 2);
         assert!(ui.toolbar_hide_at.is_none());
         assert!((ui.toolbar_motion.target - 1.0).abs() <= f32::EPSILON);
-    }
-
-    #[test]
-    fn cjk_font_candidates_keep_readest_defaults_and_filter_latin_families() {
-        let available: Arc<[String]> = [
-            "Arial".to_owned(),
-            "LXGW WenKai".to_owned(),
-            "Microsoft YaHei UI".to_owned(),
-        ]
-        .into();
-
-        let candidates = font_candidates(FontPickerKind::Cjk, &available);
-
-        assert_eq!(candidates[0], "LXGW WenKai GB Screen");
-        assert_eq!(
-            candidates
-                .iter()
-                .filter(|family| family.as_str() == "LXGW WenKai")
-                .count(),
-            1
-        );
-        assert!(
-            candidates
-                .iter()
-                .any(|family| family == "Microsoft YaHei UI")
-        );
-        assert!(!candidates.iter().any(|family| family == "Arial"));
     }
 
     #[test]
