@@ -661,6 +661,18 @@ impl ReaderSession {
         })
     }
 
+    /// Returns the authored spine sections represented by the currently
+    /// visible logical pages, in visual order and without duplicates.
+    pub fn current_spread_section_indices(&mut self) -> Result<Vec<usize>, ReaderError> {
+        let mut indices = Vec::with_capacity(self.current_visible_pages());
+        for (position, _, _) in self.current_spread_pages()? {
+            if indices.last().copied() != Some(position.section_index) {
+                indices.push(position.section_index);
+            }
+        }
+        Ok(indices)
+    }
+
     /// Resolves a canvas point against the currently visible logical pages.
     /// Exact hits start a selection; nearest hits extend an active drag through
     /// whitespace in the same page or across a two-page spread.
@@ -2581,6 +2593,7 @@ mod tests {
                 .is_some_and(|page| page.command_count() > 0)
         );
         assert_eq!(source.parse_count(1), 1);
+        assert_eq!(reader.current_spread_section_indices().unwrap(), [0, 1]);
 
         assert_eq!(
             reader.turn_page(PageDirection::Next).unwrap().outcome,

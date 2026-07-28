@@ -65,6 +65,7 @@ impl DesktopReader {
             .replace(now)
             .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
         let sidebar_was_animating = self.ui.sidebar_motion.is_animating();
+        let assistant_was_animating = self.ui.assistant_motion.is_animating();
         if self
             .ui
             .toolbar_hide_at
@@ -77,13 +78,19 @@ impl DesktopReader {
         }
         self.ui.toolbar_motion.advance(delta);
         self.ui.sidebar_motion.advance(delta);
+        self.ui.assistant_motion.advance(delta);
         self.ui.menu_motion.advance(delta);
         self.translation.dismiss_if_due(now);
 
-        if sidebar_was_animating && !self.ui.sidebar_motion.is_animating() {
+        if (sidebar_was_animating && !self.ui.sidebar_motion.is_animating())
+            || (assistant_was_animating && !self.ui.assistant_motion.is_animating())
+        {
             // Reader layout is deliberately held stable during the slide. Trigger one
             // final canvas draw so the EPUB is reflowed only once at the settled width.
             self.bump_scene_revision();
+        }
+        if !self.ui.assistant_motion.is_animating() && self.ui.assistant_motion.target <= 0.0 {
+            self.ui.assistant_panel = None;
         }
         if !self.ui.needs_motion_tick() {
             self.ui.last_motion_tick = None;

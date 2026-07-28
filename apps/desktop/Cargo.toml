@@ -1,6 +1,6 @@
 [package]
 name = "rebook-desktop"
-description = "Native parser-IR-layout-Vello e-book reader"
+description = "Torto native e-book reader"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,15 +9,28 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "torto"
+path = "src/main.rs"
+
 [dependencies]
 anyrender.workspace = true
 atomicwrites.workspace = true
 directories.workspace = true
+egui.workspace = true
+egui_commonmark.workspace = true
+egui_extras.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
 image.workspace = true
 keyring.workspace = true
 kurbo.workspace = true
 lucide-icons.workspace = true
+markie.workspace = true
+mermaid-rs-renderer.workspace = true
 peniko.workspace = true
+pollster.workspace = true
+pulldown-cmark.workspace = true
 quick-xml.workspace = true
 regex.workspace = true
 rebook-formats = { path = "../../crates/formats" }
@@ -32,11 +45,17 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 uuid.workspace = true
-xilem.workspace = true
+vello.workspace = true
+wgpu.workspace = true
+winit.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 zip.workspace = true
+
+[build-dependencies]
+winresource = "0.1.31"

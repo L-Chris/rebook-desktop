@@ -1,15 +1,17 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use xilem::core::map_state;
-use xilem::masonry::peniko::Blob;
-use xilem::view::{sized_box, zstack};
-use xilem::{AnyWidgetView, WidgetView};
+use peniko::Blob;
+use vello::Scene;
 
 use crate::library::LocalLibrary;
-use crate::reader::{DesktopReader, app_view};
-use crate::settings::{SettingsFeature, settings_view};
-use crate::shelf::{ShelfFeature, view as shelf_view};
+use crate::platform::UserEvent;
+use crate::reader::{
+    ChatTaskMessage, SearchTaskMessage, TocTranslationTaskMessage, TranslationTaskMessage,
+};
+use crate::reader::{DesktopReader, ReaderFramePlan, ReaderPageTexture};
+use crate::settings::{SettingsFeature, settings_overlay};
+use crate::shelf::{ShelfFeature, SyncTaskMessage};
 
 pub(crate) struct DesktopApp {
     shelf: ShelfFeature,
@@ -34,53 +36,104 @@ impl DesktopApp {
         self.promote_opened_reader();
     }
 
+    pub(crate) fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        page_texture: Option<ReaderPageTexture>,
+    ) -> Option<ReaderFramePlan> {
+        self.reconcile_state();
+        let interaction_blocked = self.settings.is_open();
+        let plan = if let Some(reader) = self.reader.as_mut() {
+            Some(reader.ui(ui, page_texture, interaction_blocked))
+        } else {
+            self.shelf.ui(ui);
+            None
+        };
+
+        let settings_requested = self.reader.as_mut().map_or_else(
+            || self.shelf.take_settings_request(),
+            DesktopReader::take_settings_request,
+        );
+        if settings_requested {
+            self.settings.open();
+        }
+        settings_overlay(ui.ctx(), &mut self.settings);
+        self.apply_settings_if_changed();
+        plan
+    }
+
+    pub(crate) fn reader_scene(&mut self) -> Option<Arc<Scene>> {
+        self.reader.as_mut().map(DesktopReader::page_scene)
+    }
+
+    pub(crate) fn spawn_pending_tasks(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    ) {
+        self.shelf.spawn_pending_tasks(runtime, proxy);
+        if let Some(reader) = self.reader.as_mut() {
+            reader.spawn_pending_tasks(runtime, proxy);
+        }
+    }
+
+    pub(crate) fn complete_shelf_sync(&mut self, message: SyncTaskMessage) {
+        self.shelf.complete_sync(message);
+    }
+
+    pub(crate) fn complete_reader_search(&mut self, message: SearchTaskMessage) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.complete_search(message);
+        }
+    }
+
+    pub(crate) fn complete_reader_chat(&mut self, message: ChatTaskMessage) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.complete_chat(message);
+        }
+    }
+
+    pub(crate) fn complete_reader_translation(&mut self, message: TranslationTaskMessage) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.complete_translation(message);
+        }
+    }
+
+    pub(crate) fn complete_reader_toc_translation(&mut self, message: TocTranslationTaskMessage) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.complete_toc_translation(message);
+        }
+    }
+
+    fn reconcile_state(&mut self) {
+        if self
+            .reader
+            .as_ref()
+            .is_some_and(|reader| reader.exit_requested)
+        {
+            self.reader = None;
+            self.shelf.resume();
+        }
+        self.promote_opened_reader();
+        self.apply_settings_if_changed();
+    }
+
     fn promote_opened_reader(&mut self) {
         if self.reader.is_none() {
             self.reader = self.shelf.take_opened_reader();
         }
     }
-}
 
-pub(crate) fn root_view(state: &mut DesktopApp) -> Box<AnyWidgetView<DesktopApp>> {
-    if state
-        .reader
-        .as_ref()
-        .is_some_and(|reader| reader.exit_requested)
-    {
-        state.reader = None;
-        state.shelf.resume();
-    }
-    state.promote_opened_reader();
-
-    let settings_requested = state.reader.as_mut().map_or_else(
-        || state.shelf.take_settings_request(),
-        DesktopReader::take_settings_request,
-    );
-    if settings_requested {
-        state.settings.open();
-    }
-
-    let settings_revision = state.settings.revision();
-    if settings_revision != state.applied_settings_revision {
-        let applied = state.settings.applied().clone();
-        state.shelf.apply_global_settings(&applied);
-        if let Some(reader) = state.reader.as_mut() {
+    fn apply_settings_if_changed(&mut self) {
+        let revision = self.settings.revision();
+        if revision == self.applied_settings_revision {
+            return;
+        }
+        let applied = self.settings.applied().clone();
+        self.shelf.apply_global_settings(&applied);
+        if let Some(reader) = self.reader.as_mut() {
             reader.apply_global_settings(&applied);
         }
-        state.applied_settings_revision = settings_revision;
+        self.applied_settings_revision = revision;
     }
-
-    let page: Box<AnyWidgetView<DesktopApp>> = if let Some(reader) = state.reader.as_mut() {
-        let reader_view = app_view(reader);
-        map_state(reader_view, |state: &mut DesktopApp| {
-            state.reader.as_mut().expect("reader exists")
-        })
-        .boxed()
-    } else {
-        let view = shelf_view(&mut state.shelf);
-        map_state(view, |state: &mut DesktopApp| &mut state.shelf).boxed()
-    };
-    let overlay = settings_view(&mut state.settings);
-    let overlay = map_state(overlay, |state: &mut DesktopApp| &mut state.settings).boxed();
-    sized_box(zstack((page, overlay))).expand().boxed()
 }

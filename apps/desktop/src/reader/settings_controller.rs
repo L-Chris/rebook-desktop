@@ -23,6 +23,8 @@ impl DesktopReader {
             || self.plugin_settings.providers != plugin_settings.providers
             || (self.language != language
                 && plugin_settings.target_language == crate::plugins::TARGET_LANGUAGE_INTERFACE);
+        let toc_translation_setting_changed =
+            self.plugin_settings.translate_toc != plugin_settings.translate_toc;
 
         if let Err(error) = self
             .translation_source
@@ -54,6 +56,10 @@ impl DesktopReader {
                 self.translation.clear_error();
                 if translation_backend_changed {
                     self.translation.task.cancel();
+                    self.translation.toc_task.cancel();
+                    self.translation.toc_labels.clear();
+                } else if toc_translation_setting_changed && !self.plugin_settings.translate_toc {
+                    self.translation.toc_task.cancel();
                 }
                 self.apply_snapshot(
                     snapshot,
@@ -62,6 +68,7 @@ impl DesktopReader {
                         ..SnapshotEffects::static_content_change()
                     },
                 );
+                self.queue_toc_translation();
             }
             Err(error) => {
                 self.error = Some(format!(

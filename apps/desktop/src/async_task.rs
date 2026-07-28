@@ -12,6 +12,7 @@ pub(crate) struct TaskResult<T> {
 
 pub(crate) struct TaskSlot<T> {
     pub pending: Option<PendingTask<T>>,
+    in_flight: Option<PendingTask<T>>,
     next_id: u64,
 }
 
@@ -19,6 +20,7 @@ impl<T> Default for TaskSlot<T> {
     fn default() -> Self {
         Self {
             pending: None,
+            in_flight: None,
             next_id: 1,
         }
     }
@@ -26,7 +28,7 @@ impl<T> Default for TaskSlot<T> {
 
 impl<T> TaskSlot<T> {
     pub fn is_pending(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || self.in_flight.is_some()
     }
 
     pub fn begin(&mut self, payload: T) -> u64 {
@@ -36,15 +38,25 @@ impl<T> TaskSlot<T> {
         id
     }
 
+    pub fn take_pending(&mut self) -> Option<PendingTask<T>>
+    where
+        T: Clone,
+    {
+        let request = self.pending.take()?;
+        self.in_flight = Some(request.clone());
+        Some(request)
+    }
+
     pub fn complete(&mut self, id: u64) -> Option<T> {
-        if self.pending.as_ref().map(|request| request.id) != Some(id) {
+        if self.in_flight.as_ref().map(|request| request.id) != Some(id) {
             return None;
         }
-        self.pending.take().map(|request| request.payload)
+        self.in_flight.take().map(|request| request.payload)
     }
 
     pub fn cancel(&mut self) {
         self.pending = None;
+        self.in_flight = None;
     }
 }
 
@@ -56,8 +68,10 @@ mod tests {
     fn stale_completion_cannot_clear_the_current_request() {
         let mut slot = TaskSlot::default();
         let first = slot.begin("first");
+        let _ = slot.take_pending();
         slot.cancel();
         let second = slot.begin("second");
+        let _ = slot.take_pending();
 
         assert_eq!(slot.complete(first), None);
         assert!(slot.is_pending());

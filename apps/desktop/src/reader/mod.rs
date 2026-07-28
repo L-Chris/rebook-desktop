@@ -3,12 +3,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use peniko::{Blob, Color};
 use rebook_formats::{BookFormat, open_file as open_publication_file};
 use rebook_layout::{LayoutViewport, ReaderStyle};
 use rebook_publication::{BookSource, SourceRange};
 use rebook_reader::{PageDirection, ReaderSelection, ReaderSession, ReaderSnapshot, ReaderTextHit};
-use xilem::Color;
-use xilem::masonry::peniko::{Blob, ImageData};
 
 use crate::async_task::{TaskResult, TaskSlot};
 use crate::highlights::{HighlightStore, StoredHighlight};
@@ -19,7 +18,6 @@ use crate::plugins::{
 };
 use crate::preferences::{self, AppLanguage, ReaderPreferences};
 use crate::sync::{SyncSettings, SyncStore};
-use crate::ui::decode_image;
 
 const INITIAL_WIDTH: u32 = 1200;
 const INITIAL_HEIGHT: u32 = 800;
@@ -32,16 +30,16 @@ const SEARCH_MARK_COLOR: Color = Color::from_rgba8(250, 204, 21, 89);
 const ASSISTANT_MARK_COLOR: Color = Color::from_rgba8(245, 158, 11, 56);
 
 mod assistant;
-mod assistant_view;
+mod chat_markdown;
+mod egui_view;
 mod interaction;
 mod navigation;
 pub(super) mod render;
 mod settings_controller;
 mod ui_controller;
-mod view;
 
+pub(crate) use egui_view::{ReaderFramePlan, ReaderPageTexture};
 use render::{PageSceneKey, PageSceneLayers};
-pub(super) use view::app_view;
 
 pub(super) fn open_reader(
     path: &Path,
@@ -52,9 +50,7 @@ pub(super) fn open_reader(
     let started = Instant::now();
     let publication = open_publication_file(path)?;
     let format = publication.format();
-    let cover = publication
-        .cover_bytes()
-        .and_then(|bytes| decode_image(bytes).ok());
+    let cover = publication.cover_bytes().map(<[u8]>::to_vec);
     let canonical_source = publication.source();
     let book_id = canonical_source.book().id.to_string();
     let display_metadata = resolve_book_display_metadata(
@@ -158,7 +154,8 @@ pub(super) struct DesktopReader {
     rewrite_source: Arc<RewriteBookSource>,
     translation_source: Arc<TranslationBookSource>,
     snapshot: ReaderSnapshot,
-    cover: Option<ImageData>,
+    cover: Option<Vec<u8>>,
+    cover_texture: Option<egui::TextureHandle>,
     format: BookFormat,
     book_id: String,
     display_metadata: BookDisplayMetadata,
@@ -176,6 +173,7 @@ pub(super) struct DesktopReader {
     sync_password: String,
     search: SearchUiState,
     chat: ChatUiState,
+    chat_markdown: chat_markdown::ChatMarkdownState,
     translation: TranslationUiState,
     ui: ReaderUiState,
     canvas_size: Option<(u32, u32)>,
@@ -192,7 +190,7 @@ struct DesktopReaderResources {
     source: Arc<dyn BookSource>,
     rewrite_source: Arc<RewriteBookSource>,
     translation_source: Arc<TranslationBookSource>,
-    cover: Option<ImageData>,
+    cover: Option<Vec<u8>>,
     format: BookFormat,
     book_id: String,
     display_metadata: BookDisplayMetadata,
@@ -211,7 +209,7 @@ struct SearchTask {
     query: String,
 }
 
-type SearchTaskMessage = TaskResult<Vec<BookSearchResult>>;
+pub(crate) type SearchTaskMessage = TaskResult<Vec<BookSearchResult>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusedMarkKind {
@@ -246,12 +244,6 @@ impl FocusedMark {
             FocusedMarkKind::Assistant => ASSISTANT_MARK_COLOR,
         }
     }
-
-    fn search_range(&self) -> Option<&SourceRange> {
-        (self.kind == FocusedMarkKind::Search)
-            .then(|| self.ranges.first())
-            .flatten()
-    }
 }
 
 #[derive(Default)]
@@ -272,7 +264,7 @@ struct ChatTask {
     response_language: String,
 }
 
-type ChatTaskMessage = TaskResult<ChatResponse>;
+pub(crate) type ChatTaskMessage = TaskResult<ChatResponse>;
 
 #[derive(Default)]
 struct ChatUiState {
@@ -289,14 +281,26 @@ struct TranslationTask {
     blocks: Vec<TranslationBlockInput>,
 }
 
-type TranslationTaskMessage = TaskResult<Vec<BlockTranslation>>;
+pub(crate) type TranslationTaskMessage = TaskResult<Vec<BlockTranslation>>;
+
+#[derive(Clone)]
+struct TocTranslationTask {
+    toc_ids: Vec<String>,
+    settings: PluginSettings,
+    blocks: Vec<TranslationBlockInput>,
+}
+
+pub(crate) type TocTranslationTaskMessage = TaskResult<Vec<BlockTranslation>>;
 
 #[derive(Default)]
 struct TranslationUiState {
     enabled: bool,
+    render_enabled: bool,
     error: Option<String>,
     dismiss_at: Option<Instant>,
     task: TaskSlot<TranslationTask>,
+    toc_task: TaskSlot<TocTranslationTask>,
+    toc_labels: HashMap<String, String>,
 }
 
 impl TranslationUiState {
@@ -466,15 +470,20 @@ struct ReaderUiState {
     assistant_panel: Option<AssistantPanel>,
     toolbar_motion: Motion,
     sidebar_motion: Motion,
+    assistant_motion: Motion,
     menu_motion: Motion,
     last_motion_tick: Option<Instant>,
+    wheel_accumulator: f32,
+    last_wheel_turn: Option<Instant>,
     expanded_toc: HashSet<String>,
+    last_auto_scrolled_toc: Option<String>,
 }
 
 impl ReaderUiState {
     fn is_animating(&self) -> bool {
         self.toolbar_motion.is_animating()
             || self.sidebar_motion.is_animating()
+            || self.assistant_motion.is_animating()
             || self.menu_motion.is_animating()
     }
 
@@ -539,6 +548,7 @@ impl DesktopReader {
             translation_source,
             snapshot,
             cover,
+            cover_texture: None,
             format,
             book_id,
             display_metadata,
@@ -552,6 +562,7 @@ impl DesktopReader {
             focused_mark: None,
             search: SearchUiState::default(),
             chat: ChatUiState::default(),
+            chat_markdown: chat_markdown::ChatMarkdownState::default(),
             translation: TranslationUiState::default(),
             ui: ReaderUiState {
                 sidebar_open: true,
@@ -563,9 +574,13 @@ impl DesktopReader {
                 assistant_panel: None,
                 toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
                 sidebar_motion: Motion::settled(1.0),
+                assistant_motion: Motion::settled(0.0),
                 menu_motion: Motion::settled(0.0),
                 last_motion_tick: None,
+                wheel_accumulator: 0.0,
+                last_wheel_turn: None,
                 expanded_toc,
+                last_auto_scrolled_toc: None,
             },
             plugin_settings,
             language,
@@ -650,9 +665,13 @@ mod tests {
             assistant_panel: None,
             toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
             sidebar_motion: Motion::settled(0.0),
+            assistant_motion: Motion::settled(0.0),
             menu_motion: Motion::settled(0.0),
             last_motion_tick: None,
+            wheel_accumulator: 0.0,
+            last_wheel_turn: None,
             expanded_toc: HashSet::new(),
+            last_auto_scrolled_toc: None,
         };
 
         ui.reveal_toolbar(now);

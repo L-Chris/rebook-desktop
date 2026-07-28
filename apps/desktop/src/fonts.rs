@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use xilem::Blob;
+use peniko::Blob;
 
 const BITTER_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Bitter-wght.ttf");
 const BITTER_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Bitter-Italic-wght.ttf");

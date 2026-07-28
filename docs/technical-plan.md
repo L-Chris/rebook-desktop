@@ -1,4 +1,4 @@
-# rebook-desktop EPUB 技术方案
+# Torto EPUB 技术方案
 
 > 历史调研：本文记录早期以 Blitz/DOM/CSS 浏览器组件为主的方案，不再描述当前实现。现行架构见 [ADR-0001](adr-0001-native-epub-renderer.md) 和 [当前状态](phase-0-status.md)。
 

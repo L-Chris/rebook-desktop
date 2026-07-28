@@ -540,12 +540,30 @@ fn resolve_page_geometry(
     page_height: f32,
     reader_style: &ReaderStyle,
 ) -> PageGeometry {
-    let horizontal_margin = reader_style
-        .horizontal_margin
-        .min(page_width.mul_add(0.2, -8.0).max(20.0));
+    let (content_left, content_width, column_count, continuation_offset_x) =
+        resolve_horizontal_page_geometry(page_width, reader_style);
     let vertical_margin = reader_style
         .vertical_margin
         .min(page_height.mul_add(0.2, -8.0).max(20.0));
+    let content_bottom = (page_height - vertical_margin).max(vertical_margin + 40.0);
+
+    PageGeometry {
+        left: content_left,
+        top: vertical_margin,
+        width: content_width,
+        bottom: content_bottom,
+        visible_pages: column_count,
+        continuation_offset_x,
+    }
+}
+
+fn resolve_horizontal_page_geometry(
+    page_width: f32,
+    reader_style: &ReaderStyle,
+) -> (f32, f32, usize, f32) {
+    let horizontal_margin = reader_style
+        .horizontal_margin
+        .min(page_width.mul_add(0.2, -8.0).max(20.0));
     let double_available = page_width - horizontal_margin * 2.0 - COLUMN_GAP;
     let column_count = if reader_style.spread == SpreadMode::Double
         && double_available >= MIN_COLUMN_WIDTH * 2.0
@@ -560,16 +578,20 @@ fn resolve_page_geometry(
         .clamp(80.0, MAX_COLUMN_WIDTH);
     let spread_width = content_width * column_divisor + column_gap;
     let content_left = ((page_width - spread_width) / 2.0).max(horizontal_margin);
-    let content_bottom = (page_height - vertical_margin).max(vertical_margin + 40.0);
+    (
+        content_left,
+        content_width,
+        column_count,
+        content_width + column_gap,
+    )
+}
 
-    PageGeometry {
-        left: content_left,
-        top: vertical_margin,
-        width: content_width,
-        bottom: content_bottom,
-        visible_pages: column_count,
-        continuation_offset_x: content_width + column_gap,
-    }
+/// Returns the horizontal start of the reading content for a viewport.
+///
+/// Reader chrome uses this to align its title with the exact same centered
+/// single- or double-column geometry used by pagination.
+pub fn reading_content_left(page_width: f32, reader_style: &ReaderStyle) -> f32 {
+    resolve_horizontal_page_geometry(page_width, reader_style).0
 }
 
 struct StyledRange {

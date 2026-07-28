@@ -34,10 +34,52 @@ pub(crate) const TARGET_LANGUAGE_INTERFACE: &str = "interface";
 pub(crate) const TARGET_LANGUAGE_SIMPLIFIED_CHINESE: &str = "zh-CN";
 pub(crate) const TARGET_LANGUAGE_ENGLISH: &str = "en";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AiProviderKind {
+    #[default]
+    Custom,
+    OpenAi,
+    DeepSeek,
+    OpenRouter,
+    SiliconFlow,
+}
+
+impl AiProviderKind {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Custom,
+        Self::OpenAi,
+        Self::DeepSeek,
+        Self::OpenRouter,
+        Self::SiliconFlow,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Custom => "Custom",
+            Self::OpenAi => "OpenAI",
+            Self::DeepSeek => "DeepSeek",
+            Self::OpenRouter => "OpenRouter",
+            Self::SiliconFlow => "SiliconFlow",
+        }
+    }
+
+    const fn base_url(self) -> Option<&'static str> {
+        match self {
+            Self::Custom => None,
+            Self::OpenAi => Some("https://api.openai.com/v1"),
+            Self::DeepSeek => Some("https://api.deepseek.com"),
+            Self::OpenRouter => Some("https://openrouter.ai/api/v1"),
+            Self::SiliconFlow => Some("https://api.siliconflow.cn/v1"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiProvider {
     pub id: String,
+    pub(crate) kind: AiProviderKind,
     pub name: String,
     pub base_url: String,
     pub models: Vec<String>,
@@ -59,10 +101,24 @@ impl Default for AiProvider {
     fn default() -> Self {
         Self {
             id: DEFAULT_PROVIDER_ID.into(),
-            name: "OpenAI".into(),
-            base_url: "https://api.openai.com/v1".into(),
+            kind: AiProviderKind::Custom,
+            name: AiProviderKind::Custom.label().into(),
+            base_url: String::new(),
             models: vec![DEFAULT_MODEL.into()],
             api_key: String::new(),
+        }
+    }
+}
+
+impl AiProvider {
+    pub(crate) fn select_kind(&mut self, kind: AiProviderKind) {
+        let old_kind = self.kind;
+        self.kind = kind;
+        if let Some(base_url) = kind.base_url() {
+            self.base_url = base_url.into();
+        }
+        if self.name.trim().is_empty() || self.name == old_kind.label() {
+            self.name = kind.label().into();
         }
     }
 }
@@ -77,6 +133,7 @@ pub struct PluginSettings {
     pub translation_model: String,
     pub target_language: String,
     pub translation_mode: TranslationMode,
+    pub translate_toc: bool,
     #[serde(default, rename = "base_url", skip_serializing)]
     legacy_base_url: Option<String>,
     #[serde(default, rename = "api_key", skip_serializing)]
@@ -93,6 +150,7 @@ impl Default for PluginSettings {
             translation_model: DEFAULT_MODEL.into(),
             target_language: TARGET_LANGUAGE_INTERFACE.into(),
             translation_mode: TranslationMode::Bilingual,
+            translate_toc: true,
             legacy_base_url: None,
             legacy_api_key: None,
         }
@@ -115,6 +173,7 @@ impl PluginSettings {
             && !value.trim().is_empty()
             && let Some(provider) = settings.providers.first_mut()
         {
+            provider.kind = AiProviderKind::Custom;
             provider.base_url = value;
         }
         if let Ok(value) = env::var("REBOOK_AI_MODEL")
@@ -171,6 +230,9 @@ impl PluginSettings {
             if provider.name.trim().is_empty() {
                 provider.name = format!("Provider {}", index + 1);
             }
+            if let Some(base_url) = provider.kind.base_url() {
+                provider.base_url = base_url.into();
+            }
             provider.models = normalized_models(std::mem::take(&mut provider.models));
         }
 
@@ -202,7 +264,8 @@ impl PluginSettings {
         };
         self.providers.push(AiProvider {
             id,
-            name: format!("Provider {suffix}"),
+            kind: AiProviderKind::Custom,
+            name: format!("Custom {suffix}"),
             base_url: String::new(),
             models: vec![DEFAULT_MODEL.into()],
             api_key: String::new(),
@@ -413,6 +476,33 @@ mod tests {
     }
 
     #[test]
+    fn ai_provider_defaults_to_custom_and_presets_supply_the_endpoint() {
+        let mut provider = AiProvider::default();
+        assert_eq!(provider.kind, AiProviderKind::Custom);
+        assert!(provider.base_url.is_empty());
+
+        provider.select_kind(AiProviderKind::DeepSeek);
+
+        assert_eq!(provider.kind, AiProviderKind::DeepSeek);
+        assert_eq!(provider.name, "DeepSeek");
+        assert_eq!(provider.base_url, "https://api.deepseek.com");
+    }
+
+    #[test]
+    fn legacy_ai_provider_is_treated_as_custom() {
+        let json = r#"{
+            "id": "legacy",
+            "name": "Local model",
+            "base_url": "http://localhost:11434/v1",
+            "models": ["qwen"]
+        }"#;
+        let provider: AiProvider = serde_json::from_str(json).unwrap();
+
+        assert_eq!(provider.kind, AiProviderKind::Custom);
+        assert_eq!(provider.base_url, "http://localhost:11434/v1");
+    }
+
+    #[test]
     fn legacy_single_provider_settings_migrate_without_losing_models() {
         let json = r#"{
             "base_url": "http://localhost:11434/v1",
@@ -436,6 +526,7 @@ mod tests {
         assert_eq!(settings.target_language, TARGET_LANGUAGE_ENGLISH);
         assert_eq!(settings.resolved_target_language("简体中文"), "English");
         assert_eq!(settings.translation_mode, TranslationMode::Bilingual);
+        assert!(settings.translate_toc);
     }
 
     #[test]
@@ -484,6 +575,7 @@ mod tests {
     #[test]
     fn configured_api_key_survives_normalization_and_enables_translation() {
         let mut settings = PluginSettings::default();
+        settings.providers[0].select_kind(AiProviderKind::OpenAi);
         settings.providers[0].api_key = "  secret-key  ".into();
 
         settings.normalize();

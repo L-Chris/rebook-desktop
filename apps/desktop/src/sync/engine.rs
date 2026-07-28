@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn two_desktop_devices_exchange_a_content_addressed_book_directly() {
         let server = FakeWebDav::start();
-        let runtime = xilem::tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let content = b"direct desktop webdav fixture".to_vec();
         let book_id = format!("{:x}", Sha256::digest(&content));
         let source_path = std::env::temp_dir().join(format!("{book_id}.epub"));
@@ -448,6 +448,7 @@ mod tests {
     fn test_settings(base_url: String, device_name: &str) -> SyncSettings {
         SyncSettings {
             enabled: true,
+            provider: crate::sync::CloudProviderKind::Custom,
             base_url,
             username: "reader".into(),
             device_id: Uuid::new_v4().to_string(),

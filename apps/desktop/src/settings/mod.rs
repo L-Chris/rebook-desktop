@@ -1,22 +1,13 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
+use peniko::Blob;
 use rebook_layout::{LayoutEngine, ReaderTypography, SpreadMode};
-use xilem::core::fork;
-use xilem::masonry::peniko::Blob;
-use xilem::masonry::properties::types::AsUnit;
-use xilem::view::{label, sized_box, task};
-use xilem::{AnyWidgetView, WidgetView};
 
 use crate::plugins::PluginSettings;
 use crate::preferences::{self, AppLanguage, ReaderPreferences};
 use crate::sync::SyncSettings;
 
-mod view;
+mod egui_view;
 
-const MOTION_DURATION: Duration = Duration::from_millis(180);
-const MOTION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
-const MOTION_EPSILON: f32 = 0.001;
+pub(crate) use egui_view::settings_overlay;
 
 #[derive(Clone)]
 pub(crate) struct AppliedSettings {
@@ -32,17 +23,15 @@ pub(crate) struct SettingsFeature {
     settings_tab: SettingsTab,
     draft_spread: SpreadMode,
     draft_typography: ReaderTypography,
-    font_picker: Option<FontPickerKind>,
     draft_plugin_settings: PluginSettings,
     draft_language: AppLanguage,
     draft_sync_settings: SyncSettings,
     draft_sync_password: String,
-    available_font_families: Arc<[String]>,
+    available_font_families: Vec<String>,
     applied: AppliedSettings,
     revision: u64,
     error: Option<String>,
-    motion: Motion,
-    last_motion_tick: Option<Instant>,
+    open: bool,
 }
 
 impl SettingsFeature {
@@ -63,8 +52,8 @@ impl SettingsFeature {
             tracing::warn!(%error, "failed to load WebDAV credential");
             String::new()
         });
-        let mut layout = LayoutEngine::with_fonts(reader_fonts.iter().cloned());
-        let available_font_families = layout.available_font_families().into();
+        let available_font_families =
+            LayoutEngine::with_fonts(reader_fonts.iter().cloned()).available_font_families();
         let applied = AppliedSettings {
             spread: preferences.spread,
             typography: preferences.typography,
@@ -74,10 +63,9 @@ impl SettingsFeature {
             sync_password,
         };
         Self {
-            settings_tab: SettingsTab::General,
+            settings_tab: SettingsTab::Reading,
             draft_spread: applied.spread,
             draft_typography: applied.typography.clone(),
-            font_picker: None,
             draft_plugin_settings: applied.plugin_settings.clone(),
             draft_language: applied.language,
             draft_sync_settings: applied.sync_settings.clone(),
@@ -86,16 +74,14 @@ impl SettingsFeature {
             applied,
             revision: 0,
             error: None,
-            motion: Motion::settled(0.0),
-            last_motion_tick: None,
+            open: false,
         }
     }
 
     pub(crate) fn open(&mut self) {
-        self.settings_tab = SettingsTab::General;
+        self.settings_tab = SettingsTab::Reading;
         self.draft_spread = self.applied.spread;
         self.draft_typography.clone_from(&self.applied.typography);
-        self.font_picker = None;
         self.draft_plugin_settings
             .clone_from(&self.applied.plugin_settings);
         self.draft_language = self.applied.language;
@@ -103,9 +89,7 @@ impl SettingsFeature {
             .clone_from(&self.applied.sync_settings);
         self.draft_sync_password.clear();
         self.error = None;
-        if self.motion.animate_to(1.0) {
-            self.last_motion_tick = Some(Instant::now());
-        }
+        self.open = true;
     }
 
     pub(crate) fn revision(&self) -> u64 {
@@ -117,9 +101,7 @@ impl SettingsFeature {
     }
 
     fn close_overlay(&mut self) {
-        if self.motion.animate_to(0.0) {
-            self.last_motion_tick = Some(Instant::now());
-        }
+        self.open = false;
     }
 
     fn apply_settings(&mut self) {
@@ -169,44 +151,9 @@ impl SettingsFeature {
         self.close_overlay();
     }
 
-    fn advance_motion(&mut self, now: Instant) {
-        let delta = self
-            .last_motion_tick
-            .replace(now)
-            .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
-        self.motion.advance(delta);
-        if !self.motion.is_animating() {
-            self.last_motion_tick = None;
-        }
+    pub(crate) fn is_open(&self) -> bool {
+        self.open
     }
-}
-
-pub(crate) fn settings_view(state: &mut SettingsFeature) -> Box<AnyWidgetView<SettingsFeature>> {
-    let progress = state.motion.value.clamp(0.0, 1.0);
-    let layer: Box<AnyWidgetView<SettingsFeature>> = if state.motion.is_visible() {
-        view::settings_overlay(state, progress).boxed()
-    } else {
-        sized_box(label("")).width(0.px()).height(0.px()).boxed()
-    };
-    fork(
-        layer,
-        state.motion.is_animating().then(|| {
-            task(
-                |proxy| async move {
-                    let mut interval = xilem::tokio::time::interval(MOTION_FRAME_INTERVAL);
-                    interval.set_missed_tick_behavior(xilem::tokio::time::MissedTickBehavior::Skip);
-                    loop {
-                        interval.tick().await;
-                        if proxy.message(Instant::now()).is_err() {
-                            break;
-                        }
-                    }
-                },
-                |state: &mut SettingsFeature, now| state.advance_motion(now),
-            )
-        }),
-    )
-    .boxed()
 }
 
 fn persist_settings(
@@ -259,130 +206,10 @@ fn persist_settings(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SettingsTab {
     #[default]
-    General,
     Reading,
     Font,
-    Cloud,
     Ai,
     AiChat,
     Translation,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FontPickerKind {
-    Cjk,
-    Serif,
-    SansSerif,
-    Monospace,
-}
-
-impl FontPickerKind {
-    const fn title(self, language: AppLanguage) -> &'static str {
-        match self {
-            Self::Cjk => language.text("中文字体", "CJK font"),
-            Self::Serif => language.text("衬线字体", "Serif font"),
-            Self::SansSerif => language.text("无衬线字体", "Sans-serif font"),
-            Self::Monospace => language.text("等宽字体", "Monospace font"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Motion {
-    value: f32,
-    start: f32,
-    target: f32,
-    elapsed: Duration,
-}
-
-impl Motion {
-    const fn settled(value: f32) -> Self {
-        Self {
-            value,
-            start: value,
-            target: value,
-            elapsed: Duration::ZERO,
-        }
-    }
-
-    fn animate_to(&mut self, target: f32) -> bool {
-        if (self.target - target).abs() <= MOTION_EPSILON {
-            return false;
-        }
-        self.start = self.value;
-        self.target = target;
-        self.elapsed = Duration::ZERO;
-        true
-    }
-
-    fn advance(&mut self, delta: Duration) {
-        if !self.is_animating() {
-            return;
-        }
-        self.elapsed = self.elapsed.saturating_add(delta);
-        let progress = (self.elapsed.as_secs_f32() / MOTION_DURATION.as_secs_f32()).min(1.0);
-        let eased = if self.target < self.start {
-            progress.powi(2)
-        } else {
-            1.0 - (1.0 - progress).powi(3)
-        };
-        self.value = self.start + (self.target - self.start) * eased;
-        if progress >= 1.0 {
-            self.value = self.target;
-            self.start = self.target;
-            self.elapsed = Duration::ZERO;
-        }
-    }
-
-    fn is_animating(self) -> bool {
-        (self.value - self.target).abs() > MOTION_EPSILON
-    }
-
-    fn is_visible(self) -> bool {
-        self.value > MOTION_EPSILON
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::view::font_candidates;
-    use super::*;
-
-    #[test]
-    fn settings_motion_keeps_the_layer_alive_during_exit() {
-        let mut motion = Motion::settled(1.0);
-        motion.animate_to(0.0);
-        motion.advance(MOTION_DURATION / 2);
-        assert!(motion.is_visible());
-        assert!(motion.is_animating());
-        motion.advance(MOTION_DURATION / 2);
-        assert!(!motion.is_visible());
-    }
-
-    #[test]
-    fn cjk_font_candidates_keep_reader_defaults_and_filter_latin_families() {
-        let available: Arc<[String]> = [
-            "Arial".to_owned(),
-            "LXGW WenKai".to_owned(),
-            "Microsoft YaHei UI".to_owned(),
-        ]
-        .into();
-
-        let candidates = font_candidates(FontPickerKind::Cjk, &available);
-
-        assert_eq!(candidates[0], "LXGW WenKai GB Screen");
-        assert_eq!(
-            candidates
-                .iter()
-                .filter(|family| family.as_str() == "LXGW WenKai")
-                .count(),
-            1
-        );
-        assert!(
-            candidates
-                .iter()
-                .any(|family| family == "Microsoft YaHei UI")
-        );
-        assert!(!candidates.iter().any(|family| family == "Arial"));
-    }
+    Cloud,
 }

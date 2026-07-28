@@ -1,7 +1,6 @@
 use rebook_layout::LayoutViewport;
 use rebook_publication::PublicationUrl;
 use rebook_reader::ReaderSnapshot;
-use xilem::masonry::kurbo::Size;
 
 use super::{
     DesktopReader, FollowUp, MarkRetention, ProgressChange, SceneChange, SnapshotEffects,
@@ -19,13 +18,13 @@ impl DesktopReader {
         }
     }
 
-    pub(in crate::reader) fn resize_canvas(&mut self, size: Size) {
-        let width = logical_dimension(size.width);
-        let height = logical_dimension(size.height);
+    pub(in crate::reader) fn resize_canvas(&mut self, width: f64, height: f64) {
+        let width = logical_dimension(width);
+        let height = logical_dimension(height);
         if width == 0 || height == 0 || self.canvas_size == Some((width, height)) {
             return;
         }
-        if self.ui.sidebar_motion.is_animating() {
+        if self.ui.sidebar_motion.is_animating() || self.ui.assistant_motion.is_animating() {
             return;
         }
         let Ok(viewport) = LayoutViewport::new(width, height) else {
@@ -93,7 +92,7 @@ impl DesktopReader {
             self.prefetch();
         }
         if matches!(effects.translation, FollowUp::Run) {
-            self.queue_current_section_translation();
+            self.queue_visible_section_translation();
         }
     }
 

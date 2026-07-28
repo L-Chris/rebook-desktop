@@ -12,7 +12,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -26,6 +26,11 @@ atomicwrites = "0.4.4"
 base64 = "0.22.1"
 crc32fast = "1.5.0"
 directories = "6.0.0"
+egui = "0.35.0"
+egui_commonmark = { version = "0.24.0", features = ["embedded_image", "fetch", "svg"] }
+egui_extras = { version = "0.35.0", features = ["http", "image", "svg"] }
+egui-wgpu = { version = "0.35.0", default-features = false }
+egui-winit = { version = "0.35.0", default-features = false, features = ["clipboard", "links"] }
 encoding_rs = "0.8.35"
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 hayro = "0.7.1"
@@ -34,9 +39,13 @@ image = { version = "=0.25.6", default-features = false, features = ["bmp", "gif
 kurbo = "0.13.1"
 lucide-icons = "1.25.0"
 lopdf = { version = "0.44.0", default-features = false }
+markie = "0.3.0"
+mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 parley = { version = "0.10.0", features = ["complex-scripts"] }
 peniko = "0.6.1"
 percent-encoding = "2.3.2"
+pollster = "0.4.0"
+pulldown-cmark = "0.13.0"
 quick-xml = { version = "0.41.0", features = ["encoding"] }
 regex = "1.12.2"
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
@@ -48,9 +57,11 @@ serde_json = "1.0.151"
 sha2 = "0.10.9"
 thiserror = "2.0.19"
 tracing = "0.1.44"
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "time"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
-winit = "0.31.0-beta.2"
-xilem = "=0.4.0"
+vello = "0.9.0"
+wgpu = "29.0.3"
+winit = "0.30.13"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 keyring = { version = "4.1.5", default-features = false, features = ["v1"] }
 

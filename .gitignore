@@ -2,3 +2,4 @@
 *.epub
 *.profraw
 .DS_Store
+watchexec-preview*.log

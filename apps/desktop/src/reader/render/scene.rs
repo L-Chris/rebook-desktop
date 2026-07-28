@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
+use peniko::Color;
 use rebook_formats::BookFormat;
 use rebook_renderer::PageDisplayList;
-use xilem::Color;
-use xilem::masonry::vello::Scene;
+use vello::Scene;
 
 use super::super::DesktopReader;
-use super::vello::XilemVelloScene;
+use super::vello::VelloScene;
 
 const PAGE_SCENE_CACHE_CAPACITY: usize = 32;
 const PDF_PAGE_SCENE_CACHE_CAPACITY: usize = 4;
 const ANNOTATION_MARK_COLOR: Color = Color::from_rgba8(96, 165, 250, 72);
-const TEXT_SELECTION_COLOR: Color = Color::from_rgba8(96, 165, 250, 89);
+const TEXT_SELECTION_COLOR: Color = Color::from_rgba8(68, 137, 103, 72);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PageSceneKey {
@@ -26,13 +26,13 @@ pub(crate) struct PageSceneLayers {
 }
 
 impl DesktopReader {
-    pub(in crate::reader) fn page_scene(&mut self) -> Arc<Scene> {
+    pub(crate) fn page_scene(&mut self) -> Arc<Scene> {
         let layers = self.page_scene_layers();
         let mut scene = Scene::new();
         scene.append(&layers.underlay, None);
         match self.reader.current_spread() {
             Ok(spread) => {
-                let mut bridge = XilemVelloScene::new(&mut scene);
+                let mut bridge = VelloScene::new(&mut scene);
                 self.paint_page_overlays(&spread.primary, &mut bridge, 0.0);
                 if let Some(secondary) = spread.secondary {
                     self.paint_page_overlays(&secondary, &mut bridge, spread.secondary_offset_x);
@@ -59,14 +59,14 @@ impl DesktopReader {
         let mut content = Scene::new();
         match self.reader.current_spread() {
             Ok(spread) => {
-                let mut underlay_bridge = XilemVelloScene::new(&mut underlay);
+                let mut underlay_bridge = VelloScene::new(&mut underlay);
                 spread.primary.paint_background(&mut underlay_bridge);
                 spread.primary.paint_images_at(&mut underlay_bridge, 0.0);
                 if let Some(secondary) = &spread.secondary {
                     secondary.paint_images_at(&mut underlay_bridge, spread.secondary_offset_x);
                 }
 
-                let mut content_bridge = XilemVelloScene::new(&mut content);
+                let mut content_bridge = VelloScene::new(&mut content);
                 spread
                     .primary
                     .paint_non_image_content_at(&mut content_bridge, 0.0);
@@ -79,7 +79,7 @@ impl DesktopReader {
                 self.error = Some(format!("组合双页失败：{error}"));
                 self.reader
                     .current_page()
-                    .paint(&mut XilemVelloScene::new(&mut underlay));
+                    .paint(&mut VelloScene::new(&mut underlay));
             }
         }
         let layers = Arc::new(PageSceneLayers {
@@ -106,7 +106,7 @@ impl DesktopReader {
     fn paint_page_overlays(
         &self,
         page: &PageDisplayList,
-        scene: &mut XilemVelloScene<'_>,
+        scene: &mut VelloScene<'_>,
         offset_x: f32,
     ) {
         for highlight in &self.highlights {

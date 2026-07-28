@@ -1,21 +1,11 @@
-mod width_probe;
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use egui::{Color32, RichText, TextureHandle, Vec2};
 use lucide_icons::Icon;
-use xilem::core::fork;
-use xilem::masonry::peniko::{Blob, ImageData};
-use xilem::masonry::properties::LineBreaking;
-use xilem::masonry::properties::types::{AsUnit, UnitPoint};
-use xilem::style::{Padding, Style};
-use xilem::view::{
-    CrossAxisAlignment, FlexExt, FlexSpacer, ObjectFit, ZStackExt, flex_col, flex_row, image,
-    label, portal, prose, sized_box, task, task_raw, text_input, zstack,
-};
-use xilem::{Affine, AnyWidgetView, Color, FontWeight, WidgetView};
+use peniko::Blob;
 
 use crate::async_task::{TaskResult, TaskSlot};
 use crate::library::{LibraryBook, LocalLibrary};
@@ -24,20 +14,15 @@ use crate::reader::{BookDisplayMetadata, DesktopReader, open_reader};
 use crate::settings::AppliedSettings;
 use crate::sync::{LocalSyncBook, SyncReport, SyncSettings, SyncStore, run_sync};
 use crate::ui::{
-    NOTICE_WIDTH, NoticeTone, UI_ACCENT, UI_ACCENT_BORDER, UI_ACCENT_SOFT, UI_BACKGROUND,
-    UI_BORDER, UI_MUTED, UI_SURFACE, UI_SURFACE_MUTED, UI_TEXT, UI_TEXT_SOFT, button,
-    confirmation_dialog, decode_image, divider, ellipsize_display_text, icon_label, notice_card,
+    ACCENT, ACCENT_SOFT, BACKGROUND, BORDER, MUTED, SURFACE, SURFACE_MUTED, TEXT,
+    decode_color_image, icon, icon_button,
 };
-use width_probe::shelf_width_probe;
 
-const SHELF_CARD_WIDTH: f64 = 144.0;
-const SHELF_COVER_HEIGHT: f64 = 216.0;
-const SHELF_CARD_GAP: f64 = 24.0;
-const SHELF_ROW_GAP: f64 = 28.0;
-const SHELF_TITLE_MAX_DISPLAY_UNITS: usize = 18;
-const INITIAL_SHELF_GRID_WIDTH: f64 = 1144.0;
 const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
-const NOTICE_TIMER_INTERVAL: Duration = Duration::from_millis(100);
+const CARD_WIDTH: f32 = 180.0;
+const CARD_HEIGHT: f32 = 318.0;
+const COVER_WIDTH: f32 = 160.0;
+const COVER_HEIGHT: f32 = 228.0;
 
 pub(crate) struct ShelfFeature {
     shelf: ShelfState,
@@ -47,12 +32,11 @@ pub(crate) struct ShelfFeature {
     sync: SyncUiState,
     language: AppLanguage,
     settings_requested: bool,
+    cover_textures: HashMap<String, TextureHandle>,
 }
 
 struct ShelfState {
     library: LocalLibrary,
-    covers: HashMap<String, ImageData>,
-    grid_width: f64,
     query: String,
     notice: Option<String>,
     notice_dismiss_at: Option<Instant>,
@@ -68,13 +52,13 @@ struct SyncUiState {
 }
 
 #[derive(Clone)]
-struct SyncTask {
-    settings: SyncSettings,
-    password: String,
-    books: Vec<LocalSyncBook>,
+pub(crate) struct SyncTask {
+    pub(crate) settings: SyncSettings,
+    pub(crate) password: String,
+    pub(crate) books: Vec<LocalSyncBook>,
 }
 
-type SyncTaskMessage = TaskResult<SyncReport>;
+pub(crate) type SyncTaskMessage = TaskResult<SyncReport>;
 
 #[derive(Clone, Debug)]
 struct ShelfRemoveConfirmation {
@@ -84,38 +68,50 @@ struct ShelfRemoveConfirmation {
 
 impl ShelfFeature {
     pub(crate) fn new(library: LocalLibrary, reader_fonts: Arc<[Blob<u8>]>) -> Self {
-        let (language, language_error) = match preferences::load_app_language() {
-            Ok(language) => (language, None),
-            Err(error) => (
-                AppLanguage::default(),
-                Some(format!("加载通用设置失败：{error}")),
-            ),
-        };
-        let (settings, settings_error) = match SyncSettings::load_default() {
-            Ok(settings) => (settings, None),
-            Err(error) => (
-                SyncSettings::new_device(),
-                Some(format!("加载 WebDAV 同步设置失败：{error}")),
-            ),
-        };
-        let (password, password_error) = match settings.load_password() {
-            Ok(password) => (password, None),
-            Err(error) => (
-                String::new(),
-                Some(format!("读取 Windows 凭据失败：{error}")),
-            ),
-        };
-        let (local_store, store_error) = match SyncStore::open_default(settings.device_id.clone()) {
-            Ok(store) => (Some(store), None),
-            Err(error) => (None, Some(format!("打开本地阅读数据库失败：{error}"))),
-        };
-        let mut shelf = ShelfState::new(library);
-        shelf.error = language_error
-            .or(settings_error)
-            .or(password_error)
-            .or(store_error);
+        let (language, language_error) = preferences::load_app_language().map_or_else(
+            |error| {
+                (
+                    AppLanguage::default(),
+                    Some(format!("加载通用设置失败：{error}")),
+                )
+            },
+            |language| (language, None),
+        );
+        let (settings, settings_error) = SyncSettings::load_default().map_or_else(
+            |error| {
+                (
+                    SyncSettings::new_device(),
+                    Some(format!("加载 WebDAV 同步设置失败：{error}")),
+                )
+            },
+            |settings| (settings, None),
+        );
+        let (password, password_error) = settings.load_password().map_or_else(
+            |error| {
+                (
+                    String::new(),
+                    Some(format!("读取 Windows 凭据失败：{error}")),
+                )
+            },
+            |password| (password, None),
+        );
+        let (local_store, store_error) = SyncStore::open_default(settings.device_id.clone())
+            .map_or_else(
+                |error| (None, Some(format!("打开本地阅读数据库失败：{error}"))),
+                |store| (Some(store), None),
+            );
         Self {
-            shelf,
+            shelf: ShelfState {
+                library,
+                query: String::new(),
+                notice: None,
+                notice_dismiss_at: None,
+                error: language_error
+                    .or(settings_error)
+                    .or(password_error)
+                    .or(store_error),
+                remove_confirmation: None,
+            },
             pending_reader: None,
             reader_fonts,
             local_store,
@@ -127,6 +123,7 @@ impl ShelfFeature {
             },
             language,
             settings_requested: false,
+            cover_textures: HashMap::new(),
         }
     }
 
@@ -142,19 +139,14 @@ impl ShelfFeature {
             );
             return;
         };
-        let shelf_metadata = self
+        let metadata = self
             .shelf
             .library
             .books()
             .iter()
             .find(|book| book.path.as_path() == path)
             .map(BookDisplayMetadata::from);
-        match open_reader(
-            path,
-            Arc::clone(&self.reader_fonts),
-            shelf_metadata,
-            local_store,
-        ) {
+        match open_reader(path, Arc::clone(&self.reader_fonts), metadata, local_store) {
             Ok(reader) => {
                 self.pending_reader = Some(reader);
                 self.shelf.error = None;
@@ -172,32 +164,28 @@ impl ShelfFeature {
         self.shelf.error = None;
         match self.shelf.library.import_files(paths) {
             Ok(summary) => {
-                self.shelf.refresh_covers();
-                self.shelf.show_notice(
-                    match (self.language, summary.imported, summary.duplicates) {
-                        (AppLanguage::SimplifiedChinese, 0, duplicates) => {
-                            format!("所选的 {duplicates} 本书已在书架中")
-                        }
-                        (AppLanguage::SimplifiedChinese, imported, 0) => {
-                            format!("已导入 {imported} 本书")
-                        }
-                        (AppLanguage::SimplifiedChinese, imported, duplicates) => {
-                            format!("已导入 {imported} 本书，跳过 {duplicates} 本重复书籍")
-                        }
-                        (AppLanguage::English, 0, duplicates) => {
-                            format!("All {duplicates} selected books are already on the shelf")
-                        }
-                        (AppLanguage::English, imported, 0) => {
-                            format!("Imported {imported} books")
-                        }
-                        (AppLanguage::English, imported, duplicates) => {
-                            format!("Imported {imported} books and skipped {duplicates} duplicates")
-                        }
-                    },
-                );
+                self.cover_textures.clear();
+                let message = match (self.language, summary.imported, summary.duplicates) {
+                    (AppLanguage::SimplifiedChinese, 0, duplicate) => {
+                        format!("所选的 {duplicate} 本书已在书架中")
+                    }
+                    (AppLanguage::SimplifiedChinese, imported, 0) => {
+                        format!("已导入 {imported} 本书")
+                    }
+                    (AppLanguage::SimplifiedChinese, imported, duplicate) => {
+                        format!("已导入 {imported} 本书，跳过 {duplicate} 本重复书籍")
+                    }
+                    (AppLanguage::English, 0, duplicate) => {
+                        format!("All {duplicate} selected books are already on the shelf")
+                    }
+                    (AppLanguage::English, imported, 0) => format!("Imported {imported} books"),
+                    (AppLanguage::English, imported, duplicate) => {
+                        format!("Imported {imported} books and skipped {duplicate} duplicates")
+                    }
+                };
+                self.show_notice(message);
             }
             Err(error) => {
-                self.shelf.clear_notice();
                 self.shelf.error = Some(format!(
                     "{}: {error}",
                     self.language.text("导入失败", "Import failed")
@@ -214,8 +202,8 @@ impl ShelfFeature {
                 {
                     tracing::warn!(%error, "failed to persist local book removal tombstone");
                 }
-                self.shelf.covers.remove(id);
-                self.shelf.show_notice(
+                self.cover_textures.remove(id);
+                self.show_notice(
                     self.language
                         .text("已从本地书架移除", "Removed from the local shelf")
                         .into(),
@@ -241,23 +229,8 @@ impl ShelfFeature {
         }
     }
 
-    fn request_remove_book(&mut self, id: String, title: String) {
-        self.shelf.remove_confirmation = Some(ShelfRemoveConfirmation { id, title });
-    }
-
-    fn cancel_remove_book(&mut self) {
-        self.shelf.remove_confirmation = None;
-    }
-
-    fn confirm_remove_book(&mut self) {
-        let Some(confirmation) = self.shelf.remove_confirmation.take() else {
-            return;
-        };
-        self.remove_book(&confirmation.id);
-    }
-
-    fn request_settings(&mut self) {
-        self.settings_requested = true;
+    pub(crate) fn take_opened_reader(&mut self) -> Option<DesktopReader> {
+        self.pending_reader.take()
     }
 
     pub(crate) fn take_settings_request(&mut self) -> bool {
@@ -268,6 +241,13 @@ impl ShelfFeature {
         self.language = settings.language;
         self.sync.settings.clone_from(&settings.sync_settings);
         self.sync.password.clone_from(&settings.sync_password);
+        self.start_sync();
+    }
+
+    pub(crate) fn resume(&mut self) {
+        if let Ok(language) = preferences::load_app_language() {
+            self.language = language;
+        }
         self.start_sync();
     }
 
@@ -316,10 +296,31 @@ impl ShelfFeature {
                 })
                 .collect(),
         });
-        self.shelf.error = None;
     }
 
-    fn complete_sync(&mut self, message: SyncTaskMessage) {
+    pub(crate) fn spawn_pending_tasks(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        proxy: &winit::event_loop::EventLoopProxy<crate::platform::UserEvent>,
+    ) {
+        let Some(request) = self.sync.task.take_pending() else {
+            return;
+        };
+        let proxy = proxy.clone();
+        runtime.spawn(async move {
+            let id = request.id;
+            let payload = request.payload;
+            let result = run_sync(payload.settings, payload.password, payload.books)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = proxy.send_event(crate::platform::UserEvent::ShelfSync(SyncTaskMessage {
+                id,
+                result,
+            }));
+        });
+    }
+
+    pub(crate) fn complete_sync(&mut self, message: SyncTaskMessage) {
         if self.sync.task.complete(message.id).is_none() {
             return;
         }
@@ -331,39 +332,24 @@ impl ShelfFeature {
                         Ok(true) => imported += 1,
                         Ok(false) => {}
                         Err(error) => {
-                            self.shelf.error = Some(format!(
-                                "{}: {error}",
-                                self.language
-                                    .text("导入同步书籍失败", "Failed to import a synced book")
-                            ));
+                            self.shelf.error = Some(error.to_string());
                             return;
                         }
                     }
                 }
                 if imported > 0 {
-                    self.shelf.refresh_covers();
+                    self.cover_textures.clear();
                 }
-                self.sync.status = match self.language {
-                    AppLanguage::SimplifiedChinese => format!(
-                        "同步完成：上传 {} 本，下载 {} 本，更新 {} 条进度，合并 {} 条批注",
-                        report.uploaded_books,
-                        imported,
-                        report.updated_progress,
-                        report.merged_annotations
-                    ),
-                    AppLanguage::English => format!(
-                        "Sync complete: {} uploaded, {} downloaded, {} progress updates, {} annotations merged",
-                        report.uploaded_books,
-                        imported,
-                        report.updated_progress,
-                        report.merged_annotations
-                    ),
-                };
-                self.shelf.show_notice(self.sync.status.clone());
-                self.shelf.error = None;
+                self.sync.status = format!(
+                    "{} · ↑{} ↓{} · {}",
+                    self.language.text("同步完成", "Sync complete"),
+                    report.uploaded_books,
+                    imported,
+                    report.updated_progress,
+                );
+                self.show_notice(self.sync.status.clone());
             }
             Err(error) => {
-                self.sync.status.clear();
                 self.shelf.error = Some(format!(
                     "{}: {error}",
                     self.language.text("WebDAV 同步失败", "WebDAV sync failed")
@@ -371,707 +357,376 @@ impl ShelfFeature {
             }
         }
     }
-    pub(crate) fn take_opened_reader(&mut self) -> Option<DesktopReader> {
-        self.pending_reader.take()
+
+    pub(crate) fn ui(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = root_ui.ctx().clone();
+        self.dismiss_notice_if_due();
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(BACKGROUND)
+                    .inner_margin(egui::Margin::symmetric(36, 28)),
+            )
+            .show(root_ui, |ui| {
+                self.shelf_header(ui);
+                ui.add_space(26.0);
+
+                let query = self.shelf.query.trim().to_lowercase();
+                let books: Vec<LibraryBook> = self
+                    .shelf
+                    .library
+                    .books()
+                    .iter()
+                    .filter(|book| book_matches_query(book, &query))
+                    .cloned()
+                    .collect();
+                if books.is_empty() {
+                    self.empty_shelf(ui, query.is_empty());
+                } else {
+                    egui::ScrollArea::vertical().show(ui, |ui| self.book_grid(ui, &books));
+                }
+            });
+        self.dialogs(&ctx);
     }
 
-    pub(crate) fn resume(&mut self) {
-        match preferences::load_app_language() {
-            Ok(language) => self.language = language,
-            Err(error) => {
-                self.shelf.error = Some(format!(
-                    "{}: {error}",
+    fn shelf_header(&mut self, ui: &mut egui::Ui) {
+        let book_count = self.shelf.library.books().len();
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 44.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(icon(Icon::BookOpen).size(23.0).color(ACCENT));
+                ui.label(
+                    RichText::new(self.language.text("书架", "Library"))
+                        .size(22.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.label(
+                    RichText::new(match self.language {
+                        AppLanguage::SimplifiedChinese => format!("{book_count} 本"),
+                        AppLanguage::English => format!("{book_count} books"),
+                    })
+                    .size(12.0)
+                    .color(MUTED),
+                );
+                ui.add_space(22.0);
+                shelf_search_field(
+                    ui,
+                    &mut self.shelf.query,
                     self.language
-                        .text("加载通用设置失败", "Failed to load general settings")
-                ));
-            }
-        }
-        match SyncSettings::load_default() {
-            Ok(settings) => match settings.load_password() {
-                Ok(password) => {
-                    self.sync.settings = settings;
-                    self.sync.password = password;
-                }
-                Err(error) => {
-                    self.shelf.error = Some(format!(
-                        "{}: {error}",
-                        self.language.text(
-                            "读取 Windows 凭据失败",
-                            "Failed to read the Windows credential"
-                        )
-                    ));
-                }
+                        .text("搜索书名或作者", "Search title or author"),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Settings)
+                        .on_hover_text(self.language.text("设置", "Settings"))
+                        .clicked()
+                    {
+                        self.settings_requested = true;
+                    }
+                    if shelf_import_button(ui, self.language.text("导入", "Import")).clicked()
+                        && let Some(paths) = rfd::FileDialog::new()
+                            .add_filter(
+                                "E-books",
+                                &["epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "pdf"],
+                            )
+                            .pick_files()
+                    {
+                        self.import_books(&paths);
+                    }
+                });
             },
-            Err(error) => {
-                self.shelf.error = Some(format!(
-                    "{}: {error}",
-                    self.language.text(
-                        "加载 WebDAV 同步设置失败",
-                        "Failed to load WebDAV sync settings"
-                    )
-                ));
-            }
+        );
+    }
+
+    fn empty_shelf(&mut self, ui: &mut egui::Ui, no_books: bool) {
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 280.0),
+            egui::Layout::centered_and_justified(egui::Direction::TopDown),
+            |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(icon(Icon::BookOpen).size(30.0).color(MUTED));
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(if no_books {
+                            self.language.text("书架还是空的", "Your library is empty")
+                        } else {
+                            self.language.text("没有匹配的书籍", "No matching books")
+                        })
+                        .size(16.0)
+                        .strong()
+                        .color(TEXT),
+                    );
+                    if no_books {
+                        ui.label(
+                            RichText::new(self.language.text(
+                                "导入 EPUB、MOBI、PDF 等文件开始阅读",
+                                "Import EPUB, MOBI, PDF, and other books to begin",
+                            ))
+                            .size(12.0)
+                            .color(MUTED),
+                        );
+                    }
+                });
+            },
+        );
+    }
+
+    fn book_grid(&mut self, ui: &mut egui::Ui, books: &[LibraryBook]) {
+        let mut columns = 1_usize;
+        let mut occupied = CARD_WIDTH;
+        while occupied + 20.0 + CARD_WIDTH <= ui.available_width() {
+            columns += 1;
+            occupied += 20.0 + CARD_WIDTH;
         }
-        self.start_sync();
-    }
-}
-
-impl ShelfState {
-    fn new(library: LocalLibrary) -> Self {
-        let mut state = Self {
-            library,
-            covers: HashMap::new(),
-            grid_width: INITIAL_SHELF_GRID_WIDTH,
-            query: String::new(),
-            notice: None,
-            notice_dismiss_at: None,
-            error: None,
-            remove_confirmation: None,
-        };
-        state.refresh_covers();
-        state
+        egui::Grid::new("shelf-grid")
+            .num_columns(columns)
+            .spacing(Vec2::new(20.0, 24.0))
+            .show(ui, |ui| {
+                for (index, book) in books.iter().enumerate() {
+                    self.book_card(ui, book);
+                    if (index + 1) % columns == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
     }
 
-    fn refresh_covers(&mut self) {
-        self.covers = self
-            .library
-            .books()
-            .iter()
-            .filter_map(|book| {
-                book.cover_bytes
-                    .as_deref()
-                    .and_then(|bytes| decode_image(bytes).ok())
-                    .map(|cover| (book.id.clone(), cover))
-            })
-            .collect();
+    fn book_card(&mut self, ui: &mut egui::Ui, book: &LibraryBook) {
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(CARD_WIDTH, CARD_HEIGHT), egui::Sense::click());
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let texture = self.cover_texture(ui.ctx(), book);
+        let painter = ui.painter();
+        painter.rect_filled(
+            rect,
+            10.0,
+            if response.hovered() {
+                ACCENT_SOFT.gamma_multiply(0.42)
+            } else {
+                SURFACE
+            },
+        );
+        let cover_rect = egui::Rect::from_min_size(
+            rect.min + Vec2::splat(10.0),
+            Vec2::new(COVER_WIDTH, COVER_HEIGHT),
+        );
+        painter.rect_filled(cover_rect, 6.0, SURFACE_MUTED);
+        if let Some(texture) = texture {
+            let image_rect = contain_rect(cover_rect, texture.size_vec2());
+            painter.image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            painter.text(
+                cover_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                Icon::BookOpen.unicode(),
+                egui::FontId::new(24.0, egui::FontFamily::Name("lucide".into())),
+                MUTED,
+            );
+        }
+
+        let title_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 12.0, cover_rect.bottom() + 12.0),
+            Vec2::new(CARD_WIDTH - 24.0, 42.0),
+        );
+        let title = painter.layout(
+            book.title.clone(),
+            egui::FontId::proportional(14.0),
+            TEXT,
+            title_rect.width(),
+        );
+        painter
+            .with_clip_rect(title_rect)
+            .galley(title_rect.min, title, TEXT);
+
+        let authors = book.authors.join(" / ");
+        if !authors.is_empty() {
+            let author_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 12.0, title_rect.bottom() + 4.0),
+                Vec2::new(CARD_WIDTH - 24.0, 20.0),
+            );
+            let author = painter.layout_no_wrap(authors, egui::FontId::proportional(12.0), MUTED);
+            painter
+                .with_clip_rect(author_rect)
+                .galley(author_rect.min, author, MUTED);
+        }
+
+        if response.clicked() {
+            self.open_book(&book.path);
+        }
+        response.context_menu(|ui| {
+            if ui
+                .button(self.language.text("从书架移除", "Remove from library"))
+                .clicked()
+            {
+                self.shelf.remove_confirmation = Some(ShelfRemoveConfirmation {
+                    id: book.id.clone(),
+                    title: book.title.clone(),
+                });
+                ui.close();
+            }
+        });
+        response.on_hover_text(&book.title);
+    }
+
+    fn cover_texture(&mut self, ctx: &egui::Context, book: &LibraryBook) -> Option<TextureHandle> {
+        if let Some(texture) = self.cover_textures.get(&book.id) {
+            return Some(texture.clone());
+        }
+        let image = decode_color_image(book.cover_bytes.as_deref()?).ok()?;
+        let texture = ctx.load_texture(
+            format!("cover:{}", book.id),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.cover_textures.insert(book.id.clone(), texture.clone());
+        Some(texture)
+    }
+
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(error) = &self.shelf.error {
+            egui::Area::new("shelf-error".into())
+                .anchor(egui::Align2::RIGHT_TOP, [-24.0, 24.0])
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .fill(Color32::from_rgb(69, 32, 32))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(error).color(Color32::WHITE));
+                        });
+                });
+        } else if let Some(notice) = &self.shelf.notice {
+            egui::Area::new("shelf-notice".into())
+                .anchor(egui::Align2::RIGHT_TOP, [-24.0, 24.0])
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).fill(ACCENT).show(ui, |ui| {
+                        ui.label(RichText::new(notice).color(Color32::WHITE));
+                    });
+                });
+        }
+        let confirmation = self.shelf.remove_confirmation.clone();
+        if let Some(confirmation) = confirmation {
+            egui::Window::new(self.language.text("移除书籍", "Remove book"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "{}\n{}",
+                        self.language
+                            .text("只会移除本地副本。", "Only the local copy will be removed."),
+                        confirmation.title
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button(self.language.text("取消", "Cancel")).clicked() {
+                            self.shelf.remove_confirmation = None;
+                        }
+                        if ui.button(self.language.text("移除", "Remove")).clicked() {
+                            self.shelf.remove_confirmation = None;
+                            self.remove_book(&confirmation.id);
+                        }
+                    });
+                });
+        }
     }
 
     fn show_notice(&mut self, message: String) {
-        self.notice = Some(message);
-        self.notice_dismiss_at = Some(Instant::now() + NOTICE_AUTO_DISMISS_DELAY);
+        self.shelf.notice = Some(message);
+        self.shelf.notice_dismiss_at = Some(Instant::now() + NOTICE_AUTO_DISMISS_DELAY);
     }
 
-    fn clear_notice(&mut self) {
-        self.notice = None;
-        self.notice_dismiss_at = None;
-    }
-
-    fn dismiss_notice_if_due(&mut self, now: Instant) {
-        if notice_is_due(self.notice_dismiss_at, now) {
-            self.clear_notice();
+    fn dismiss_notice_if_due(&mut self) {
+        if self
+            .shelf
+            .notice_dismiss_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.shelf.notice = None;
+            self.shelf.notice_dismiss_at = None;
         }
     }
 }
 
-fn notice_is_due(deadline: Option<Instant>, now: Instant) -> bool {
-    deadline.is_some_and(|deadline| now >= deadline)
+fn shelf_search_field(ui: &mut egui::Ui, query: &mut String, hint: &str) {
+    let width = ui.available_width().clamp(180.0, 320.0);
+    egui::Frame::new()
+        .fill(SURFACE)
+        .stroke(egui::Stroke::new(1.0, BORDER))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.set_width(width - 22.0);
+            ui.horizontal_centered(|ui| {
+                ui.label(icon(Icon::Search).size(15.0).color(MUTED));
+                ui.add(
+                    egui::TextEdit::singleline(query)
+                        .hint_text(hint)
+                        .desired_width(ui.available_width())
+                        .frame(egui::Frame::NONE)
+                        .vertical_align(egui::Align::Center),
+                );
+            });
+        });
 }
 
-pub(crate) fn view(state: &mut ShelfFeature) -> Box<AnyWidgetView<ShelfFeature>> {
-    shelf_app_view(state).boxed()
-}
-
-fn shelf_app_view(state: &mut ShelfFeature) -> impl WidgetView<ShelfFeature> + use<> {
-    let pending = state.sync.task.pending.clone();
-    let auto_sync = state.sync.settings.enabled;
-    let interval = Duration::from_secs(u64::from(state.sync.settings.interval_minutes.max(1)) * 60);
-    let view = fork(
-        shelf_view(state),
-        pending.map(|request| {
-            task_raw(
-                move |proxy| {
-                    let request = request.clone();
-                    async move {
-                        let id = request.id;
-                        let payload = request.payload;
-                        let result = run_sync(payload.settings, payload.password, payload.books)
-                            .await
-                            .map_err(|error| error.to_string());
-                        let _ = proxy.message(SyncTaskMessage { id, result });
-                    }
-                },
-                ShelfFeature::complete_sync,
-            )
-        }),
+fn shelf_import_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(80.0, 36.0), egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let fill = if response.is_pointer_button_down_on() {
+        ACCENT.gamma_multiply(0.84)
+    } else if response.hovered() {
+        ACCENT.gamma_multiply(0.92)
+    } else {
+        ACCENT
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 8.0, fill);
+    let icon_font = egui::FontId::new(15.0, egui::FontFamily::Name("lucide".into()));
+    let text_font = egui::FontId::proportional(13.0);
+    let icon_galley =
+        painter.layout_no_wrap(Icon::Plus.unicode().into(), icon_font, Color32::WHITE);
+    let text_galley = painter.layout_no_wrap(label.into(), text_font, Color32::WHITE);
+    let gap = 6.0;
+    let content_width = icon_galley.size().x + gap + text_galley.size().x;
+    let start_x = rect.center().x - content_width / 2.0;
+    painter.galley(
+        egui::pos2(start_x, rect.center().y - icon_galley.size().y / 2.0),
+        icon_galley,
+        Color32::WHITE,
     );
-    let view = fork(
-        view,
-        state.shelf.notice_dismiss_at.map(|_| {
-            task(
-                |proxy| async move {
-                    let mut timer = xilem::tokio::time::interval(NOTICE_TIMER_INTERVAL);
-                    timer.set_missed_tick_behavior(xilem::tokio::time::MissedTickBehavior::Skip);
-                    loop {
-                        timer.tick().await;
-                        if proxy.message(Instant::now()).is_err() {
-                            break;
-                        }
-                    }
-                },
-                |state: &mut ShelfFeature, now| state.shelf.dismiss_notice_if_due(now),
-            )
-        }),
+    painter.galley(
+        egui::pos2(
+            start_x + content_width - text_galley.size().x,
+            rect.center().y - text_galley.size().y / 2.0,
+        ),
+        text_galley,
+        Color32::WHITE,
     );
-    fork(
-        view,
-        auto_sync.then(|| {
-            task_raw(
-                move |proxy| async move {
-                    let mut timer = xilem::tokio::time::interval(interval);
-                    timer.set_missed_tick_behavior(xilem::tokio::time::MissedTickBehavior::Skip);
-                    loop {
-                        timer.tick().await;
-                        if proxy.message(()).is_err() {
-                            break;
-                        }
-                    }
-                },
-                |state: &mut ShelfFeature, ()| state.start_sync(),
-            )
-        }),
-    )
+    response
 }
 
-fn shelf_view(state: &mut ShelfFeature) -> impl WidgetView<ShelfFeature> + use<> {
-    let query = state.shelf.query.trim().to_lowercase();
-    let books = state
-        .shelf
-        .library
-        .books()
-        .iter()
-        .filter(|book| book_matches_query(book, &query))
-        .cloned()
-        .collect::<Vec<_>>();
-    let book_count = state.shelf.library.books().len();
-    let feedback_layer = shelf_feedback_notice(state).alignment(UnitPoint::TOP_RIGHT);
-    let content: Box<AnyWidgetView<ShelfFeature>> = if books.is_empty() && !query.is_empty() {
-        sized_box(
-            flex_col((
-                FlexSpacer::Fixed(96.px()),
-                icon_label(Icon::Search, 30.0, UI_MUTED),
-                label(state.language.text("没有匹配的书籍", "No matching books"))
-                    .text_size(14.0)
-                    .color(UI_MUTED),
-            ))
-            .gap(14.px())
-            .cross_axis_alignment(CrossAxisAlignment::Center),
-        )
-        .expand_width()
-        .boxed()
-    } else {
-        shelf_grid(state, books, query.is_empty(), state.shelf.grid_width).boxed()
-    };
-
-    let shelf = sized_box(
-        flex_col((
-            shelf_toolbar(
-                state.shelf.query.clone(),
-                book_count,
-                state.sync.settings.enabled,
-                state.sync.task.is_pending(),
-                state.language,
-            ),
-            divider(),
-            portal(
-                sized_box(zstack((
-                    content.alignment(UnitPoint::TOP_LEFT),
-                    shelf_width_probe(|state: &mut ShelfFeature, width| {
-                        state.shelf.grid_width = width;
-                    }),
-                )))
-                .expand_width()
-                .padding(Padding::from_vh(24.0, 28.0)),
-            )
-            .flex(1.0),
-        ))
-        .cross_axis_alignment(CrossAxisAlignment::Fill),
-    )
-    .expand()
-    .background_color(UI_BACKGROUND);
-    let remove_dialog: Box<AnyWidgetView<ShelfFeature>> =
-        state.shelf.remove_confirmation.clone().map_or_else(
-            || sized_box(label("")).width(0.px()).height(0.px()).boxed(),
-            |confirmation| {
-                confirmation_dialog(
-                    state.language.text("从书架移除", "Remove from shelf"),
-                    match state.language {
-                        AppLanguage::SimplifiedChinese => format!(
-                            "确定要移除《{}》吗？本地书架中的副本将被删除。",
-                            confirmation.title
-                        ),
-                        AppLanguage::English => format!(
-                            "Remove “{}”? The local shelf copy will be deleted.",
-                            confirmation.title
-                        ),
-                    },
-                    state.language.text("取消", "Cancel"),
-                    state.language.text("移除", "Remove"),
-                    ShelfFeature::cancel_remove_book,
-                    ShelfFeature::confirm_remove_book,
-                )
-                .boxed()
-            },
-        );
-    sized_box(zstack((shelf, feedback_layer, remove_dialog))).expand()
-}
-
-fn shelf_feedback_notice(state: &ShelfFeature) -> Box<AnyWidgetView<ShelfFeature>> {
-    let content: Box<AnyWidgetView<ShelfFeature>> = if let Some(message) = &state.shelf.error {
-        notice_card(
-            NoticeTone::Error,
-            state.language.text("操作失败", "Operation failed"),
-            message.clone(),
-        )
-        .boxed()
-    } else if let Some(message) = &state.shelf.notice {
-        notice_card(
-            NoticeTone::Success,
-            state.language.text("操作完成", "Completed"),
-            message.clone(),
-        )
-        .boxed()
-    } else if state.sync.task.is_pending() {
-        notice_card(
-            NoticeTone::Info,
-            state.language.text("WebDAV 同步", "WebDAV sync"),
-            state.sync.status.clone(),
-        )
-        .boxed()
-    } else {
-        return sized_box(label("")).width(0.px()).height(0.px()).boxed();
-    };
-
-    sized_box(content)
-        .width(NOTICE_WIDTH.px())
-        .transform(Affine::translate((-16.0, 76.0)))
-        .boxed()
-}
-
-fn shelf_toolbar(
-    query: String,
-    book_count: usize,
-    sync_enabled: bool,
-    syncing: bool,
-    language: AppLanguage,
-) -> impl WidgetView<ShelfFeature> {
-    let search = sized_box(
-        flex_row((
-            icon_label(Icon::Search, 16.0, UI_MUTED),
-            text_input(query, |state: &mut ShelfFeature, value| {
-                state.shelf.query = value;
-            })
-            .placeholder(match language {
-                AppLanguage::SimplifiedChinese => format!("搜索 {book_count} 本书"),
-                AppLanguage::English => format!("Search {book_count} books"),
-            })
-            .text_color(UI_TEXT)
-            .caret_color(UI_ACCENT)
-            .background_color(Color::TRANSPARENT)
-            .border_color(Color::TRANSPARENT)
-            .border_width(0.0)
-            .corner_radius(0.0)
-            .padding(0.0)
-            .flex(1.0),
-        ))
-        .gap(8.px())
-        .cross_axis_alignment(CrossAxisAlignment::Center),
-    )
-    .height(40.px())
-    .background_color(UI_SURFACE)
-    .border(UI_BORDER, 1.0)
-    .corner_radius(9.0)
-    .padding(Padding::horizontal(12.0))
-    .flex(1.0);
-
-    sized_box(
-        flex_row((
-            search,
-            sized_box(label(""))
-                .width(1.px())
-                .height(24.px())
-                .background_color(UI_BORDER),
-            shelf_icon_button(Icon::Settings, ShelfFeature::request_settings),
-            sync_enabled.then(|| {
-                shelf_icon_button(
-                    if syncing {
-                        Icon::CloudDownload
-                    } else {
-                        Icon::CloudSync
-                    },
-                    ShelfFeature::start_sync,
-                )
-            }),
-            shelf_icon_button(Icon::Plus, import_with_dialog),
-        ))
-        .gap(12.px())
-        .cross_axis_alignment(CrossAxisAlignment::Center),
-    )
-    .height(64.px())
-    .expand_width()
-    .background_color(UI_SURFACE)
-    .padding(Padding::horizontal(20.0))
-}
-
-fn shelf_grid(
-    state: &ShelfFeature,
-    books: Vec<LibraryBook>,
-    include_import: bool,
-    available_width: f64,
-) -> impl WidgetView<ShelfFeature> + use<> {
-    let mut cards = books
-        .into_iter()
-        .map(|book| {
-            let cover = state.shelf.covers.get(&book.id).cloned();
-            shelf_book_card(&book, cover, state.language).boxed()
-        })
-        .collect::<Vec<Box<AnyWidgetView<ShelfFeature>>>>();
-    if include_import {
-        cards.push(import_card(state.language).boxed());
+fn contain_rect(bounds: egui::Rect, image_size: Vec2) -> egui::Rect {
+    if image_size.x <= 0.0
+        || image_size.y <= 0.0
+        || !image_size.x.is_finite()
+        || !image_size.y.is_finite()
+    {
+        return bounds;
     }
-
-    let columns = shelf_column_count(available_width);
-    let mut rows = Vec::new();
-    let mut cards = cards.into_iter();
-    loop {
-        let mut row = cards.by_ref().take(columns).collect::<Vec<_>>();
-        if row.is_empty() {
-            break;
-        }
-        while row.len() < columns {
-            row.push(
-                sized_box(label(""))
-                    .width(SHELF_CARD_WIDTH.px())
-                    .height(1.px())
-                    .boxed(),
-            );
-        }
-        rows.push(
-            flex_row(row)
-                .gap(SHELF_CARD_GAP.px())
-                .cross_axis_alignment(CrossAxisAlignment::Start),
-        );
-    }
-
-    flex_col(rows)
-        .gap(SHELF_ROW_GAP.px())
-        .cross_axis_alignment(CrossAxisAlignment::Start)
-}
-
-fn shelf_column_count(available_width: f64) -> usize {
-    let mut columns = 1;
-    let mut occupied_width = SHELF_CARD_WIDTH;
-    while occupied_width + SHELF_CARD_GAP + SHELF_CARD_WIDTH <= available_width {
-        columns += 1;
-        occupied_width += SHELF_CARD_GAP + SHELF_CARD_WIDTH;
-    }
-    columns
-}
-
-fn shelf_book_card(
-    book: &LibraryBook,
-    cover: Option<ImageData>,
-    language: AppLanguage,
-) -> impl WidgetView<ShelfFeature> {
-    let open_path = book.path.clone();
-    let open_path_from_title = book.path.clone();
-    let title = ellipsize_shelf_title(&book.title);
-    let available = book.path.exists();
-    let cover_button = sized_box(
-        button(
-            shelf_cover_content(book, cover, language),
-            move |state: &mut ShelfFeature| {
-                state.open_book(&open_path);
-            },
-        )
-        .background_color(cover_color(&book.id))
-        .active_background_color(UI_TEXT_SOFT)
-        .border_color(UI_BORDER)
-        .hovered_border_color(UI_ACCENT_BORDER)
-        .border_width(1.0)
-        .corner_radius(4.0)
-        .padding(0.0),
-    )
-    .width(SHELF_CARD_WIDTH.px())
-    .height(SHELF_COVER_HEIGHT.px());
-
-    sized_box(
-        flex_col((
-            zstack((
-                cover_button,
-                shelf_remove_button(book.id.clone(), book.title.clone(), language)
-                    .alignment(UnitPoint::TOP_RIGHT),
-            )),
-            sized_box(
-                button(
-                    label(title)
-                        .text_size(13.5)
-                        .weight(FontWeight::BOLD)
-                        .line_break_mode(LineBreaking::Clip)
-                        .color(UI_TEXT),
-                    move |state: &mut ShelfFeature| state.open_book(&open_path_from_title),
-                )
-                .background_color(Color::TRANSPARENT)
-                .active_background_color(Color::TRANSPARENT)
-                .border_color(Color::TRANSPARENT)
-                .hovered_border_color(Color::TRANSPARENT)
-                .border_width(0.0)
-                .padding(0.0),
-            )
-            .height(24.px())
-            .expand_width(),
-            shelf_book_status(available, language),
-        ))
-        .gap(7.px())
-        .cross_axis_alignment(CrossAxisAlignment::Fill),
-    )
-    .width(SHELF_CARD_WIDTH.px())
-}
-
-fn shelf_cover_content(
-    book: &LibraryBook,
-    cover: Option<ImageData>,
-    language: AppLanguage,
-) -> Box<AnyWidgetView<ShelfFeature>> {
-    if let Some(cover) = cover {
-        return image(cover).fit(ObjectFit::Contain).boxed();
-    }
-    let author = if book.authors.is_empty() {
-        language.text("未知作者", "Unknown author").to_owned()
-    } else {
-        book.authors.join(" / ")
-    };
-    flex_col((
-        icon_label(Icon::BookOpen, 20.0, Color::from_rgba8(255, 255, 255, 150)),
-        FlexSpacer::Flex(1.0),
-        prose(book.title.clone())
-            .text_size(17.0)
-            .weight(FontWeight::BOLD)
-            .text_color(Color::WHITE),
-        label(author)
-            .text_size(11.0)
-            .color(Color::from_rgba8(255, 255, 255, 180)),
-    ))
-    .gap(8.px())
-    .cross_axis_alignment(CrossAxisAlignment::Start)
-    .padding(18.0)
-    .boxed()
-}
-
-fn shelf_remove_button(
-    id: String,
-    title: String,
-    language: AppLanguage,
-) -> impl WidgetView<ShelfFeature> {
-    sized_box(
-        button(
-            icon_label(Icon::Trash2, 14.0, Color::WHITE),
-            move |state: &mut ShelfFeature| {
-                state.request_remove_book(id.clone(), title.clone());
-            },
-        )
-        .accessibility_label(language.text("从书架移除", "Remove from shelf"))
-        .background_color(Color::from_rgba8(31, 45, 61, 205))
-        .active_background_color(Color::from_rgb8(0xb4, 0x23, 0x18))
-        .border_color(Color::TRANSPARENT)
-        .hovered_border_color(Color::from_rgb8(0xfe, 0xcd, 0xca))
-        .corner_radius(15.0)
-        .padding(0.0),
-    )
-    .width(30.px())
-    .height(30.px())
-    .transform(Affine::translate((-8.0, 8.0)))
-}
-
-fn shelf_book_status(available: bool, language: AppLanguage) -> impl WidgetView<ShelfFeature> {
-    let (icon, text, color) = if available {
-        (Icon::HardDrive, language.text("本地", "Local"), UI_MUTED)
-    } else {
-        (
-            Icon::AlertTriangle,
-            language.text("文件缺失", "Missing file"),
-            Color::from_rgb8(0xb4, 0x23, 0x18),
-        )
-    };
-    flex_row((
-        icon_label(icon, 12.0, color),
-        label(text).text_size(11.5).color(color),
-    ))
-    .gap(5.px())
-    .cross_axis_alignment(CrossAxisAlignment::Center)
-}
-
-fn import_card(language: AppLanguage) -> impl WidgetView<ShelfFeature> {
-    sized_box(
-        flex_col((
-            sized_box(
-                button(icon_label(Icon::Plus, 46.0, UI_MUTED), import_with_dialog)
-                    .background_color(UI_SURFACE_MUTED)
-                    .active_background_color(UI_ACCENT_SOFT)
-                    .border_color(UI_BORDER)
-                    .hovered_border_color(UI_ACCENT_BORDER)
-                    .corner_radius(4.0)
-                    .padding(0.0),
-            )
-            .width(SHELF_CARD_WIDTH.px())
-            .height(SHELF_COVER_HEIGHT.px()),
-            label(language.text("导入本地书籍", "Import local books"))
-                .text_size(13.5)
-                .weight(FontWeight::BOLD)
-                .color(UI_MUTED),
-            label(language.text("保存在此设备", "Stored on this device"))
-                .text_size(11.5)
-                .color(UI_MUTED),
-        ))
-        .gap(7.px())
-        .cross_axis_alignment(CrossAxisAlignment::Start),
-    )
-    .width(SHELF_CARD_WIDTH.px())
-}
-
-fn shelf_icon_button(
-    icon: Icon,
-    callback: impl Fn(&mut ShelfFeature) + Send + Sync + 'static,
-) -> impl WidgetView<ShelfFeature> {
-    sized_box(
-        button(icon_label(icon, 17.0, UI_TEXT_SOFT), callback)
-            .background_color(UI_SURFACE)
-            .active_background_color(UI_SURFACE_MUTED)
-            .border_color(Color::TRANSPARENT)
-            .hovered_border_color(UI_BORDER)
-            .corner_radius(8.0)
-            .padding(0.0),
-    )
-    .width(36.px())
-    .height(36.px())
-}
-
-fn import_with_dialog(state: &mut ShelfFeature) {
-    let language = state.language;
-    let Some(paths) = rfd::FileDialog::new()
-        .add_filter(
-            language.text(
-                "电子书（EPUB / Kindle / FB2 / CBZ / PDF）",
-                "E-books (EPUB / Kindle / FB2 / CBZ / PDF)",
-            ),
-            &[
-                "epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "pdf", "zip",
-            ],
-        )
-        .set_title(language.text("导入本地书籍", "Import local books"))
-        .pick_files()
-    else {
-        return;
-    };
-    state.import_books(&paths);
+    let scale = (bounds.width() / image_size.x).min(bounds.height() / image_size.y);
+    let size = image_size * scale;
+    egui::Rect::from_center_size(bounds.center(), size)
 }
 
 fn book_matches_query(book: &LibraryBook, query: &str) -> bool {
     query.is_empty()
         || book.title.to_lowercase().contains(query)
-        || book.file_name.to_lowercase().contains(query)
         || book
             .authors
             .iter()
             .any(|author| author.to_lowercase().contains(query))
-}
-
-fn ellipsize_shelf_title(title: &str) -> String {
-    ellipsize_display_text(title, SHELF_TITLE_MAX_DISPLAY_UNITS)
-}
-
-fn cover_color(id: &str) -> Color {
-    const PALETTES: [Color; 6] = [
-        Color::from_rgb8(0x20, 0x63, 0x9b),
-        Color::from_rgb8(0x9b, 0x4b, 0x5f),
-        Color::from_rgb8(0x4f, 0x77, 0x5a),
-        Color::from_rgb8(0x8a, 0x69, 0x43),
-        Color::from_rgb8(0x75, 0x67, 0xa8),
-        Color::from_rgb8(0x5c, 0x7c, 0x81),
-    ];
-    let index = id
-        .bytes()
-        .fold(0_usize, |sum, byte| sum + usize::from(byte))
-        % PALETTES.len();
-    PALETTES[index]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        Duration, Instant, LibraryBook, PathBuf, SHELF_CARD_GAP, SHELF_CARD_WIDTH,
-        book_matches_query, ellipsize_shelf_title, notice_is_due, shelf_column_count,
-    };
-    use crate::ui::{display_character_units, wrap_display_text};
-
-    #[test]
-    fn shelf_search_matches_title_author_and_source_file() {
-        let book = LibraryBook {
-            id: "book-id".into(),
-            title: "系统之美".into(),
-            authors: vec!["Donella Meadows".into()],
-            file_name: "thinking-in-systems.epub".into(),
-            path: PathBuf::from("book.epub"),
-            cover_bytes: None,
-            added_at: 0,
-        };
-
-        assert!(book_matches_query(&book, "系统"));
-        assert!(book_matches_query(&book, "meadows"));
-        assert!(book_matches_query(&book, "thinking-in"));
-        assert!(!book_matches_query(&book, "不存在"));
-    }
-
-    #[test]
-    fn shelf_titles_are_ellipsized_by_approximate_display_width() {
-        assert_eq!(ellipsize_shelf_title("短书名"), "短书名");
-        assert_eq!(
-            ellipsize_shelf_title("这是一本书名非常非常长的电子书"),
-            "这是一本书名非常…"
-        );
-        assert_eq!(
-            ellipsize_shelf_title("A very long English book title"),
-            "A very long Engl…"
-        );
-    }
-
-    #[test]
-    fn sidebar_titles_wrap_to_at_most_two_ellipsized_lines() {
-        let short = wrap_display_text("Short title", 20, 2);
-        assert_eq!(short, "Short title");
-
-        let long = wrap_display_text(
-            "A very long English book title that should not overflow the sidebar",
-            20,
-            2,
-        );
-        assert_eq!(long.lines().count(), 2);
-        assert!(long.ends_with('…'));
-        assert!(
-            long.lines()
-                .all(|line| { line.chars().map(display_character_units).sum::<usize>() <= 20 })
-        );
-    }
-
-    #[test]
-    fn shelf_columns_fill_the_available_width_before_wrapping() {
-        assert_eq!(shelf_column_count(SHELF_CARD_WIDTH), 1);
-        assert_eq!(
-            shelf_column_count(SHELF_CARD_WIDTH * 4.0 + SHELF_CARD_GAP * 3.0),
-            4
-        );
-        assert_eq!(
-            shelf_column_count(SHELF_CARD_WIDTH * 6.0 + SHELF_CARD_GAP * 5.0),
-            6
-        );
-    }
-
-    #[test]
-    fn shelf_notices_expire_at_their_deadline() {
-        let now = Instant::now();
-        let deadline = now + Duration::from_secs(3);
-
-        assert!(!notice_is_due(None, now));
-        assert!(!notice_is_due(Some(deadline), now));
-        assert!(notice_is_due(Some(deadline), deadline));
-    }
 }

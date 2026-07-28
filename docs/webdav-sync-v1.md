@@ -1,6 +1,6 @@
-# Rebook Desktop WebDAV Sync v1
+# Torto Desktop WebDAV Sync v1
 
-This protocol is currently desktop-to-desktop. It does not depend on `rebook-service` and is not yet a compatibility contract with `rebook-web`.
+This protocol is currently desktop-to-desktop. It does not depend on `rebook-service` and is not yet a compatibility contract with `rebook-web`. The historical `Rebook/v1/` remote path is intentionally retained so existing Torto users do not lose access to synchronized data after the product rename.
 
 ## Remote layout
 
