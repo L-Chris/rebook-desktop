@@ -1,13 +1,17 @@
 use std::time::{Duration, Instant};
 
+use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, Pos2, Rect, RichText, TextureId, Vec2};
 use lucide_icons::Icon;
 use rebook_layout::reading_content_left;
 use rebook_reader::PageDirection;
 
+use super::chat_autocomplete::{
+    ChatReference, ChatReferenceKind, chat_reference_token, move_suggestion_index,
+};
 use super::chat_markdown::ChatMarkdownState;
-use super::{AssistantPanel, DesktopReader, ReaderOverlay, SidebarTab};
-use crate::plugins::{ChatRole, chat_command_suggestions};
+use super::{AssistantPanel, DesktopReader, PageTextureAnchor, ReaderOverlay, SidebarTab};
+use crate::plugins::{ChatCommand, ChatRole, chat_command_suggestions};
 use crate::ui::{
     ACCENT, ACCENT_SOFT, BACKGROUND, BORDER, MUTED, SURFACE, SURFACE_MUTED, TEXT,
     decode_color_image, icon, icon_button, navigation_button, navigation_text_button,
@@ -21,11 +25,40 @@ const ASSISTANT_SIDE_PADDING: i8 = 14;
 const ASSISTANT_EMPTY_TOP_PADDING: f32 = 12.0;
 const ASSISTANT_BOTTOM_PADDING: f32 = 12.0;
 const ASSISTANT_COMPOSER_RESERVED_HEIGHT: f32 = 52.0;
+const ASSISTANT_INPUT_HEIGHT: f32 = 32.0;
 const TOOLBAR_HEIGHT: f32 = 48.0;
 const TOOLBAR_CONTROL_SIZE: f32 = 32.0;
 const TOOLBAR_TITLE_SIZE: f32 = 15.0;
 const WHEEL_PAGE_THRESHOLD: f32 = 18.0;
 const WHEEL_TURN_COOLDOWN: Duration = Duration::from_millis(180);
+
+#[derive(Clone, Copy)]
+struct AssistantComposerKeys {
+    input_had_focus: bool,
+    initial_suggestion_count: usize,
+    movement: AssistantSuggestionMovement,
+    acceptance: AssistantSuggestionAcceptance,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AssistantSuggestionMovement {
+    None,
+    Forward,
+    Backward,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AssistantSuggestionAcceptance {
+    None,
+    Tab,
+    Enter,
+}
+
+struct AssistantComposerRender {
+    composer_rect: Rect,
+    input_response: egui::Response,
+    submit: bool,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReaderFramePlan {
@@ -84,6 +117,9 @@ impl DesktopReader {
 
         let background = self.reader.style().background;
         let background_ui = color32(background);
+        let anchor_page_texture_right = self.ui.page_texture_anchor
+            == PageTextureAnchor::CanvasRightUntilSidebarResize
+            && self.ui.sidebar_pinned;
         let mut page_rect = Rect::NOTHING;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(background_ui))
@@ -95,9 +131,11 @@ impl DesktopReader {
                         ui.allocate_exact_size(size, egui::Sense::click_and_drag());
                     let painter = ui.painter().with_clip_rect(rect);
                     painter.rect_filled(rect, 0.0, background_ui);
+                    let texture_rect =
+                        page_texture_destination(rect, texture.size, anchor_page_texture_right);
                     painter.image(
                         texture.id,
-                        Rect::from_min_size(rect.min, texture.size),
+                        texture_rect,
                         Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
                         Color32::WHITE,
                     );
@@ -126,6 +164,7 @@ impl DesktopReader {
                 );
                 ui.painter().rect_filled(filled, 0.0, ACCENT);
             });
+        self.finish_sidebar_texture_transition(page_rect, page_texture);
 
         if !self.ui.sidebar_pinned && sidebar_progress > 0.001 {
             self.floating_sidebar(&ctx, sidebar_progress);
@@ -145,6 +184,21 @@ impl DesktopReader {
             ),
             defer_target_resize: self.ui.sidebar_motion.is_animating()
                 || self.ui.assistant_motion.is_animating(),
+        }
+    }
+
+    fn finish_sidebar_texture_transition(
+        &mut self,
+        page_rect: Rect,
+        page_texture: Option<ReaderPageTexture>,
+    ) {
+        let resize_finished = !self.ui.sidebar_motion.is_animating()
+            && page_texture
+                .is_some_and(|texture| page_texture_matches_canvas(page_rect, texture.size));
+        if self.ui.page_texture_anchor == PageTextureAnchor::CanvasRightUntilSidebarResize
+            && (!self.ui.sidebar_pinned || resize_finished)
+        {
+            self.ui.page_texture_anchor = PageTextureAnchor::CanvasLeft;
         }
     }
 
@@ -631,27 +685,18 @@ impl DesktopReader {
         self.assistant_header(ui);
 
         let busy = self.chat.task.is_pending();
-        let command_count = if busy {
-            0
-        } else {
-            chat_command_suggestions(&self.chat.input).len().min(3)
-        };
-        let command_height = match command_count {
-            0 => 0.0,
-            1 => 49.0,
-            2 => 88.0,
-            _ => 126.0,
-        };
+        let reference_rows =
+            u16::try_from(self.chat.references.len().div_ceil(2)).unwrap_or(u16::MAX);
+        let reference_height = f32::from(reference_rows) * 28.0;
         let error_height = if self.chat.error.is_some() { 54.0 } else { 0.0 };
         let conversation_height = (ui.available_height()
             - ASSISTANT_COMPOSER_RESERVED_HEIGHT
             - ASSISTANT_BOTTOM_PADDING
-            - command_height
+            - reference_height
             - error_height)
             .max(96.0);
         self.assistant_conversation(ui, conversation_height, busy);
         self.assistant_error(ui);
-        self.assistant_commands(ui, busy);
         self.assistant_composer(ui);
     }
 
@@ -773,53 +818,196 @@ impl DesktopReader {
         }
     }
 
-    fn assistant_commands(&mut self, ui: &mut egui::Ui, busy: bool) {
-        let commands = chat_command_suggestions(&self.chat.input);
-        if !commands.is_empty() && !busy {
-            egui::Frame::new()
-                .fill(SURFACE)
-                .stroke(egui::Stroke::new(1.0, BORDER))
-                .corner_radius(8)
-                .inner_margin(4)
-                .show(ui, |ui| {
-                    for command in commands {
-                        let label = format!("{}  {}", command.name, command.description);
-                        if navigation_text_button(ui, &label, false).clicked() {
-                            self.select_chat_command(command);
-                        }
-                    }
-                });
-        }
-    }
-
     fn assistant_composer(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
-        let mut submit = false;
-        compact_input_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let input_width = (ui.available_width() - 38.0).max(48.0);
-                let response = ui.add_sized(
-                    [input_width, 32.0],
-                    egui::TextEdit::singleline(&mut self.chat.input)
-                        .hint_text(self.language.text(
-                            "询问这本书，或输入 / 使用技能…",
-                            "Ask about this book, or type / for skills…",
-                        ))
-                        .frame(egui::Frame::NONE)
-                        .vertical_align(egui::Align::Center)
-                        .margin(egui::Margin::symmetric(2, 0)),
-                );
-                submit = (response.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter)))
-                    || icon_button(ui, Icon::Send)
-                        .on_hover_text(self.language.text("发送", "Send"))
-                        .clicked();
-            });
-        });
+        let busy = self.chat.task.is_pending();
+        let input_id = ui.make_persistent_id("assistant-chat-input");
+        let (initial_references, initial_commands) = self.assistant_suggestions(busy);
+        let keys = assistant_composer_keys(
+            ui,
+            input_id,
+            active_suggestion_count(&initial_references, &initial_commands),
+        );
+        let render = self.assistant_composer_input(ui, input_id);
+        let (reference_suggestions, command_suggestions) = self.assistant_suggestions(busy);
+        let suggestion_count =
+            active_suggestion_count(&reference_suggestions, &command_suggestions);
+        self.chat.suggestion_index = self
+            .chat
+            .suggestion_index
+            .min(suggestion_count.saturating_sub(1));
+
+        let mut submit = render.submit;
+        let suggestion_applied = self.apply_assistant_suggestion_key(
+            keys,
+            &reference_suggestions,
+            &command_suggestions,
+            &render.input_response,
+            &mut submit,
+        );
+        if !suggestion_applied && suggestion_count > 0 {
+            let (picked_reference, picked_command, hovered_index) = assistant_suggestion_popup(
+                ui,
+                render.composer_rect,
+                &reference_suggestions,
+                &command_suggestions,
+                self.chat.suggestion_index,
+                self.language,
+            );
+            if let Some(index) = hovered_index {
+                self.chat.suggestion_index = index;
+            }
+            if let Some(reference) = picked_reference {
+                self.select_chat_reference(reference);
+                render.input_response.request_focus();
+            } else if let Some(command) = picked_command {
+                self.select_chat_command(command);
+                render.input_response.request_focus();
+            }
+        }
         if submit {
             self.send_chat();
         }
         ui.add_space(ASSISTANT_BOTTOM_PADDING);
+    }
+
+    fn assistant_suggestions(&mut self, busy: bool) -> (Vec<ChatReference>, Vec<ChatCommand>) {
+        let reference_token_active = chat_reference_token(
+            &self.chat.input,
+            self.chat.cursor_char_index,
+            &self.chat.references,
+        )
+        .is_some();
+        let references = if busy {
+            Vec::new()
+        } else {
+            self.current_chat_reference_suggestions()
+        };
+        let commands = if busy || reference_token_active {
+            Vec::new()
+        } else {
+            chat_command_suggestions(&self.chat.input)
+        };
+        (references, commands)
+    }
+
+    fn assistant_composer_input(
+        &mut self,
+        ui: &mut egui::Ui,
+        input_id: egui::Id,
+    ) -> AssistantComposerRender {
+        let references = self.chat.references.clone();
+        let mut remove_reference = None;
+        let mut input_response = None;
+        let mut submit = false;
+        let move_cursor_to_end = std::mem::take(&mut self.chat.move_cursor_to_end);
+        let composer = compact_input_frame().show(ui, |ui| {
+            remove_reference = chat_reference_chips(ui, &references, self.language);
+            ui.horizontal(|ui| {
+                let input_width = (ui.available_width() - 38.0).max(48.0);
+                let hint_text = self.language.text(
+                    "询问这本书，输入 / 使用技能或 @ 引用…",
+                    "Ask this book, type / for skills or @ to reference…",
+                );
+                let (mut output, input_rect) =
+                    centered_assistant_text_edit(ui, &mut self.chat.input, input_id, input_width);
+                if self.chat.input.is_empty() {
+                    // egui 0.35 forces its built-in hint atom to LEFT_TOP, so
+                    // paint the placeholder ourselves to honor vertical centering.
+                    ui.painter().with_clip_rect(input_rect).text(
+                        input_rect.left_center() + Vec2::new(4.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        hint_text,
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        ui.visuals().weak_text_color(),
+                    );
+                }
+                if output.response.changed() {
+                    self.chat.suggestion_index = 0;
+                }
+                self.chat.cursor_char_index = output.cursor_range.map_or_else(
+                    || self.chat.input.chars().count(),
+                    |range| range.primary.index.into(),
+                );
+                if move_cursor_to_end {
+                    let cursor = CCursor::new(self.chat.input.chars().count());
+                    output
+                        .state
+                        .cursor
+                        .set_char_range(Some(CCursorRange::one(cursor)));
+                    output.state.store(ui.ctx(), output.response.id);
+                    output.response.request_focus();
+                    self.chat.cursor_char_index = cursor.index.into();
+                }
+                input_response = Some(output.response.response.clone());
+                submit = icon_button(ui, Icon::Send)
+                    .on_hover_text(self.language.text("发送", "Send"))
+                    .clicked();
+            });
+        });
+        if let Some(id) = remove_reference {
+            self.remove_chat_reference(&id);
+        }
+        AssistantComposerRender {
+            composer_rect: composer.response.rect,
+            input_response: input_response.expect("chat input is always rendered"),
+            submit,
+        }
+    }
+
+    fn apply_assistant_suggestion_key(
+        &mut self,
+        keys: AssistantComposerKeys,
+        references: &[ChatReference],
+        commands: &[ChatCommand],
+        input_response: &egui::Response,
+        submit: &mut bool,
+    ) -> bool {
+        let suggestion_count = active_suggestion_count(references, commands);
+        if keys.input_had_focus && keys.initial_suggestion_count > 0 && suggestion_count > 0 {
+            match keys.movement {
+                AssistantSuggestionMovement::Forward => {
+                    self.chat.suggestion_index =
+                        move_suggestion_index(self.chat.suggestion_index, suggestion_count, true);
+                }
+                AssistantSuggestionMovement::Backward => {
+                    self.chat.suggestion_index =
+                        move_suggestion_index(self.chat.suggestion_index, suggestion_count, false);
+                }
+                AssistantSuggestionMovement::None => {}
+            }
+        }
+        let input_is_active = input_response.has_focus() || input_response.lost_focus();
+        let apply = input_is_active
+            && keys.initial_suggestion_count > 0
+            && suggestion_count > 0
+            && keys.acceptance != AssistantSuggestionAcceptance::None;
+        if !apply {
+            if input_is_active
+                && keys.acceptance == AssistantSuggestionAcceptance::Enter
+                && suggestion_count == 0
+            {
+                *submit = true;
+            }
+            return false;
+        }
+        if let Some(reference) = references.get(self.chat.suggestion_index).cloned() {
+            self.select_chat_reference(reference);
+            input_response.request_focus();
+            return true;
+        }
+        let Some(command) = commands.get(self.chat.suggestion_index).copied() else {
+            return false;
+        };
+        let exact_non_argument_command =
+            !command.requires_args && self.chat.input.trim().eq_ignore_ascii_case(command.name);
+        if keys.acceptance == AssistantSuggestionAcceptance::Enter && exact_non_argument_command {
+            *submit = true;
+        } else {
+            self.select_chat_command(command);
+            input_response.request_focus();
+        }
+        true
     }
 
     fn menu(&mut self, ctx: &egui::Context) {
@@ -1043,6 +1231,221 @@ fn toc_toggle_button(
     response.clicked()
 }
 
+fn assistant_composer_keys(
+    ui: &mut egui::Ui,
+    input_id: egui::Id,
+    initial_suggestion_count: usize,
+) -> AssistantComposerKeys {
+    let input_had_focus = ui.memory(|memory| memory.has_focus(input_id));
+    let (arrow_down, arrow_up, tab, enter) = ui.input(|input| {
+        (
+            input.key_pressed(egui::Key::ArrowDown),
+            input.key_pressed(egui::Key::ArrowUp),
+            input.key_pressed(egui::Key::Tab),
+            input.key_pressed(egui::Key::Enter),
+        )
+    });
+    if input_had_focus && initial_suggestion_count > 0 {
+        ui.input_mut(|input| {
+            if arrow_down {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown);
+            }
+            if arrow_up {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp);
+            }
+            if tab {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
+            }
+            if enter {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+            }
+        });
+    }
+    AssistantComposerKeys {
+        input_had_focus,
+        initial_suggestion_count,
+        movement: if arrow_down {
+            AssistantSuggestionMovement::Forward
+        } else if arrow_up {
+            AssistantSuggestionMovement::Backward
+        } else {
+            AssistantSuggestionMovement::None
+        },
+        acceptance: if tab {
+            AssistantSuggestionAcceptance::Tab
+        } else if enter {
+            AssistantSuggestionAcceptance::Enter
+        } else {
+            AssistantSuggestionAcceptance::None
+        },
+    }
+}
+
+fn active_suggestion_count(references: &[ChatReference], commands: &[ChatCommand]) -> usize {
+    if references.is_empty() {
+        commands.len()
+    } else {
+        references.len()
+    }
+}
+
+fn chat_reference_chips(
+    ui: &mut egui::Ui,
+    references: &[ChatReference],
+    language: crate::preferences::AppLanguage,
+) -> Option<String> {
+    if references.is_empty() {
+        return None;
+    }
+    let mut removed = None;
+    ui.horizontal_wrapped(|ui| {
+        for reference in references {
+            let kind = chat_reference_kind_label(language, reference.kind);
+            let label = format!("{kind} · {}  ×", reference.label);
+            if ui
+                .add(
+                    egui::Button::new(RichText::new(label).size(10.5).color(ACCENT))
+                        .fill(ACCENT_SOFT)
+                        .stroke(egui::Stroke::new(1.0, BORDER))
+                        .corner_radius(10),
+                )
+                .on_hover_text(&reference.description)
+                .clicked()
+            {
+                removed = Some(reference.id.clone());
+            }
+        }
+    });
+    ui.add_space(3.0);
+    removed
+}
+
+const fn chat_reference_kind_label(
+    language: crate::preferences::AppLanguage,
+    kind: ChatReferenceKind,
+) -> &'static str {
+    match (language, kind) {
+        (crate::preferences::AppLanguage::SimplifiedChinese, ChatReferenceKind::Book) => "全文",
+        (crate::preferences::AppLanguage::SimplifiedChinese, ChatReferenceKind::Section) => "章节",
+        (crate::preferences::AppLanguage::SimplifiedChinese, ChatReferenceKind::Paragraph) => {
+            "段落"
+        }
+        (crate::preferences::AppLanguage::English, ChatReferenceKind::Book) => "Book",
+        (crate::preferences::AppLanguage::English, ChatReferenceKind::Section) => "Chapter",
+        (crate::preferences::AppLanguage::English, ChatReferenceKind::Paragraph) => "Paragraph",
+    }
+}
+
+fn assistant_suggestion_popup(
+    ui: &egui::Ui,
+    anchor: Rect,
+    references: &[ChatReference],
+    commands: &[ChatCommand],
+    selected_index: usize,
+    language: crate::preferences::AppLanguage,
+) -> (Option<ChatReference>, Option<ChatCommand>, Option<usize>) {
+    let mut picked_reference = None;
+    let mut picked_command = None;
+    let mut hovered_index = None;
+    let context = ui.ctx().clone();
+    egui::Area::new("assistant-chat-suggestions".into())
+        .order(egui::Order::Tooltip)
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(Pos2::new(anchor.left(), anchor.top() - 7.0))
+        .show(&context, |ui| {
+            egui::Frame::new()
+                .fill(SURFACE)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(8)
+                .inner_margin(4)
+                .show(ui, |ui| {
+                    ui.set_width((anchor.width() - 8.0).max(1.0));
+                    if references.is_empty() {
+                        for (index, command) in commands.iter().enumerate() {
+                            let label = format!("{}  {}", command.name, command.description);
+                            let response =
+                                navigation_text_button(ui, &label, index == selected_index);
+                            if response.hovered() {
+                                hovered_index = Some(index);
+                            }
+                            if response.clicked() {
+                                picked_command = Some(*command);
+                            }
+                        }
+                    } else {
+                        for (index, reference) in references.iter().enumerate() {
+                            let label = chat_reference_suggestion_label(reference, language);
+                            let response =
+                                navigation_text_button(ui, &label, index == selected_index)
+                                    .on_hover_text(&reference.description);
+                            if response.hovered() {
+                                hovered_index = Some(index);
+                            }
+                            if response.clicked() {
+                                picked_reference = Some(reference.clone());
+                            }
+                        }
+                    }
+                });
+        });
+    (picked_reference, picked_command, hovered_index)
+}
+
+fn chat_reference_suggestion_label(
+    reference: &ChatReference,
+    language: crate::preferences::AppLanguage,
+) -> String {
+    let kind = chat_reference_kind_label(language, reference.kind);
+    if reference.kind != ChatReferenceKind::Book {
+        return format!("{kind}  {}", reference.label);
+    }
+    let fallback = match language {
+        crate::preferences::AppLanguage::SimplifiedChinese => "整本书",
+        crate::preferences::AppLanguage::English => "Entire book",
+    };
+    if reference.description == fallback {
+        kind.to_owned()
+    } else {
+        format!("{kind}  {}", reference.description)
+    }
+}
+
+fn centered_assistant_text_edit(
+    ui: &mut egui::Ui,
+    input: &mut String,
+    input_id: egui::Id,
+    width: f32,
+) -> (egui::text_edit::TextEditOutput, Rect) {
+    let mut input_rect = Rect::NOTHING;
+    let output = ui.allocate_ui_with_layout(
+        Vec2::new(width, ASSISTANT_INPUT_HEIGHT),
+        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+        |ui| {
+            input_rect = ui.max_rect();
+            egui::TextEdit::singleline(input)
+                .id(input_id)
+                .desired_width(width)
+                .frame(egui::Frame::NONE)
+                .vertical_align(egui::Align::Center)
+                .show(ui)
+        },
+    );
+    (output.inner, input_rect)
+}
+
+fn page_texture_destination(page_rect: Rect, texture_size: Vec2, anchor_right: bool) -> Rect {
+    let origin = if anchor_right {
+        Pos2::new(page_rect.right() - texture_size.x, page_rect.top())
+    } else {
+        page_rect.min
+    };
+    Rect::from_min_size(origin, texture_size)
+}
+
+fn page_texture_matches_canvas(page_rect: Rect, texture_size: Vec2) -> bool {
+    (texture_size - page_rect.size()).length_sq() <= 0.25
+}
+
 fn compact_input_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(SURFACE)
@@ -1104,4 +1507,89 @@ fn color32(color: rebook_publication::Rgba) -> Color32 {
 #[allow(clippy::cast_possible_truncation)]
 fn unit_f32(value: f64) -> f32 {
     value.clamp(0.0, 1.0) as f32
+}
+
+#[cfg(test)]
+mod reference_suggestion_label_tests {
+    use super::*;
+
+    fn reference(kind: ChatReferenceKind, label: &str, description: &str) -> ChatReference {
+        ChatReference {
+            id: "test".into(),
+            kind,
+            label: label.into(),
+            description: description.into(),
+            locator: "rebook://test".into(),
+            excerpt: None,
+        }
+    }
+
+    #[test]
+    fn reference_rows_show_only_user_facing_content() {
+        let language = crate::preferences::AppLanguage::SimplifiedChinese;
+        assert_eq!(
+            chat_reference_suggestion_label(
+                &reference(ChatReferenceKind::Book, "全文", "Structured Writing"),
+                language,
+            ),
+            "全文  Structured Writing"
+        );
+        assert_eq!(
+            chat_reference_suggestion_label(
+                &reference(
+                    ChatReferenceKind::Section,
+                    "Chapter 7. Rhetorical Structure",
+                    "当前章节 · 7",
+                ),
+                language,
+            ),
+            "章节  Chapter 7. Rhetorical Structure"
+        );
+        assert_eq!(
+            chat_reference_suggestion_label(
+                &reference(ChatReferenceKind::Book, "全文", "整本书"),
+                language,
+            ),
+            "全文"
+        );
+    }
+
+    #[test]
+    fn assistant_text_edit_uses_the_full_centered_input_row() {
+        egui::__run_test_ui(|ui| {
+            let mut input = String::new();
+            let input_id = ui.make_persistent_id("centered-input-test");
+            let (output, input_rect) =
+                centered_assistant_text_edit(ui, &mut input, input_id, 240.0);
+            let galley_center = output.galley_pos.y + output.galley.size().y / 2.0;
+
+            assert!((output.response.rect.height() - ASSISTANT_INPUT_HEIGHT).abs() < 0.01);
+            assert!((output.response.rect.center().y - input_rect.center().y).abs() < 0.01);
+            assert!((galley_center - input_rect.center().y).abs() < 0.01);
+        });
+    }
+
+    #[test]
+    fn stale_wide_page_texture_keeps_its_right_edge_while_sidebar_opens() {
+        let page_rect = Rect::from_min_size(Pos2::new(256.0, 48.0), Vec2::new(944.0, 700.0));
+        let previous_texture_size = Vec2::new(1_200.0, 700.0);
+
+        let destination = page_texture_destination(page_rect, previous_texture_size, true);
+
+        assert!(destination.left().abs() < 0.01);
+        assert!((destination.right() - page_rect.right()).abs() < 0.01);
+        assert!((destination.width() - previous_texture_size.x).abs() < 0.01);
+    }
+
+    #[test]
+    fn stale_narrow_page_texture_keeps_its_right_edge_while_sidebar_closes() {
+        let page_rect = Rect::from_min_size(Pos2::new(0.0, 48.0), Vec2::new(1_200.0, 700.0));
+        let previous_texture_size = Vec2::new(944.0, 700.0);
+
+        let destination = page_texture_destination(page_rect, previous_texture_size, true);
+
+        assert!((destination.left() - 256.0).abs() < 0.01);
+        assert!((destination.right() - page_rect.right()).abs() < 0.01);
+        assert!((destination.width() - previous_texture_size.x).abs() < 0.01);
+    }
 }

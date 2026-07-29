@@ -169,13 +169,18 @@ async fn translate_block_batch(
         .zip(blocks)
         .map(|(key, block)| (key.clone(), Value::String(block.text.clone())))
         .collect::<serde_json::Map<_, _>>();
+    let fixed_page_hint = if blocks.iter().any(|block| block.segment_index.is_some()) {
+        "部分值来自 PDF 文字层。请先按语义修复错误断行、行末断词和明显缺失的单词空格，再进行翻译；不要逐行生硬翻译。"
+    } else {
+        ""
+    };
     let mut last_error = None;
     for _ in 0..MAX_TRANSLATION_ATTEMPTS {
         let messages = vec![
             json!({
                 "role": "system",
                 "content": format!(
-                    "你是一名专业图书翻译。请把输入 JSON 对象中的每个值翻译为{target_language}，忠实保留原文语气、专有名词与段落结构。只返回一个 JSON 对象，必须保留完全相同的键，每个值只能是对应译文字符串。"
+                    "你是一名专业图书翻译。请把输入 JSON 对象中的每个值翻译为{target_language}，忠实保留原文语气、专有名词与段落结构。{fixed_page_hint}只返回一个 JSON 对象，必须保留完全相同的键，每个值只能是对应译文字符串。"
                 ),
             }),
             json!({ "role": "user", "content": Value::Object(input.clone()).to_string() }),
@@ -191,6 +196,7 @@ async fn translate_block_batch(
                     .zip(values)
                     .map(|(block, text)| BlockTranslation {
                         block_index: block.block_index,
+                        segment_index: block.segment_index,
                         text,
                     })
                     .collect());
@@ -748,10 +754,12 @@ mod tests {
         let blocks = vec![
             TranslationBlockInput {
                 block_index: 2,
+                segment_index: None,
                 text: "abcd".into(),
             },
             TranslationBlockInput {
                 block_index: 7,
+                segment_index: Some(3),
                 text: "efgh".into(),
             },
         ];
@@ -761,6 +769,7 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0][0].block_index, 2);
         assert_eq!(batches[1][0].block_index, 7);
+        assert_eq!(batches[1][0].segment_index, Some(3));
     }
 
     #[test]
@@ -854,6 +863,7 @@ mod tests {
                 settings,
                 vec![TranslationBlockInput {
                     block_index: 4,
+                    segment_index: None,
                     text: "Hello".into(),
                 }],
             ))
@@ -864,6 +874,7 @@ mod tests {
             translations,
             [BlockTranslation {
                 block_index: 4,
+                segment_index: None,
                 text: "你好".into(),
             }]
         );

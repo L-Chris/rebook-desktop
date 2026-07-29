@@ -52,10 +52,20 @@ pub fn chat_command_suggestions(input: &str) -> Vec<ChatCommand> {
     let Some(token) = command_token(input) else {
         return Vec::new();
     };
+    let token = token.to_ascii_lowercase();
+    let has_args = input
+        .get(token.len()..)
+        .is_some_and(|suffix| suffix.chars().any(char::is_whitespace));
+    if has_args
+        && CHAT_COMMANDS
+            .iter()
+            .any(|command| command.name.eq_ignore_ascii_case(&token))
+    {
+        return Vec::new();
+    }
     CHAT_COMMANDS
         .into_iter()
-        .filter(|command| command.name.starts_with(token))
-        .filter(|command| command.name != token)
+        .filter(|command| command.name.starts_with(&token))
         .collect()
 }
 
@@ -129,7 +139,9 @@ mod tests {
             command.name,
             "/story-index" | "/timeline" | "/profile" | "/relations" | "/entities"
         )));
-        assert!(chat_command_suggestions("/summary").is_empty());
+        assert_eq!(chat_command_suggestions("/SUMMARY")[0].name, "/summary");
+        assert_eq!(chat_command_suggestions("/summary")[0].name, "/summary");
+        assert!(chat_command_suggestions("/summary now").is_empty());
     }
 
     #[test]

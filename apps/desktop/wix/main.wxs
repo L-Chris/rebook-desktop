@@ -115,6 +115,8 @@
                                 Name='Torto'
                                 Description='Torto e-book reader'
                                 WorkingDirectory='APPLICATIONFOLDER'
+                                Icon='ProductICO'
+                                IconIndex='0'
                                 Advertise='yes'/>
                         </File>
                     </Component>

@@ -58,6 +58,19 @@ impl PageDisplayList {
         self.text_regions.len()
     }
 
+    /// Bounds of retained raster page content in logical page coordinates.
+    pub fn image_bounds(&self) -> Option<Rect> {
+        self.commands
+            .iter()
+            .filter_map(|command| match command {
+                DisplayCommand::Image(command) => Some(command.bounds),
+                DisplayCommand::Glyphs(_)
+                | DisplayCommand::FillRect(_)
+                | DisplayCommand::Rule(_) => None,
+            })
+            .reduce(|bounds, next| bounds.union(next))
+    }
+
     /// Visible UTF-8 byte range for a retained text placement.
     pub fn text_region_visible_range(&self, region_index: usize) -> Option<Range<usize>> {
         self.text_regions
@@ -184,7 +197,10 @@ impl PageDisplayList {
     pub fn paint_images_at(&self, scene: &mut impl PaintScene, offset_x: f32) {
         let transform = Affine::translate((f64::from(offset_x), 0.0));
         for command in &self.commands {
-            if matches!(command, DisplayCommand::Image(_)) {
+            if matches!(
+                command,
+                DisplayCommand::Image(_) | DisplayCommand::FillRect(_)
+            ) {
                 command.paint(scene, transform);
             }
         }
@@ -194,7 +210,7 @@ impl PageDisplayList {
     pub fn paint_non_image_content_at(&self, scene: &mut impl PaintScene, offset_x: f32) {
         let transform = Affine::translate((f64::from(offset_x), 0.0));
         for command in &self.commands {
-            if !matches!(command, DisplayCommand::Image(_)) {
+            if matches!(command, DisplayCommand::Glyphs(_) | DisplayCommand::Rule(_)) {
                 command.paint(scene, transform);
             }
         }
@@ -708,6 +724,7 @@ fn source_range_contains(range: &SourceRange, anchor: &SourceAnchor) -> bool {
 enum DisplayCommand {
     Glyphs(GlyphCommand),
     Image(ImageCommand),
+    FillRect(FillRectCommand),
     Rule(RuleCommand),
 }
 
@@ -730,6 +747,13 @@ impl DisplayCommand {
             Self::Image(command) => {
                 scene.draw_image(command.image.as_ref(), page_transform * command.transform);
             }
+            Self::FillRect(command) => scene.fill(
+                Fill::NonZero,
+                page_transform,
+                command.color,
+                None,
+                &command.rect,
+            ),
             Self::Rule(command) => scene.stroke(
                 &Stroke::new(command.width),
                 page_transform,
@@ -754,6 +778,12 @@ struct GlyphCommand {
 struct ImageCommand {
     image: ImageBrush,
     transform: Affine,
+    bounds: Rect,
+}
+
+struct FillRectCommand {
+    rect: Rect,
+    color: Color,
 }
 
 struct RuleCommand {
@@ -795,8 +825,30 @@ impl DisplayListCompiler {
                     commands.push(DisplayCommand::Image(ImageCommand {
                         image: ImageBrush::new(data),
                         transform,
+                        bounds: Rect::new(
+                            f64::from(image.x),
+                            f64::from(image.y),
+                            f64::from(image.x + image.width),
+                            f64::from(image.y + image.height),
+                        ),
                     }));
-                    if let Some(region) = fixed_text_region(image) {
+                    if let Some(replacement) = &image.replacement {
+                        for segment in &replacement.segments {
+                            commands.push(DisplayCommand::FillRect(FillRectCommand {
+                                rect: Rect::new(
+                                    f64::from(segment.rect.x),
+                                    f64::from(segment.rect.y),
+                                    f64::from(segment.rect.x + segment.rect.width),
+                                    f64::from(segment.rect.y + segment.rect.height),
+                                ),
+                                color: fixed_page_mask_color(image, segment.rect),
+                            }));
+                            if let Some(region) = text_region(&segment.text) {
+                                text_regions.push(region);
+                            }
+                            compile_text_commands(&mut commands, &segment.text);
+                        }
+                    } else if let Some(region) = fixed_text_region(image) {
                         text_regions.push(region);
                     }
                 }
@@ -822,6 +874,70 @@ impl DisplayListCompiler {
             text_regions,
         }
     }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "fixed-page raster coordinates are clamped to bounded image dimensions before indexing"
+)]
+fn fixed_page_mask_color(
+    image: &ImagePlacement,
+    rect: rebook_publication::FixedPageTextRect,
+) -> Color {
+    let raster_width = image.image.width as usize;
+    let raster_height = image.image.height as usize;
+    if raster_width == 0
+        || raster_height == 0
+        || image.width <= 0.0
+        || image.height <= 0.0
+        || image.image.pixels.len() < raster_width.saturating_mul(raster_height).saturating_mul(4)
+    {
+        return Color::from_rgba8(255, 255, 255, 255);
+    }
+    let to_x = |x: f32| {
+        (((x - image.x) / image.width) * image.image.width as f32)
+            .floor()
+            .clamp(0.0, (raster_width - 1) as f32) as usize
+    };
+    let to_y = |y: f32| {
+        (((y - image.y) / image.height) * image.image.height as f32)
+            .floor()
+            .clamp(0.0, (raster_height - 1) as f32) as usize
+    };
+    let x0 = to_x(rect.x);
+    let x1 = to_x(rect.x + rect.width).max(x0);
+    let y0 = to_y(rect.y);
+    let y1 = to_y(rect.y + rect.height).max(y0);
+    let mut samples = Vec::<[u8; 4]>::new();
+    let sample = |samples: &mut Vec<[u8; 4]>, x: usize, y: usize| {
+        let offset = (y * raster_width + x) * 4;
+        samples.push([
+            image.image.pixels[offset],
+            image.image.pixels[offset + 1],
+            image.image.pixels[offset + 2],
+            image.image.pixels[offset + 3],
+        ]);
+    };
+    let steps = 12_usize;
+    for step in 0..=steps {
+        let x = x0 + (x1 - x0) * step / steps;
+        let y = y0 + (y1 - y0) * step / steps;
+        sample(&mut samples, x, y0);
+        sample(&mut samples, x, y1);
+        sample(&mut samples, x0, y);
+        sample(&mut samples, x1, y);
+    }
+    let median = |channel: usize| {
+        let mut values = samples
+            .iter()
+            .map(|sample| sample[channel])
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        values[values.len() / 2]
+    };
+    Color::from_rgba8(median(0), median(1), median(2), median(3))
 }
 
 fn text_region(text: &TextPlacement) -> Option<TextRegion> {
@@ -940,7 +1056,9 @@ mod tests {
     use super::*;
     use parley::{Alignment, AlignmentOptions, FontContext, LayoutContext, StyleProperty};
     use rebook_layout::{
-        ImagePlacement, LayoutViewport, PageItem, PageLayout, RasterImage, TextBrush, TextPlacement,
+        FixedPageTextReplacementPlacement, FixedPageTextReplacementSegmentPlacement,
+        ImagePlacement, LayoutViewport, PageItem, PageLayout, RasterImage, TextBrush,
+        TextPlacement,
     };
     use rebook_publication::{
         FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan, SourceAnchor, SourceRange,
@@ -1081,12 +1199,18 @@ mod tests {
                     height: 100.0,
                     text: "PDF".into(),
                     spans,
+                    replacement: None,
                 }),
+                replacement: None,
             })],
         };
 
         let list = DisplayListCompiler.compile(&page);
         assert_eq!(list.text_region_count(), 1);
+        assert_eq!(
+            list.image_bounds(),
+            Some(Rect::new(50.0, 40.0, 150.0, 140.0))
+        );
         let rects = list.source_rects(std::slice::from_ref(&source));
         assert_eq!(rects.len(), 1);
         let point = rects[0].center();
@@ -1095,6 +1219,98 @@ mod tests {
             .expect("fixed text should be hit-testable");
         let fragment = list.selection_fragment(hit.region_index, 0..3).unwrap();
         assert_eq!(fragment.quote, "PDF");
+        assert_eq!(fragment.range, source);
+    }
+
+    #[test]
+    fn fixed_page_replacement_compiles_image_mask_and_translated_glyphs() {
+        let text: Arc<str> = "译文".into();
+        let mut font_context = FontContext::new();
+        let mut layout_context = LayoutContext::new();
+        let mut builder =
+            layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
+        builder.push_default(StyleProperty::FontSize(14.0));
+        builder.push_default(StyleProperty::Brush(TextBrush {
+            color: Rgba::BLACK,
+            underline: false,
+        }));
+        let mut layout = builder.build(text.as_ref());
+        layout.break_all_lines(Some(80.0));
+        layout.align(Alignment::Start, AlignmentOptions::default());
+        let line_count = layout.len();
+        let spine = SpineItemId::new("pdf-page-1").unwrap();
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "pdf-page-text".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "pdf-page-text".into(),
+                text_offset: 2,
+            },
+        };
+        let page = PageLayout {
+            viewport: LayoutViewport::new(200, 200).unwrap(),
+            background: Rgba::BLACK,
+            items: vec![PageItem::Image(ImagePlacement {
+                image: RasterImage {
+                    width: 100,
+                    height: 100,
+                    pixels: [200, 201, 202, 255].repeat(100 * 100).into(),
+                },
+                x: 50.0,
+                y: 40.0,
+                width: 100.0,
+                height: 100.0,
+                source: Some(source.clone()),
+                text_layer: None,
+                replacement: Some(FixedPageTextReplacementPlacement {
+                    segments: vec![FixedPageTextReplacementSegmentPlacement {
+                        rect: FixedPageTextRect {
+                            x: 60.0,
+                            y: 60.0,
+                            width: 80.0,
+                            height: 30.0,
+                        },
+                        text: TextPlacement {
+                            layout: Arc::new(layout),
+                            text,
+                            source_text_start: 0,
+                            lines: 0..line_count,
+                            origin_x: 64.0,
+                            origin_y: 64.0,
+                            source: Some(source.clone()),
+                        },
+                    }],
+                }),
+            })],
+        };
+
+        let list = DisplayListCompiler.compile(&page);
+
+        assert!(matches!(
+            list.commands.first(),
+            Some(DisplayCommand::Image(_))
+        ));
+        assert!(matches!(
+            list.commands.get(1),
+            Some(DisplayCommand::FillRect(_))
+        ));
+        let Some(DisplayCommand::FillRect(mask)) = list.commands.get(1) else {
+            unreachable!();
+        };
+        assert_eq!(mask.color, Color::from_rgba8(200, 201, 202, 255));
+        assert!(
+            list.commands
+                .iter()
+                .skip(2)
+                .any(|command| matches!(command, DisplayCommand::Glyphs(_)))
+        );
+        assert_eq!(list.text_region_count(), 1);
+        let fragment = list.selection_fragment(0, 0.."译文".len()).unwrap();
+        assert_eq!(fragment.quote, "译文");
         assert_eq!(fragment.range, source);
     }
 }

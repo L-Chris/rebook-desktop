@@ -390,6 +390,24 @@ pub struct FixedPageTextLayer {
     pub text: String,
     /// Source character ranges and their fixed-page rectangles.
     pub spans: Vec<FixedPageTextSpan>,
+    /// Optional replacement text painted back into the original fixed page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<FixedPageTextReplacement>,
+}
+
+/// Replacement text and its repaint region in fixed-page coordinates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FixedPageTextReplacement {
+    pub segments: Vec<FixedPageTextReplacementSegment>,
+}
+
+/// One translated fragment repainted over its original fixed-page region.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FixedPageTextReplacementSegment {
+    pub text: String,
+    pub rect: FixedPageTextRect,
+    /// Character offset of this fragment in the translated page text.
+    pub source_offset: u64,
 }
 
 /// One source-backed fragment in a fixed page text layer.

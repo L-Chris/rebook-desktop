@@ -74,12 +74,23 @@ pub struct ReaderSelection {
     pub rects: Vec<ReaderSelectionRect>,
 }
 
+/// One source-backed text fragment retained on a logical page in the current
+/// visible spread. The source range remains stable while `position` identifies
+/// the page that supplied the visible quote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReaderVisibleTextFragment {
+    pub position: ReaderPosition,
+    pub range: SourceRange,
+    pub text: String,
+}
+
 /// One visual reader surface assembled from adjacent logical pages. In double
 /// mode the secondary page may come from the next layout segment or authored
 /// spine section.
 pub struct ReaderSpread {
     pub primary: Arc<PageDisplayList>,
     pub secondary: Option<Arc<PageDisplayList>>,
+    pub primary_offset_x: f32,
     pub secondary_offset_x: f32,
 }
 
@@ -654,9 +665,16 @@ impl ReaderSession {
         } else {
             None
         };
+        let (primary_offset_x, secondary_offset_x) = resolve_spread_offsets(
+            &primary,
+            secondary.as_deref(),
+            secondary_offset_x,
+            self.style.column_gap == 0.0,
+        );
         Ok(ReaderSpread {
             primary,
             secondary,
+            primary_offset_x,
             secondary_offset_x,
         })
     }
@@ -671,6 +689,34 @@ impl ReaderSession {
             }
         }
         Ok(indices)
+    }
+
+    /// Returns the source-backed text actually retained on the currently
+    /// visible logical pages. In double-page mode this includes both pages in
+    /// visual order and excludes text outside the displayed spread.
+    pub fn current_visible_text_fragments(
+        &mut self,
+    ) -> Result<Vec<ReaderVisibleTextFragment>, ReaderError> {
+        let mut fragments = Vec::new();
+        for (position, page, _) in self.current_spread_pages()? {
+            for region_index in 0..page.text_region_count() {
+                let Some(visible_range) = page.text_region_visible_range(region_index) else {
+                    continue;
+                };
+                let Some(fragment) = page.selection_fragment(region_index, visible_range) else {
+                    continue;
+                };
+                if fragment.quote.trim().is_empty() {
+                    continue;
+                }
+                fragments.push(ReaderVisibleTextFragment {
+                    position,
+                    range: fragment.range,
+                    text: fragment.quote,
+                });
+            }
+        }
+        Ok(fragments)
     }
 
     /// Resolves a canvas point against the currently visible logical pages.
@@ -1101,26 +1147,13 @@ impl ReaderSession {
     fn current_spread_pages(
         &mut self,
     ) -> Result<Vec<(ReaderPosition, Arc<PageDisplayList>, f32)>, ReaderError> {
-        self.poll_prefetch()?;
         let position = self.current_position();
-        let (primary, visible_pages, secondary_offset_x) = self
-            .cache
-            .get(&self.current_key())
-            .and_then(|segment| {
-                segment.pages.get(self.current_page).map(|page| {
-                    (
-                        Arc::clone(page),
-                        segment.visible_pages,
-                        segment.continuation_offset_x,
-                    )
-                })
-            })
-            .ok_or(ReaderError::PageOutOfBounds(position))?;
-        let mut pages = vec![(position, primary, 0.0)];
-        if visible_pages > 1
+        let spread = self.current_spread()?;
+        let mut pages = vec![(position, spread.primary, spread.primary_offset_x)];
+        if let Some(secondary) = spread.secondary
             && let Some(position) = self.next_position(position)?
         {
-            pages.push((position, self.page_at(position)?, secondary_offset_x));
+            pages.push((position, secondary, spread.secondary_offset_x));
         }
         Ok(pages)
     }
@@ -2052,6 +2085,35 @@ fn total_progression(location: ReaderLocation, section_count: usize) -> f64 {
     ((to_f64(location.section_index) + segment_progress) / section_count).clamp(0.0, 1.0)
 }
 
+// Spread bounds use kurbo's f64 geometry while reader composition uses bounded
+// logical f32 coordinates.
+#[allow(clippy::cast_possible_truncation)]
+fn resolve_spread_offsets(
+    primary: &PageDisplayList,
+    secondary: Option<&PageDisplayList>,
+    default_secondary_offset_x: f32,
+    compact_images: bool,
+) -> (f32, f32) {
+    let Some(secondary) = secondary.filter(|_| compact_images) else {
+        return (0.0, default_secondary_offset_x);
+    };
+    let (Some(primary_bounds), Some(secondary_bounds)) =
+        (primary.image_bounds(), secondary.image_bounds())
+    else {
+        return (0.0, default_secondary_offset_x);
+    };
+    let viewport_width = f64::from(primary.width());
+    let primary_offset_x = f64::midpoint(
+        viewport_width - primary_bounds.x0 - primary_bounds.x1 - secondary_bounds.x1,
+        secondary_bounds.x0,
+    );
+    let secondary_offset_x = primary_bounds.x1 + primary_offset_x - secondary_bounds.x0;
+    if !primary_offset_x.is_finite() || !secondary_offset_x.is_finite() {
+        return (0.0, default_secondary_offset_x);
+    }
+    (primary_offset_x as f32, secondary_offset_x as f32)
+}
+
 // Renderer geometry uses f64 (kurbo), while pointer events and the reader's
 // public logical-pixel geometry use f32. Page coordinates are viewport-bounded,
 // so the conversion cannot overflow and only discards unused sub-pixel precision.
@@ -2116,7 +2178,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use rebook_layout::ReaderDefaultFont;
+    use rebook_layout::{ReaderDefaultFont, SpreadMode};
     use rebook_publication::{
         Block, BlockStyle, Inline, Metadata, PublicationId, PublicationUrl, Resource, Section,
         SectionAnchor, SourceAnchor, SourceRange, SpineItem, SpineItemId, TextBlock, TextBlockKind,
@@ -2224,6 +2286,46 @@ mod tests {
         LayoutViewport::new(width, height).unwrap()
     }
 
+    fn image_page(image_x: f32) -> PageDisplayList {
+        DisplayListCompiler.compile(&rebook_layout::PageLayout {
+            viewport: viewport(1_200, 700),
+            background: rebook_publication::Rgba::BLACK,
+            items: vec![rebook_layout::PageItem::Image(
+                rebook_layout::ImagePlacement {
+                    image: rebook_layout::RasterImage {
+                        width: 400,
+                        height: 600,
+                        pixels: vec![255; 400 * 600 * 4].into(),
+                    },
+                    x: image_x,
+                    y: 0.0,
+                    width: 400.0,
+                    height: 600.0,
+                    source: None,
+                    text_layer: None,
+                    replacement: None,
+                },
+            )],
+        })
+    }
+
+    #[test]
+    fn compact_image_spread_touches_and_centers_page_edges() {
+        let primary = image_page(150.0);
+        let secondary = image_page(150.0);
+        let (primary_offset, secondary_offset) =
+            resolve_spread_offsets(&primary, Some(&secondary), 600.0, true);
+        let primary_bounds = primary.image_bounds().unwrap();
+        let secondary_bounds = secondary.image_bounds().unwrap();
+        let primary_left = primary_bounds.x0 + f64::from(primary_offset);
+        let primary_right = primary_bounds.x1 + f64::from(primary_offset);
+        let secondary_left = secondary_bounds.x0 + f64::from(secondary_offset);
+        let secondary_right = secondary_bounds.x1 + f64::from(secondary_offset);
+
+        assert!((primary_right - secondary_left).abs() < f64::EPSILON);
+        assert!(((primary_left + secondary_right) / 2.0 - 600.0).abs() < f64::EPSILON);
+    }
+
     #[test]
     fn cached_page_turns_and_boundaries_do_not_reparse() {
         let source = CountingSource::new(&["缓存翻页测试。".repeat(600)]);
@@ -2292,6 +2394,51 @@ mod tests {
                     selection.rects[0].y + selection.rects[0].height / 2.0,
                 )
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn visible_text_fragments_follow_the_current_page() {
+        let source = CountingSource::new(&["visible page text ".repeat(1_200)]);
+        let mut style = ReaderStyle::default();
+        style.spread = SpreadMode::Single;
+        let mut reader = ReaderSession::open(source, viewport(600, 400), style).unwrap();
+
+        let first = reader.current_visible_text_fragments().unwrap();
+        assert!(!first.is_empty());
+        assert!(first.iter().all(|fragment| {
+            fragment.position
+                == ReaderPosition {
+                    section_index: reader.location().section_index,
+                    segment_index: reader.location().segment_index,
+                    page_index: reader.location().page_index,
+                }
+        }));
+        let first_ranges = first
+            .iter()
+            .map(|fragment| fragment.range.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            reader.turn_page(PageDirection::Next).unwrap().outcome,
+            NavigationOutcome::Moved
+        );
+        let second = reader.current_visible_text_fragments().unwrap();
+        assert!(!second.is_empty());
+        assert!(second.iter().all(|fragment| {
+            fragment.position
+                == ReaderPosition {
+                    section_index: reader.location().section_index,
+                    segment_index: reader.location().segment_index,
+                    page_index: reader.location().page_index,
+                }
+        }));
+        assert_ne!(
+            first_ranges,
+            second
+                .iter()
+                .map(|fragment| fragment.range.clone())
+                .collect::<Vec<_>>()
         );
     }
 

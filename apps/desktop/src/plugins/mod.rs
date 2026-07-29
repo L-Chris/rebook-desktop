@@ -23,6 +23,7 @@ pub use commands::{
     ChatCommand, ChatCommandResolution, chat_command_suggestions, resolve_chat_command,
 };
 pub use rewrite::RewriteBookSource;
+pub(crate) use search::section_title;
 pub use search::{BookSearchResult, search_book};
 pub use translation::{BlockTranslation, TranslationBlockInput, TranslationBookSource};
 

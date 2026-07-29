@@ -10,17 +10,19 @@ use parley::{
     LayoutContext, LineHeight, StyleProperty,
 };
 use rebook_publication::{
-    Block, BookSource, FixedPageTextLayer, ImageStyle, Inline, PublicationError, PublicationUrl,
-    RenditionLayout, Rgba, Section, SourceRange, TextAlignment, TextBlock, TextBlockKind,
-    TextStyle,
+    Block, BookSource, FixedPageTextLayer, FixedPageTextRect, ImageStyle, Inline, PublicationError,
+    PublicationUrl, RenditionLayout, Rgba, Section, SourceRange, TextAlignment, TextBlock,
+    TextBlockKind, TextRun, TextStyle,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const COLUMN_GAP: f32 = 36.0;
+const DEFAULT_COLUMN_GAP: f32 = 36.0;
 const IMAGE_BLOCK_GAP: f32 = 14.0;
 const MIN_COLUMN_WIDTH: f32 = 360.0;
 const MAX_COLUMN_WIDTH: f32 = 960.0;
+const DEFAULT_TOP_MARGIN: f32 = 0.0;
+const DEFAULT_BOTTOM_MARGIN: f32 = 24.0;
 
 /// Logical viewport in device-independent pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,7 +45,9 @@ impl LayoutViewport {
 pub struct ReaderStyle {
     pub typography: ReaderTypography,
     pub horizontal_margin: f32,
-    pub vertical_margin: f32,
+    pub top_margin: f32,
+    pub bottom_margin: f32,
+    pub column_gap: f32,
     pub spread: SpreadMode,
     pub foreground: Rgba,
     pub background: Rgba,
@@ -190,7 +194,9 @@ impl Default for ReaderStyle {
         Self {
             typography: ReaderTypography::default(),
             horizontal_margin: 44.0,
-            vertical_margin: 44.0,
+            top_margin: DEFAULT_TOP_MARGIN,
+            bottom_margin: DEFAULT_BOTTOM_MARGIN,
+            column_gap: DEFAULT_COLUMN_GAP,
             spread: SpreadMode::Double,
             foreground: Rgba::BLACK,
             background: Rgba {
@@ -298,6 +304,18 @@ pub struct ImagePlacement {
     pub height: f32,
     pub source: Option<SourceRange>,
     pub text_layer: Option<FixedPageTextLayer>,
+    pub replacement: Option<FixedPageTextReplacementPlacement>,
+}
+
+/// Translated text repainted inside the original fixed-layout page image.
+pub struct FixedPageTextReplacementPlacement {
+    pub segments: Vec<FixedPageTextReplacementSegmentPlacement>,
+}
+
+/// One shaped translated fragment inside a fixed-page replacement overlay.
+pub struct FixedPageTextReplacementSegmentPlacement {
+    pub rect: FixedPageTextRect,
+    pub text: TextPlacement,
 }
 
 /// Positioned thematic break.
@@ -424,12 +442,17 @@ impl LayoutEngine {
                                 pixels: decoded.into_raw().into(),
                             }
                         };
-                        paginator.push_image(
+                        let replacements = paginator.push_image(
                             raster,
                             image.style,
                             image.source.clone(),
                             image.text_layer.clone(),
                         );
+                        for replacement in replacements {
+                            let prepared =
+                                self.shape_fixed_page_replacement(&replacement, reader_style);
+                            paginator.push_fixed_page_replacement(&prepared, replacement)?;
+                        }
                     }
                     Block::Separator => paginator.push_separator(),
                     Block::PageBreak => paginator.force_page(),
@@ -450,8 +473,18 @@ impl LayoutEngine {
         reader_style: &ReaderStyle,
         content_width: f32,
     ) -> PreparedText {
+        self.shape_text_with_min_width(block, reader_style, content_width, 40.0)
+    }
+
+    fn shape_text_with_min_width(
+        &mut self,
+        block: &TextBlock,
+        reader_style: &ReaderStyle,
+        content_width: f32,
+        minimum_width: f32,
+    ) -> PreparedText {
         let (text, spans, source_text_start) = flatten_text(block, reader_style.foreground);
-        let available_width = (content_width - block.style.indent).max(40.0);
+        let available_width = (content_width - block.style.indent).max(minimum_width);
         let typography = &reader_style.typography;
         let font_stack = if block.kind == TextBlockKind::Preformatted {
             typography.monospace_stack()
@@ -521,6 +554,30 @@ impl LayoutEngine {
             source_text_start,
         }
     }
+
+    fn shape_fixed_page_replacement(
+        &mut self,
+        request: &FixedPageReplacementRequest,
+        reader_style: &ReaderStyle,
+    ) -> PreparedText {
+        let block = fixed_page_replacement_block(&request.text, request.source.clone());
+        let mut style = reader_style.clone();
+        style.typography.font_size = style.typography.font_size.min(14.0);
+        style.typography.minimum_font_size = 5.0;
+        let available_width = (request.rect.width - 3.0).max(2.0);
+        let available_height = (request.rect.height - 3.0).max(2.0);
+
+        loop {
+            let prepared = self.shape_text_with_min_width(&block, &style, available_width, 2.0);
+            let height = prepared_text_height(&prepared);
+            if height <= available_height || style.typography.font_size <= 5.0 {
+                return prepared;
+            }
+            let next_size = (style.typography.font_size * available_height / height)
+                .clamp(5.0, style.typography.font_size - 0.5);
+            style.typography.font_size = next_size;
+        }
+    }
 }
 
 fn fragments_are_standalone_cover(fragments: &[&[Block]], cover: Option<&PublicationUrl>) -> bool {
@@ -542,14 +599,14 @@ fn resolve_page_geometry(
 ) -> PageGeometry {
     let (content_left, content_width, column_count, continuation_offset_x) =
         resolve_horizontal_page_geometry(page_width, reader_style);
-    let vertical_margin = reader_style
-        .vertical_margin
-        .min(page_height.mul_add(0.2, -8.0).max(20.0));
-    let content_bottom = (page_height - vertical_margin).max(vertical_margin + 40.0);
+    let max_vertical_margin = page_height.mul_add(0.2, -8.0).max(20.0);
+    let top_margin = reader_style.top_margin.min(max_vertical_margin);
+    let bottom_margin = reader_style.bottom_margin.min(max_vertical_margin);
+    let content_bottom = (page_height - bottom_margin).max(top_margin + 40.0);
 
     PageGeometry {
         left: content_left,
-        top: vertical_margin,
+        top: top_margin,
         width: content_width,
         bottom: content_bottom,
         visible_pages: column_count,
@@ -564,7 +621,8 @@ fn resolve_horizontal_page_geometry(
     let horizontal_margin = reader_style
         .horizontal_margin
         .min(page_width.mul_add(0.2, -8.0).max(20.0));
-    let double_available = page_width - horizontal_margin * 2.0 - COLUMN_GAP;
+    let configured_column_gap = reader_style.column_gap.max(0.0);
+    let double_available = page_width - horizontal_margin * 2.0 - configured_column_gap;
     let column_count = if reader_style.spread == SpreadMode::Double
         && double_available >= MIN_COLUMN_WIDTH * 2.0
     {
@@ -572,7 +630,11 @@ fn resolve_horizontal_page_geometry(
     } else {
         1
     };
-    let column_gap = if column_count == 2 { COLUMN_GAP } else { 0.0 };
+    let column_gap = if column_count == 2 {
+        configured_column_gap
+    } else {
+        0.0
+    };
     let column_divisor = if column_count == 2 { 2.0 } else { 1.0 };
     let content_width = ((page_width - horizontal_margin * 2.0 - column_gap) / column_divisor)
         .clamp(80.0, MAX_COLUMN_WIDTH);
@@ -603,6 +665,47 @@ struct PreparedText {
     layout: Arc<Layout<TextBrush>>,
     text: Arc<str>,
     source_text_start: usize,
+}
+
+struct FixedPageReplacementRequest {
+    text: String,
+    rect: FixedPageTextRect,
+    source: Option<SourceRange>,
+}
+
+fn fixed_page_replacement_block(text: &str, source: Option<SourceRange>) -> TextBlock {
+    let mut content = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if index > 0 {
+            content.push(Inline::Break);
+        }
+        if !line.is_empty() {
+            content.push(Inline::Text(TextRun {
+                text: line.to_owned(),
+                style: TextStyle::default(),
+                link: None,
+            }));
+        }
+    }
+    TextBlock {
+        kind: TextBlockKind::Paragraph,
+        content,
+        style: rebook_publication::BlockStyle {
+            line_height: 1.2,
+            ..rebook_publication::BlockStyle::default()
+        },
+        source,
+    }
+}
+
+fn prepared_text_height(prepared: &PreparedText) -> f32 {
+    let Some(first) = prepared.layout.get(0) else {
+        return 0.0;
+    };
+    let Some(last) = prepared.layout.get(prepared.layout.len().saturating_sub(1)) else {
+        return 0.0;
+    };
+    (last.metrics().block_max_coord - first.metrics().block_min_coord).max(0.0)
 }
 
 fn flatten_text(block: &TextBlock, fallback_color: Rgba) -> (String, Vec<StyledRange>, usize) {
@@ -756,7 +859,7 @@ impl Paginator {
         style: ImageStyle,
         source: Option<SourceRange>,
         text_layer: Option<FixedPageTextLayer>,
-    ) {
+    ) -> Vec<FixedPageReplacementRequest> {
         let intrinsic_width = image.width.max(1) as f32;
         let intrinsic_height = image.height.max(1) as f32;
         let aspect_ratio = intrinsic_width / intrinsic_height;
@@ -789,6 +892,30 @@ impl Paginator {
             self.advance_column();
         }
         let x = self.column_left() + (self.width - width) / 2.0;
+        let replacements = text_layer.as_ref().map_or_else(Vec::new, |layer| {
+            let Some(replacement) = layer.replacement.as_ref() else {
+                return Vec::new();
+            };
+            if layer.width <= 0.0 || layer.height <= 0.0 {
+                return Vec::new();
+            }
+            let scale_x = width / layer.width;
+            let scale_y = height / layer.height;
+            replacement
+                .segments
+                .iter()
+                .map(|segment| FixedPageReplacementRequest {
+                    text: segment.text.clone(),
+                    rect: FixedPageTextRect {
+                        x: x + segment.rect.x * scale_x,
+                        y: self.cursor_y + segment.rect.y * scale_y,
+                        width: segment.rect.width * scale_x,
+                        height: segment.rect.height * scale_y,
+                    },
+                    source: fixed_page_replacement_source(source.as_ref(), segment),
+                })
+                .collect()
+        });
         self.items.push(PageItem::Image(ImagePlacement {
             image,
             x,
@@ -797,9 +924,45 @@ impl Paginator {
             height,
             source,
             text_layer,
+            replacement: None,
         }));
         self.column_has_content = true;
         self.cursor_y += height + style.margin_after.max(IMAGE_BLOCK_GAP);
+        replacements
+    }
+
+    fn push_fixed_page_replacement(
+        &mut self,
+        prepared: &PreparedText,
+        request: FixedPageReplacementRequest,
+    ) -> Result<(), LayoutError> {
+        let Some(first) = prepared.layout.get(0) else {
+            return Ok(());
+        };
+        let Some(PageItem::Image(image)) = self.items.last_mut() else {
+            return Err(LayoutError::InvalidLayout);
+        };
+        let padding = 1.5;
+        let segment = FixedPageTextReplacementSegmentPlacement {
+            rect: request.rect,
+            text: TextPlacement {
+                layout: Arc::clone(&prepared.layout),
+                text: Arc::clone(&prepared.text),
+                source_text_start: prepared.source_text_start,
+                lines: 0..prepared.layout.len(),
+                origin_x: request.rect.x + padding,
+                origin_y: request.rect.y + padding - first.metrics().block_min_coord,
+                source: request.source,
+            },
+        };
+        image
+            .replacement
+            .get_or_insert_with(|| FixedPageTextReplacementPlacement {
+                segments: Vec::new(),
+            })
+            .segments
+            .push(segment);
+        Ok(())
     }
 
     fn ensure_minimum_spacing(&mut self, amount: f32) {
@@ -869,7 +1032,15 @@ impl Paginator {
             && let [PageItem::Image(image)] = self.items.as_mut_slice()
         {
             let available_height = self.bottom - self.top;
-            image.y = self.top + ((available_height - image.height) / 2.0).max(0.0);
+            let centered_y = self.top + ((available_height - image.height) / 2.0).max(0.0);
+            let offset_y = centered_y - image.y;
+            image.y = centered_y;
+            if let Some(replacement) = image.replacement.as_mut() {
+                for segment in &mut replacement.segments {
+                    segment.rect.y += offset_y;
+                    segment.text.origin_y += offset_y;
+                }
+            }
         }
         self.pages.push(PageLayout {
             viewport: self.viewport,
@@ -891,6 +1062,23 @@ impl Paginator {
         }
         self.pages
     }
+}
+
+fn fixed_page_replacement_source(
+    source: Option<&SourceRange>,
+    segment: &rebook_publication::FixedPageTextReplacementSegment,
+) -> Option<SourceRange> {
+    let mut source = source?.clone();
+    let start = source
+        .start
+        .text_offset
+        .saturating_add(segment.source_offset);
+    source.start.text_offset = start;
+    source.end.spine = source.start.spine.clone();
+    source.end.node.clone_from(&source.start.node);
+    source.end.text_offset =
+        start.saturating_add(u64::try_from(segment.text.chars().count()).unwrap_or(u64::MAX));
+    Some(source)
 }
 
 /// Native layout errors.
@@ -956,6 +1144,17 @@ mod tests {
     }
 
     #[test]
+    fn default_page_geometry_compacts_only_the_top_inset() {
+        let style = ReaderStyle::default();
+        let geometry = resolve_page_geometry(800.0, 600.0, &style);
+
+        assert!((style.top_margin - DEFAULT_TOP_MARGIN).abs() < f32::EPSILON);
+        assert!((style.bottom_margin - DEFAULT_BOTTOM_MARGIN).abs() < f32::EPSILON);
+        assert!((geometry.top - DEFAULT_TOP_MARGIN).abs() < f32::EPSILON);
+        assert!((geometry.bottom - (600.0 - DEFAULT_BOTTOM_MARGIN)).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn wide_viewports_cap_and_center_each_reading_column() {
         let viewport_width = 3_000.0;
         let page_height = 900.0;
@@ -979,14 +1178,31 @@ mod tests {
                 ..ReaderStyle::default()
             },
         );
-        let spread_width = MAX_COLUMN_WIDTH * 2.0 + COLUMN_GAP;
+        let spread_width = MAX_COLUMN_WIDTH * 2.0 + DEFAULT_COLUMN_GAP;
         assert_eq!(double.visible_pages, 2);
         assert!((double.width - MAX_COLUMN_WIDTH).abs() < f32::EPSILON);
         assert!((double.left - (viewport_width - spread_width) / 2.0).abs() < f32::EPSILON);
     }
+
+    #[test]
+    fn zero_column_gap_places_double_pages_next_to_each_other() {
+        let geometry = resolve_page_geometry(
+            1_200.0,
+            700.0,
+            &ReaderStyle {
+                spread: SpreadMode::Double,
+                column_gap: 0.0,
+                ..ReaderStyle::default()
+            },
+        );
+
+        assert_eq!(geometry.visible_pages, 2);
+        assert!((geometry.continuation_offset_x - geometry.width).abs() < f32::EPSILON);
+    }
     use rebook_publication::{
-        Book, ImageBlock, ImageLength, Metadata, PublicationId, PublicationUrl, RasterResource,
-        Resource, SpineItemId, TocEntry,
+        Book, FixedPageTextReplacement, FixedPageTextReplacementSegment, FixedPageTextSpan,
+        ImageBlock, ImageLength, Metadata, PublicationId, PublicationUrl, RasterResource,
+        RenditionLayout, Resource, SourceAnchor, SpineItemId, TocEntry,
     };
 
     struct EmptySource {
@@ -1305,9 +1521,9 @@ mod tests {
             ],
             anchors: Vec::new(),
         };
-        let viewport = LayoutViewport::new(400, 180).unwrap();
+        let viewport = LayoutViewport::new(400, 140).unwrap();
         let style = ReaderStyle::default();
-        let page_top = resolve_page_geometry(400.0, 180.0, &style).top;
+        let page_top = resolve_page_geometry(400.0, 140.0, &style).top;
 
         let layout = LayoutEngine::new()
             .layout_section(&source, &section, viewport, &style)
@@ -1354,6 +1570,95 @@ mod tests {
     }
 
     #[test]
+    fn fixed_page_replacement_stays_on_the_original_page_image() {
+        let href = PublicationUrl::parse("page-1.png").unwrap();
+        let spine = SpineItemId::new("pdf-page-1").unwrap();
+        let source_range = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "pdf-page-text".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "pdf-page-text".into(),
+                text_offset: 4,
+            },
+        };
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("fixed-page-translation").unwrap(),
+                metadata: Metadata {
+                    layout: RenditionLayout::PrePaginated,
+                    ..Metadata::default()
+                },
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let replacement_rect = FixedPageTextRect {
+            x: 20.0,
+            y: 10.0,
+            width: 100.0,
+            height: 40.0,
+        };
+        let section = Section {
+            id: SpineItemId::new("pdf-page-1").unwrap(),
+            href: PublicationUrl::parse("page-1.pdf").unwrap(),
+            blocks: vec![Block::Image(ImageBlock {
+                href,
+                alt: "PDF page 1".into(),
+                style: ImageStyle::default(),
+                source: Some(source_range),
+                text_layer: Some(FixedPageTextLayer {
+                    width: 200.0,
+                    height: 100.0,
+                    text: "PDF text".into(),
+                    spans: vec![FixedPageTextSpan {
+                        char_range: 0..8,
+                        rect: replacement_rect,
+                    }],
+                    replacement: Some(FixedPageTextReplacement {
+                        segments: vec![FixedPageTextReplacementSegment {
+                            text: "译文".into(),
+                            rect: replacement_rect,
+                            source_offset: 0,
+                        }],
+                    }),
+                }),
+            })],
+            anchors: Vec::new(),
+        };
+
+        let layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                LayoutViewport::new(400, 500).unwrap(),
+                &ReaderStyle::default(),
+            )
+            .unwrap();
+
+        assert_eq!(layout.pages.len(), 1);
+        let [PageItem::Image(image)] = layout.pages[0].items.as_slice() else {
+            panic!("translation must remain attached to the fixed page image");
+        };
+        let replacement = image
+            .replacement
+            .as_ref()
+            .expect("fixed page should retain its replacement overlay");
+        let [segment] = replacement.segments.as_slice() else {
+            panic!("expected one translated fixed-page segment");
+        };
+        assert!(segment.rect.x >= image.x);
+        assert!(segment.rect.y >= image.y);
+        assert!(segment.rect.x + segment.rect.width <= image.x + image.width);
+        assert!(segment.rect.y + segment.rect.height <= image.y + image.height);
+        assert_eq!(segment.text.text.as_ref(), "译文");
+    }
+
+    #[test]
     fn reflowable_standalone_cover_is_vertically_centered() {
         let cover = PublicationUrl::parse("images/cover.jpg").unwrap();
         let source = EmptySource {
@@ -1390,7 +1695,10 @@ mod tests {
             panic!("expected a cover image placement");
         };
 
-        assert!((image.y - 200.0).abs() < 0.001);
+        let style = ReaderStyle::default();
+        let geometry = resolve_page_geometry(400.0, 500.0, &style);
+        let expected_y = geometry.top + (geometry.bottom - geometry.top - image.height) / 2.0;
+        assert!((image.y - expected_y).abs() < 0.001);
     }
 
     #[test]
@@ -1430,6 +1738,6 @@ mod tests {
             panic!("expected an illustration image placement");
         };
 
-        assert!((image.y - ReaderStyle::default().vertical_margin).abs() < 0.001);
+        assert!((image.y - ReaderStyle::default().top_margin).abs() < 0.001);
     }
 }

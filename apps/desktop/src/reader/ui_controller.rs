@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use super::{DesktopReader, ReaderOverlay};
+use super::{DesktopReader, PageTextureAnchor, ReaderOverlay};
 
 impl DesktopReader {
     pub(in crate::reader) fn set_sidebar_open(&mut self, open: bool) {
@@ -10,6 +10,9 @@ impl DesktopReader {
             .sidebar_motion
             .animate_to(if open { 1.0 } else { 0.0 })
         {
+            if self.ui.sidebar_pinned {
+                self.ui.page_texture_anchor = PageTextureAnchor::CanvasRightUntilSidebarResize;
+            }
             self.ui.last_motion_tick = Some(Instant::now());
         }
     }

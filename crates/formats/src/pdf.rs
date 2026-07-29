@@ -446,6 +446,7 @@ impl PdfTextExtractor {
             height,
             text,
             spans,
+            replacement: None,
         }
     }
 }
@@ -528,7 +529,7 @@ fn glyph_needs_space(previous: &ExtractedGlyph, current: &ExtractedGlyph) -> boo
         .height()
         .abs()
         .max(current.rect.height().abs());
-    gap > (line_height * 0.2).max(1.0)
+    gap > (line_height * 0.12).max(0.75)
 }
 
 #[allow(
@@ -583,6 +584,30 @@ fn interpreter_settings() -> InterpreterSettings {
         FontQuery::Fallback(_) | FontQuery::Standard(_) => default_resolver(query),
     });
     settings
+}
+
+#[cfg(test)]
+mod spacing_tests {
+    use super::*;
+
+    fn extracted_glyph(x: f64, advance_end_x: f64) -> ExtractedGlyph {
+        ExtractedGlyph {
+            text: "x".into(),
+            rect: Rect::new(x, 0.0, x + 5.0, 10.0),
+            baseline: Point::new(x, 10.0),
+            advance_end: Point::new(advance_end_x, 10.0),
+        }
+    }
+
+    #[test]
+    fn pdf_word_spacing_accepts_compressed_justified_spaces() {
+        let previous = extracted_glyph(0.0, 5.0);
+        let compressed_word_start = extracted_glyph(6.3, 11.3);
+        let normal_letter = extracted_glyph(5.7, 10.7);
+
+        assert!(glyph_needs_space(&previous, &compressed_word_start));
+        assert!(!glyph_needs_space(&previous, &normal_letter));
+    }
 }
 
 fn pdf_render_error(error: impl std::fmt::Debug) -> PublicationError {

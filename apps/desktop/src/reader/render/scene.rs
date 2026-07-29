@@ -33,7 +33,7 @@ impl DesktopReader {
         match self.reader.current_spread() {
             Ok(spread) => {
                 let mut bridge = VelloScene::new(&mut scene);
-                self.paint_page_overlays(&spread.primary, &mut bridge, 0.0);
+                self.paint_page_overlays(&spread.primary, &mut bridge, spread.primary_offset_x);
                 if let Some(secondary) = spread.secondary {
                     self.paint_page_overlays(&secondary, &mut bridge, spread.secondary_offset_x);
                 }
@@ -61,7 +61,9 @@ impl DesktopReader {
             Ok(spread) => {
                 let mut underlay_bridge = VelloScene::new(&mut underlay);
                 spread.primary.paint_background(&mut underlay_bridge);
-                spread.primary.paint_images_at(&mut underlay_bridge, 0.0);
+                spread
+                    .primary
+                    .paint_images_at(&mut underlay_bridge, spread.primary_offset_x);
                 if let Some(secondary) = &spread.secondary {
                     secondary.paint_images_at(&mut underlay_bridge, spread.secondary_offset_x);
                 }
@@ -69,7 +71,7 @@ impl DesktopReader {
                 let mut content_bridge = VelloScene::new(&mut content);
                 spread
                     .primary
-                    .paint_non_image_content_at(&mut content_bridge, 0.0);
+                    .paint_non_image_content_at(&mut content_bridge, spread.primary_offset_x);
                 if let Some(secondary) = spread.secondary {
                     secondary
                         .paint_non_image_content_at(&mut content_bridge, spread.secondary_offset_x);

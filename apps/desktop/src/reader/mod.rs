@@ -14,7 +14,7 @@ use crate::highlights::{HighlightStore, StoredHighlight};
 use crate::library::LibraryBook;
 use crate::plugins::{
     BlockTranslation, BookSearchResult, ChatResponse, ChatTurn, PluginSettings, RewriteBookSource,
-    TranslationBlockInput, TranslationBookSource,
+    TranslationBlockInput, TranslationBookSource, TranslationMode,
 };
 use crate::preferences::{self, AppLanguage, ReaderPreferences};
 use crate::sync::{SyncSettings, SyncStore};
@@ -30,6 +30,7 @@ const SEARCH_MARK_COLOR: Color = Color::from_rgba8(250, 204, 21, 89);
 const ASSISTANT_MARK_COLOR: Color = Color::from_rgba8(245, 158, 11, 56);
 
 mod assistant;
+mod chat_autocomplete;
 mod chat_markdown;
 mod egui_view;
 mod interaction;
@@ -38,6 +39,7 @@ pub(super) mod render;
 mod settings_controller;
 mod ui_controller;
 
+use chat_autocomplete::ChatReference;
 pub(crate) use egui_view::{ReaderFramePlan, ReaderPageTexture};
 use render::{PageSceneKey, PageSceneLayers};
 
@@ -59,14 +61,21 @@ pub(super) fn open_reader(
         &canonical_source.book().metadata.authors,
     );
     let rewrite_source = Arc::new(RewriteBookSource::new(canonical_source));
-    let plugin_settings = PluginSettings::load_default().unwrap_or_else(|error| {
+    let mut plugin_settings = PluginSettings::load_default().unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to load plugin settings; using defaults");
         PluginSettings::default()
     });
-    let translation_source = Arc::new(TranslationBookSource::new(
-        rewrite_source.clone(),
-        plugin_settings.translation_mode,
-    ));
+    if format == BookFormat::Pdf {
+        plugin_settings.translation_mode = TranslationMode::Replace;
+    }
+    let translation_source = Arc::new(if format == BookFormat::Pdf {
+        TranslationBookSource::new_fixed_page(
+            rewrite_source.clone(),
+            plugin_settings.translation_mode,
+        )
+    } else {
+        TranslationBookSource::new(rewrite_source.clone(), plugin_settings.translation_mode)
+    });
     let source: Arc<dyn BookSource> = translation_source.clone();
     let highlight_store = HighlightStore::from_repository(local_store.clone())?;
     let highlights = highlight_store.for_book(&book_id);
@@ -75,11 +84,14 @@ pub(super) fn open_reader(
         tracing::warn!(%error, "failed to load reader preferences; using defaults");
         ReaderPreferences::default()
     });
-    let style = ReaderStyle {
+    let mut style = ReaderStyle {
         spread: reader_preferences.spread,
         typography: reader_preferences.typography.clone(),
         ..ReaderStyle::default()
     };
+    if format == BookFormat::Pdf {
+        style.column_gap = 0.0;
+    }
     let sync_settings = SyncSettings::load_default().unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to load WebDAV settings; using defaults");
         SyncSettings::new_device()
@@ -269,6 +281,12 @@ pub(crate) type ChatTaskMessage = TaskResult<ChatResponse>;
 #[derive(Default)]
 struct ChatUiState {
     input: String,
+    cursor_char_index: usize,
+    suggestion_index: usize,
+    move_cursor_to_end: bool,
+    references: Vec<ChatReference>,
+    reference_options_location: Option<(usize, usize, usize)>,
+    reference_options: Vec<ChatReference>,
     messages: Vec<ChatTurn>,
     error: Option<String>,
     task: TaskSlot<ChatTask>,
@@ -460,9 +478,17 @@ impl Motion {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PageTextureAnchor {
+    #[default]
+    CanvasLeft,
+    CanvasRightUntilSidebarResize,
+}
+
 struct ReaderUiState {
     sidebar_open: bool,
     sidebar_pinned: bool,
+    page_texture_anchor: PageTextureAnchor,
     sidebar_tab: SidebarTab,
     toolbar_hovered: bool,
     toolbar_hide_at: Option<Instant>,
@@ -567,6 +593,7 @@ impl DesktopReader {
             ui: ReaderUiState {
                 sidebar_open: true,
                 sidebar_pinned: true,
+                page_texture_anchor: PageTextureAnchor::CanvasLeft,
                 sidebar_tab: SidebarTab::Toc,
                 toolbar_hovered: false,
                 toolbar_hide_at: None,
@@ -610,8 +637,9 @@ fn logical_dimension(value: f64) -> u32 {
 mod tests {
     use super::{
         BookDisplayMetadata, HashSet, Instant, MOTION_DURATION, Motion, NOTICE_AUTO_DISMISS_DELAY,
-        ReaderOverlay, ReaderUiState, SidebarTab, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION,
-        TranslationUiState, logical_dimension, resolve_book_display_metadata,
+        PageTextureAnchor, ReaderOverlay, ReaderUiState, SidebarTab, TOOLBAR_HIDE_DELAY,
+        TOOLBAR_MOTION_DURATION, TranslationUiState, logical_dimension,
+        resolve_book_display_metadata,
     };
 
     #[test]
@@ -658,6 +686,7 @@ mod tests {
         let mut ui = ReaderUiState {
             sidebar_open: false,
             sidebar_pinned: false,
+            page_texture_anchor: PageTextureAnchor::CanvasLeft,
             sidebar_tab: SidebarTab::Toc,
             toolbar_hovered: false,
             toolbar_hide_at: None,

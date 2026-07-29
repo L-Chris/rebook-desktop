@@ -1,12 +1,19 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use rebook_reader::ReaderVisibleTextFragment;
+
 use crate::platform::UserEvent;
 use crate::plugins::{
     BookSearchResult, ChatCommand, ChatCommandResolution, ChatRole, ChatTurn,
-    TranslationBlockInput, chat_with_book, resolve_chat_command, search_book, translate_blocks,
+    TranslationBlockInput, chat_with_book, resolve_chat_command, search_book, section_title,
+    translate_blocks,
 };
 
+use super::chat_autocomplete::{
+    ChatReference, ChatReferenceKind, build_chat_prompt_with_references,
+    chat_reference_suggestions, chat_reference_token, insert_chat_reference,
+};
 use super::{
     AssistantPanel, ChatTask, ChatTaskMessage, DesktopReader, FocusedMark, MarkRetention,
     SearchTask, SearchTaskMessage, SidebarTab, SnapshotEffects, TocTranslationTask,
@@ -169,7 +176,7 @@ impl DesktopReader {
 
     pub(super) fn send_chat(&mut self) {
         let raw = self.chat.input.trim().to_owned();
-        if raw.is_empty() || self.chat.task.is_pending() {
+        if (raw.is_empty() && self.chat.references.is_empty()) || self.chat.task.is_pending() {
             return;
         }
         match resolve_chat_command(&raw) {
@@ -188,15 +195,43 @@ impl DesktopReader {
                     display_content: None,
                 });
                 self.chat.input = insert_text.into();
+                self.chat.cursor_char_index = self.chat.input.chars().count();
+                self.chat.move_cursor_to_end = true;
+                self.chat.suggestion_index = 0;
                 self.chat.error = None;
             }
             ChatCommandResolution::Resolved { display, prompt } => {
+                let references = std::mem::take(&mut self.chat.references);
+                let prompt = build_chat_prompt_with_references(
+                    &prompt,
+                    &references,
+                    self.language == crate::preferences::AppLanguage::English,
+                );
                 self.chat.input.clear();
+                self.chat.cursor_char_index = 0;
+                self.chat.suggestion_index = 0;
                 self.queue_chat(prompt, Some(display));
             }
             ChatCommandResolution::NotCommand | ChatCommandResolution::Unknown => {
+                let references = std::mem::take(&mut self.chat.references);
+                let display = if raw.is_empty() {
+                    references
+                        .iter()
+                        .map(|reference| format!("@{}", reference.label))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    raw.clone()
+                };
+                let prompt = build_chat_prompt_with_references(
+                    &raw,
+                    &references,
+                    self.language == crate::preferences::AppLanguage::English,
+                );
                 self.chat.input.clear();
-                self.queue_chat(raw, None);
+                self.chat.cursor_char_index = 0;
+                self.chat.suggestion_index = 0;
+                self.queue_chat(prompt, (!references.is_empty()).then_some(display));
             }
         }
     }
@@ -204,8 +239,144 @@ impl DesktopReader {
     pub(super) fn select_chat_command(&mut self, command: ChatCommand) {
         if !self.chat.task.is_pending() {
             self.chat.input = command.insert_text.into();
+            self.chat.cursor_char_index = self.chat.input.chars().count();
+            self.chat.suggestion_index = 0;
+            self.chat.move_cursor_to_end = true;
             self.chat.error = None;
         }
+    }
+
+    pub(super) fn current_chat_reference_suggestions(&mut self) -> Vec<ChatReference> {
+        let Some(token) = chat_reference_token(
+            &self.chat.input,
+            self.chat.cursor_char_index,
+            &self.chat.references,
+        ) else {
+            return Vec::new();
+        };
+        self.refresh_chat_reference_options();
+        chat_reference_suggestions(
+            &self.chat.reference_options,
+            &self.chat.references,
+            &token.query,
+        )
+    }
+
+    pub(super) fn select_chat_reference(&mut self, reference: ChatReference) {
+        if self.chat.task.is_pending() {
+            return;
+        }
+        let Some(token) = chat_reference_token(
+            &self.chat.input,
+            self.chat.cursor_char_index,
+            &self.chat.references,
+        ) else {
+            return;
+        };
+        let (input, cursor_char_index) =
+            insert_chat_reference(&self.chat.input, &token, &reference);
+        if !self
+            .chat
+            .references
+            .iter()
+            .any(|item| item.id == reference.id)
+        {
+            self.chat.references.push(reference);
+        }
+        self.chat.input = input;
+        self.chat.cursor_char_index = cursor_char_index;
+        self.chat.suggestion_index = 0;
+        self.chat.move_cursor_to_end = true;
+        self.chat.error = None;
+    }
+
+    pub(super) fn remove_chat_reference(&mut self, id: &str) {
+        self.chat.references.retain(|reference| reference.id != id);
+    }
+
+    fn refresh_chat_reference_options(&mut self) {
+        let location = (
+            self.snapshot.location.section_index,
+            self.snapshot.location.segment_index,
+            self.snapshot.location.page_index,
+        );
+        if self.chat.reference_options_location == Some(location) {
+            return;
+        }
+        let section_index = location.0;
+        let english = self.language == crate::preferences::AppLanguage::English;
+        let book_title = self.source.book().metadata.title.trim().to_owned();
+        let mut options = vec![ChatReference {
+            id: "book:full-text".into(),
+            kind: ChatReferenceKind::Book,
+            label: if english { "Full text" } else { "全文" }.into(),
+            description: if book_title.is_empty() {
+                if english { "Entire book" } else { "整本书" }.into()
+            } else {
+                book_title
+            },
+            locator: "rebook://book".into(),
+            excerpt: None,
+        }];
+
+        let mut section_titles = Vec::new();
+        if let Ok(section) = self.source.parse_section(section_index) {
+            let title = section_title(self.source.as_ref(), section_index, &section.blocks);
+            section_titles.push((section_index, title.clone()));
+            options.push(ChatReference {
+                id: format!("section:{section_index}"),
+                kind: ChatReferenceKind::Section,
+                label: title.clone(),
+                description: if english {
+                    format!("Current chapter · {}", section_index + 1)
+                } else {
+                    format!("当前章节 · {}", section_index + 1)
+                },
+                locator: format!("rebook://j/{section_index}"),
+                excerpt: None,
+            });
+        }
+
+        let Ok(fragments) = self.reader.current_visible_text_fragments() else {
+            self.chat.reference_options = options;
+            return;
+        };
+        let visible_paragraphs = visible_chat_paragraphs(fragments);
+        for (paragraph_index, (section_index, node, part_index, text)) in
+            visible_paragraphs.into_iter().enumerate()
+        {
+            let title_index = section_titles
+                .iter()
+                .position(|(candidate, _)| *candidate == section_index);
+            let title_index = title_index.unwrap_or_else(|| {
+                let title = self.source.parse_section(section_index).map_or_else(
+                    |_| {
+                        format!(
+                            "{} {}",
+                            if english { "Chapter" } else { "章节" },
+                            section_index + 1
+                        )
+                    },
+                    |section| section_title(self.source.as_ref(), section_index, &section.blocks),
+                );
+                section_titles.push((section_index, title));
+                section_titles.len() - 1
+            });
+            options.push(paragraph_reference(
+                section_index,
+                paragraph_index + 1,
+                &section_titles[title_index].1,
+                &node,
+                part_index,
+                &text,
+                english,
+            ));
+            if options.len() >= 120 {
+                break;
+            }
+        }
+        self.chat.reference_options = options;
+        self.chat.reference_options_location = Some(location);
     }
 
     pub(super) fn explain_selection(&mut self) {
@@ -439,6 +610,7 @@ impl DesktopReader {
             toc_ids.push(row.id.clone());
             blocks.push(TranslationBlockInput {
                 block_index,
+                segment_index: None,
                 text: row.label.clone(),
             });
         }
@@ -544,6 +716,73 @@ impl DesktopReader {
     }
 }
 
+fn paragraph_reference(
+    section_index: usize,
+    paragraph_index: usize,
+    section_title: &str,
+    node: &str,
+    part_index: usize,
+    text: &str,
+    english: bool,
+) -> ChatReference {
+    let label = clip_chat_reference_text(text, 32);
+    let excerpt = clip_chat_reference_text(text, 220);
+    ChatReference {
+        id: format!("paragraph:{section_index}:{node}:{part_index}"),
+        kind: ChatReferenceKind::Paragraph,
+        label,
+        description: if english {
+            format!("Paragraph {paragraph_index} · {section_title}")
+        } else {
+            format!("段落 {paragraph_index} · {section_title}")
+        },
+        locator: format!("rebook://j/{section_index}/{node}"),
+        excerpt: Some(excerpt),
+    }
+}
+
+type VisibleChatParagraph = (usize, String, usize, String);
+
+fn visible_chat_paragraphs(fragments: Vec<ReaderVisibleTextFragment>) -> Vec<VisibleChatParagraph> {
+    let mut paragraphs = Vec::<VisibleChatParagraph>::new();
+    for fragment in fragments {
+        for (part_index, part) in fragment.text.split("\n\n").enumerate() {
+            let text = normalize_chat_reference_text(part);
+            if text.chars().count() < 2 {
+                continue;
+            }
+            let section_index = fragment.position.section_index;
+            let node = fragment.range.start.node.clone();
+            if let Some((_, _, _, combined)) = paragraphs.iter_mut().find(
+                |(candidate_section, candidate_node, candidate_part, _)| {
+                    *candidate_section == section_index
+                        && *candidate_node == node
+                        && *candidate_part == part_index
+                },
+            ) {
+                combined.push(' ');
+                combined.push_str(&text);
+            } else {
+                paragraphs.push((section_index, node, part_index, text));
+            }
+        }
+    }
+    paragraphs
+}
+
+fn normalize_chat_reference_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn clip_chat_reference_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let mut clipped = value.chars().take(max_chars).collect::<String>();
+    clipped.push_str("...");
+    clipped
+}
+
 fn translated_toc_labels(
     toc_ids: &[String],
     translations: &[crate::plugins::BlockTranslation],
@@ -570,10 +809,12 @@ mod tests {
             &[
                 BlockTranslation {
                     block_index: 1,
+                    segment_index: None,
                     text: "第一章".into(),
                 },
                 BlockTranslation {
                     block_index: 99,
+                    segment_index: None,
                     text: "ignored".into(),
                 },
             ],

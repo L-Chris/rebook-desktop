@@ -104,7 +104,11 @@ pub(crate) fn text_block_text(block: &TextBlock) -> String {
         .collect()
 }
 
-fn section_title(source: &dyn BookSource, section_index: usize, blocks: &[Block]) -> String {
+pub(crate) fn section_title(
+    source: &dyn BookSource,
+    section_index: usize,
+    blocks: &[Block],
+) -> String {
     if let Some(title) = blocks.iter().find_map(|block| match block {
         Block::Text(block) if matches!(block.kind, TextBlockKind::Heading(_)) => {
             let text = text_block_text(block);
@@ -326,6 +330,7 @@ mod tests {
                                 height: 20.0,
                             },
                         }],
+                        replacement: None,
                     }),
                 })],
                 anchors: Vec::new(),
