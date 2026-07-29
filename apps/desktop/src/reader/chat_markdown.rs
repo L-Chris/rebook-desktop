@@ -288,8 +288,9 @@ fn asset_worker(requests: &Receiver<AssetRequest>, results: &Sender<AssetResult>
 fn render_formula(tex: &str, inline: bool) -> Result<String, String> {
     let font_size = if inline { 13.0 } else { 16.0 };
     let padding = if inline { 1.0 } else { 4.0 };
-    let mut measure = markie::fonts::CosmicTextMeasure::new()?;
-    let rendered = markie::math::render_math(tex, font_size, "#262624", &mut measure, !inline)?;
+    let mut measure = rebook_math::fonts::CosmicTextMeasure::new()?;
+    let rendered =
+        rebook_math::math::render_math(tex, font_size, "#262624", &mut measure, !inline)?;
     let width = (rendered.width + padding * 2.0).max(1.0);
     let height = (rendered.ascent + rendered.descent + padding * 2.0).max(1.0);
     let view_y = -rendered.ascent - padding;

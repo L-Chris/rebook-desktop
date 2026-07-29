@@ -26,7 +26,6 @@ image.workspace = true
 keyring.workspace = true
 kurbo.workspace = true
 lucide-icons.workspace = true
-markie.workspace = true
 mermaid-rs-renderer.workspace = true
 peniko.workspace = true
 pollster.workspace = true
@@ -35,10 +34,12 @@ quick-xml.workspace = true
 regex.workspace = true
 rebook-formats = { path = "../../crates/formats" }
 rebook-layout = { path = "../../crates/layout" }
+rebook-math = { path = "../../crates/math" }
 rebook-publication = { path = "../../crates/publication" }
 rebook-reader = { path = "../../crates/reader" }
 rebook-renderer = { path = "../../crates/renderer" }
 reqwest.workspace = true
+resvg.workspace = true
 rfd.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

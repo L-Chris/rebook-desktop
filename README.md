@@ -76,8 +76,16 @@ Torto 仍在持续开发中。当前不支持带 DRM 的电子书，也不追求
 项目使用 Rust `1.97.1`，桌面端包名仍为 `rebook-desktop`，运行产物为 `torto.exe`。
 
 ```powershell
+# Recommended once on Windows; new terminals will discover sccache automatically.
+winget install --id Mozilla.sccache --exact
+
+# Uses sccache when installed and falls back to ordinary Cargo otherwise.
+.\scripts\cargo-sccache.cmd run --locked -p rebook-desktop
 cargo run -p rebook-desktop
 cargo run -p rebook-desktop -- "test-data\数学觉醒学会更清晰地思考.epub"
+
+# Release-equivalent runtime profiling build with debug symbols.
+cargo run --locked --profile perf -p rebook-desktop
 ```
 
 修改 Rust 或 TOML 后自动重启：

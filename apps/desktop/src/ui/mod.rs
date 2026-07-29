@@ -1,3 +1,5 @@
+mod svg_loader;
+
 use egui::{
     Align2, Color32, ColorImage, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
     Response, Sense, Stroke, TextStyle, Ui, Vec2, WidgetInfo, WidgetType,
@@ -15,6 +17,7 @@ pub(crate) const ACCENT_SOFT: Color32 = Color32::from_rgb(222, 237, 228);
 
 pub(crate) fn configure(ctx: &egui::Context) {
     egui_extras::install_image_loaders(ctx);
+    svg_loader::install(ctx);
     // Application state is mutated while building a frame. A single pass keeps
     // keyboard and pointer actions exactly-once; the retained reader layout
     // performs its own explicit invalidation when geometry changes.

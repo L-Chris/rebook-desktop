@@ -1,0 +1,20 @@
+[package]
+name = "rebook-math"
+description = "Lightweight SVG math rendering for Torto chat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+cosmic-text.workspace = true
+latex2mathml.workspace = true
+lru.workspace = true
+parking_lot.workspace = true
+quick-xml.workspace = true
+
+[lints]
+workspace = true
