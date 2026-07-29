@@ -115,7 +115,7 @@
                                 Name='Torto'
                                 Description='Torto e-book reader'
                                 WorkingDirectory='APPLICATIONFOLDER'
-                                Icon='ProductICO'
+                                Icon='ProductIcon.exe'
                                 IconIndex='0'
                                 Advertise='yes'/>
                         </File>
@@ -152,8 +152,8 @@
           The product icon is the graphic that appears in the Add/Remove
           Programs control panel for the application.
         -->
-        <Icon Id='ProductICO' SourceFile='assets\windows\torto.ico'/>
-        <Property Id='ARPPRODUCTICON' Value='ProductICO'/>
+        <Icon Id='ProductIcon.exe' SourceFile='assets\windows\torto.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='ProductIcon.exe'/>
 
         <Property Id='ARPHELPLINK' Value='https://github.com/L-Chris/rebook-desktop'/>
 

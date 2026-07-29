@@ -261,6 +261,7 @@ impl FocusedMark {
 #[derive(Default)]
 struct SearchUiState {
     query: String,
+    focus_input: bool,
     results: Vec<BookSearchResult>,
     status: String,
     task: TaskSlot<SearchTask>,
@@ -478,17 +479,9 @@ impl Motion {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum PageTextureAnchor {
-    #[default]
-    CanvasLeft,
-    CanvasRightUntilSidebarResize,
-}
-
 struct ReaderUiState {
     sidebar_open: bool,
     sidebar_pinned: bool,
-    page_texture_anchor: PageTextureAnchor,
     sidebar_tab: SidebarTab,
     toolbar_hovered: bool,
     toolbar_hide_at: Option<Instant>,
@@ -593,7 +586,6 @@ impl DesktopReader {
             ui: ReaderUiState {
                 sidebar_open: true,
                 sidebar_pinned: true,
-                page_texture_anchor: PageTextureAnchor::CanvasLeft,
                 sidebar_tab: SidebarTab::Toc,
                 toolbar_hovered: false,
                 toolbar_hide_at: None,
@@ -637,9 +629,8 @@ fn logical_dimension(value: f64) -> u32 {
 mod tests {
     use super::{
         BookDisplayMetadata, HashSet, Instant, MOTION_DURATION, Motion, NOTICE_AUTO_DISMISS_DELAY,
-        PageTextureAnchor, ReaderOverlay, ReaderUiState, SidebarTab, TOOLBAR_HIDE_DELAY,
-        TOOLBAR_MOTION_DURATION, TranslationUiState, logical_dimension,
-        resolve_book_display_metadata,
+        ReaderOverlay, ReaderUiState, SidebarTab, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION,
+        TranslationUiState, logical_dimension, resolve_book_display_metadata,
     };
 
     #[test]
@@ -686,7 +677,6 @@ mod tests {
         let mut ui = ReaderUiState {
             sidebar_open: false,
             sidebar_pinned: false,
-            page_texture_anchor: PageTextureAnchor::CanvasLeft,
             sidebar_tab: SidebarTab::Toc,
             toolbar_hovered: false,
             toolbar_hide_at: None,

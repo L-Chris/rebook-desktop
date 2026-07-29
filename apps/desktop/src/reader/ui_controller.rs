@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use super::{DesktopReader, PageTextureAnchor, ReaderOverlay};
+use super::{DesktopReader, ReaderOverlay};
 
 impl DesktopReader {
     pub(in crate::reader) fn set_sidebar_open(&mut self, open: bool) {
@@ -10,9 +10,6 @@ impl DesktopReader {
             .sidebar_motion
             .animate_to(if open { 1.0 } else { 0.0 })
         {
-            if self.ui.sidebar_pinned {
-                self.ui.page_texture_anchor = PageTextureAnchor::CanvasRightUntilSidebarResize;
-            }
             self.ui.last_motion_tick = Some(Instant::now());
         }
     }
@@ -88,8 +85,8 @@ impl DesktopReader {
         if (sidebar_was_animating && !self.ui.sidebar_motion.is_animating())
             || (assistant_was_animating && !self.ui.assistant_motion.is_animating())
         {
-            // Reader layout is deliberately held stable during the slide. Trigger one
-            // final canvas draw so the EPUB is reflowed only once at the settled width.
+            // Side panels resize live. Bump once more at the settled dimensions so
+            // the final frame cannot retain an intermediate scene revision.
             self.bump_scene_revision();
         }
         if !self.ui.assistant_motion.is_animating() && self.ui.assistant_motion.target <= 0.0 {

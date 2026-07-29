@@ -101,6 +101,17 @@ impl GpuState {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
+    fn take_egui_input(
+        &self,
+        window: &Window,
+        egui_state: &mut egui_winit::State,
+    ) -> egui::RawInput {
+        let mut input = egui_state.take_egui_input(window);
+        input.max_texture_side =
+            usize::try_from(self.device.limits().max_texture_dimension_2d).ok();
+        input
+    }
+
     pub(super) fn render(
         &mut self,
         window: &Window,
@@ -108,7 +119,7 @@ impl GpuState {
         egui_ctx: &egui::Context,
         egui_state: &mut egui_winit::State,
     ) -> Result<(), String> {
-        let raw_input = egui_state.take_egui_input(window);
+        let raw_input = self.take_egui_input(window, egui_state);
         let pixels_per_point = egui_ctx.pixels_per_point();
         let mut plan = None;
         let output = egui_ctx.run_ui(raw_input, |ui| {
@@ -232,13 +243,6 @@ impl GpuState {
             .as_ref()
             .is_some_and(|target| target.size == size)
         {
-            return false;
-        }
-        // Keep sampling the settled page texture while either side panel is sliding.
-        // Replacing the native egui texture on every animation frame can expose a
-        // partially updated GPU view; egui can safely scale the existing texture until
-        // the panel reaches its target width, when we resize and redraw exactly once.
-        if plan.defer_target_resize && self.page_target.is_some() {
             return false;
         }
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {

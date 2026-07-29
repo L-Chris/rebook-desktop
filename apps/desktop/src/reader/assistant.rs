@@ -86,6 +86,7 @@ impl DesktopReader {
 
     pub(super) fn open_search(&mut self) {
         self.ui.sidebar_tab = SidebarTab::Search;
+        self.search.focus_input = true;
         self.set_sidebar_open(true);
     }
 

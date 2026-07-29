@@ -24,9 +24,6 @@ impl DesktopReader {
         if width == 0 || height == 0 || self.canvas_size == Some((width, height)) {
             return;
         }
-        if self.ui.sidebar_motion.is_animating() || self.ui.assistant_motion.is_animating() {
-            return;
-        }
         let Ok(viewport) = LayoutViewport::new(width, height) else {
             return;
         };

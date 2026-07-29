@@ -10,7 +10,7 @@ use super::chat_autocomplete::{
     ChatReference, ChatReferenceKind, chat_reference_token, move_suggestion_index,
 };
 use super::chat_markdown::ChatMarkdownState;
-use super::{AssistantPanel, DesktopReader, PageTextureAnchor, ReaderOverlay, SidebarTab};
+use super::{AssistantPanel, DesktopReader, ReaderOverlay, SidebarTab};
 use crate::plugins::{ChatCommand, ChatRole, chat_command_suggestions};
 use crate::ui::{
     ACCENT, ACCENT_SOFT, BACKGROUND, BORDER, MUTED, SURFACE, SURFACE_MUTED, TEXT,
@@ -65,7 +65,6 @@ pub(crate) struct ReaderFramePlan {
     pub(crate) rect: Rect,
     pub(crate) scene_revision: u64,
     pub(crate) background: peniko::Color,
-    pub(crate) defer_target_resize: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,9 +116,6 @@ impl DesktopReader {
 
         let background = self.reader.style().background;
         let background_ui = color32(background);
-        let anchor_page_texture_right = self.ui.page_texture_anchor
-            == PageTextureAnchor::CanvasRightUntilSidebarResize
-            && self.ui.sidebar_pinned;
         let mut page_rect = Rect::NOTHING;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(background_ui))
@@ -131,8 +127,7 @@ impl DesktopReader {
                         ui.allocate_exact_size(size, egui::Sense::click_and_drag());
                     let painter = ui.painter().with_clip_rect(rect);
                     painter.rect_filled(rect, 0.0, background_ui);
-                    let texture_rect =
-                        page_texture_destination(rect, texture.size, anchor_page_texture_right);
+                    let texture_rect = page_texture_destination(rect, texture.size);
                     painter.image(
                         texture.id,
                         texture_rect,
@@ -164,7 +159,6 @@ impl DesktopReader {
                 );
                 ui.painter().rect_filled(filled, 0.0, ACCENT);
             });
-        self.finish_sidebar_texture_transition(page_rect, page_texture);
 
         if !self.ui.sidebar_pinned && sidebar_progress > 0.001 {
             self.floating_sidebar(&ctx, sidebar_progress);
@@ -182,27 +176,17 @@ impl DesktopReader {
                 background.blue,
                 background.alpha,
             ),
-            defer_target_resize: self.ui.sidebar_motion.is_animating()
-                || self.ui.assistant_motion.is_animating(),
-        }
-    }
-
-    fn finish_sidebar_texture_transition(
-        &mut self,
-        page_rect: Rect,
-        page_texture: Option<ReaderPageTexture>,
-    ) {
-        let resize_finished = !self.ui.sidebar_motion.is_animating()
-            && page_texture
-                .is_some_and(|texture| page_texture_matches_canvas(page_rect, texture.size));
-        if self.ui.page_texture_anchor == PageTextureAnchor::CanvasRightUntilSidebarResize
-            && (!self.ui.sidebar_pinned || resize_finished)
-        {
-            self.ui.page_texture_anchor = PageTextureAnchor::CanvasLeft;
         }
     }
 
     fn keyboard_shortcuts(&mut self, ctx: &egui::Context, interaction_blocked: bool) {
+        let open_search = !interaction_blocked
+            && !self.ui.overlay_visible()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::F));
+        if open_search {
+            self.open_search();
+            return;
+        }
         if interaction_blocked || ctx.egui_wants_keyboard_input() || self.ui.overlay_visible() {
             return;
         }
@@ -536,7 +520,8 @@ impl DesktopReader {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.set_max_width((ui.available_width() - 12.0).max(1.0));
+                let content_width = (ui.available_width() - 12.0).max(1.0);
+                ui.set_width(content_width);
                 for row in rows {
                     let selected = active.as_ref() == Some(&row.id);
                     let display_label =
@@ -548,9 +533,8 @@ impl DesktopReader {
                         } else {
                             &row.label
                         };
-                    let row_width = ui.available_width();
-                    let (row_rect, row_response) =
-                        ui.allocate_exact_size(Vec2::new(row_width, 36.0), egui::Sense::click());
+                    let (row_rect, row_response) = ui
+                        .allocate_exact_size(Vec2::new(content_width, 36.0), egui::Sense::click());
                     let mut row_response =
                         row_response.on_hover_cursor(egui::CursorIcon::PointingHand);
                     if selected && should_auto_scroll {
@@ -617,23 +601,42 @@ impl DesktopReader {
 
     fn highlights(&mut self, ui: &mut egui::Ui) {
         let highlights = self.highlights.clone();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for highlight in highlights {
-                let selected = self.selected_highlight_id.as_deref() == Some(&highlight.id);
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(selected, &highlight.quote).clicked() {
-                        self.go_to_highlight(&highlight.id);
-                    }
-                    if icon_button(ui, Icon::Trash2)
-                        .on_hover_text(self.language.text("删除", "Delete"))
-                        .clicked()
-                    {
-                        self.remove_highlight(&highlight.id);
-                    }
-                });
-                ui.separator();
-            }
-        });
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let content_width = (ui.available_width() - 12.0).max(1.0);
+                ui.set_width(content_width);
+                for highlight in highlights {
+                    let selected = self.selected_highlight_id.as_deref() == Some(&highlight.id);
+                    ui.horizontal(|ui| {
+                        ui.set_width(content_width);
+                        let quote_width = (ui.available_width()
+                            - TOOLBAR_CONTROL_SIZE
+                            - ui.spacing().item_spacing.x)
+                            .max(1.0);
+                        let quote_response = ui
+                            .add_sized(
+                                [quote_width, TOOLBAR_CONTROL_SIZE],
+                                egui::Button::selectable(
+                                    selected,
+                                    RichText::new(&highlight.quote).size(12.0),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&highlight.quote);
+                        if quote_response.clicked() {
+                            self.go_to_highlight(&highlight.id);
+                        }
+                        if icon_button(ui, Icon::Trash2)
+                            .on_hover_text(self.language.text("删除", "Delete"))
+                            .clicked()
+                        {
+                            self.remove_highlight(&highlight.id);
+                        }
+                    });
+                    ui.separator();
+                }
+            });
     }
 
     fn search(&mut self, ui: &mut egui::Ui) {
@@ -659,6 +662,9 @@ impl DesktopReader {
                 .inner
             })
             .inner;
+        if std::mem::take(&mut self.search.focus_input) {
+            response.request_focus();
+        }
         if (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
             || clicked
         {
@@ -1171,22 +1177,53 @@ fn paint_toc_label(ui: &egui::Ui, rect: Rect, label: &str, selected: bool) -> bo
         return false;
     }
     let color = if selected { ACCENT } else { TEXT };
-    let mut job = egui::text::LayoutJob::simple(
-        label.to_owned(),
-        egui::TextStyle::Body.resolve(ui.style()),
-        color,
-        rect.width(),
-    );
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    let galley = ui.painter().layout_job(job);
-    let elided = galley.elided;
-    ui.painter().with_clip_rect(rect).galley(
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let painter = ui.painter();
+    let (display_label, elided) = elide_text_to_width(label, rect.width(), |text| {
+        painter
+            .layout_no_wrap(text.to_owned(), font_id.clone(), color)
+            .size()
+            .x
+    });
+    let galley = painter.layout_no_wrap(display_label, font_id, color);
+    painter.with_clip_rect(rect).galley(
         Pos2::new(rect.left(), rect.center().y - galley.size().y / 2.0),
         galley,
         color,
     );
     elided
+}
+
+fn elide_text_to_width(
+    label: &str,
+    max_width: f32,
+    mut measure: impl FnMut(&str) -> f32,
+) -> (String, bool) {
+    const ELLIPSIS: &str = "…";
+
+    if measure(label) <= max_width {
+        return (label.to_owned(), false);
+    }
+    if measure(ELLIPSIS) > max_width {
+        return (String::new(), true);
+    }
+
+    let mut boundaries = label
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    boundaries.push(label.len());
+    let (mut lower, mut upper) = (0, boundaries.len() - 1);
+    while lower < upper {
+        let middle = (lower + upper).div_ceil(2);
+        let candidate = format!("{}…", &label[..boundaries[middle]]);
+        if measure(&candidate) <= max_width {
+            lower = middle;
+        } else {
+            upper = middle - 1;
+        }
+    }
+    (format!("{}…", &label[..boundaries[lower]]), true)
 }
 
 fn toc_label_rect(row: Rect, toggle: Rect) -> Rect {
@@ -1433,17 +1470,8 @@ fn centered_assistant_text_edit(
     (output.inner, input_rect)
 }
 
-fn page_texture_destination(page_rect: Rect, texture_size: Vec2, anchor_right: bool) -> Rect {
-    let origin = if anchor_right {
-        Pos2::new(page_rect.right() - texture_size.x, page_rect.top())
-    } else {
-        page_rect.min
-    };
-    Rect::from_min_size(origin, texture_size)
-}
-
-fn page_texture_matches_canvas(page_rect: Rect, texture_size: Vec2) -> bool {
-    (texture_size - page_rect.size()).length_sq() <= 0.25
+fn page_texture_destination(page_rect: Rect, texture_size: Vec2) -> Rect {
+    Rect::from_min_size(page_rect.min, texture_size)
 }
 
 fn compact_input_frame() -> egui::Frame {
@@ -1570,26 +1598,30 @@ mod reference_suggestion_label_tests {
     }
 
     #[test]
-    fn stale_wide_page_texture_keeps_its_right_edge_while_sidebar_opens() {
-        let page_rect = Rect::from_min_size(Pos2::new(256.0, 48.0), Vec2::new(944.0, 700.0));
-        let previous_texture_size = Vec2::new(1_200.0, 700.0);
+    fn long_toc_labels_are_elided_to_the_sidebar_row() {
+        fn measured_width(text: &str) -> f32 {
+            f32::from(u16::try_from(text.chars().count()).unwrap_or(u16::MAX)) * 10.0
+        }
 
-        let destination = page_texture_destination(page_rect, previous_texture_size, true);
+        let original = "Separate font system that any application can use";
+        let (display, elided) = elide_text_to_width(original, 170.0, measured_width);
 
-        assert!(destination.left().abs() < 0.01);
-        assert!((destination.right() - page_rect.right()).abs() < 0.01);
-        assert!((destination.width() - previous_texture_size.x).abs() < 0.01);
+        assert!(elided);
+        assert!(display.ends_with('…'));
+        assert!(measured_width(&display) <= 170.0);
+        assert!(display.len() < original.len());
     }
 
     #[test]
-    fn stale_narrow_page_texture_keeps_its_right_edge_while_sidebar_closes() {
-        let page_rect = Rect::from_min_size(Pos2::new(0.0, 48.0), Vec2::new(1_200.0, 700.0));
-        let previous_texture_size = Vec2::new(944.0, 700.0);
+    fn stale_page_texture_keeps_its_size_and_starts_at_the_moving_canvas() {
+        let page_rect = Rect::from_min_size(Pos2::new(256.0, 48.0), Vec2::new(944.0, 700.0));
+        let previous_texture_size = Vec2::new(1_200.0, 700.0);
 
-        let destination = page_texture_destination(page_rect, previous_texture_size, true);
+        let destination = page_texture_destination(page_rect, previous_texture_size);
 
-        assert!((destination.left() - 256.0).abs() < 0.01);
-        assert!((destination.right() - page_rect.right()).abs() < 0.01);
+        assert!((destination.left() - page_rect.left()).abs() < 0.01);
+        assert!((destination.top() - page_rect.top()).abs() < 0.01);
         assert!((destination.width() - previous_texture_size.x).abs() < 0.01);
+        assert!((destination.height() - previous_texture_size.y).abs() < 0.01);
     }
 }
