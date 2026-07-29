@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use rebook_publication::{Block, BookSource, Inline, SourceAnchor, SourceRange};
 use rebook_reader::ReaderVisibleTextFragment;
 
 use crate::platform::UserEvent;
@@ -12,7 +13,7 @@ use crate::plugins::{
 
 use super::chat_autocomplete::{
     ChatReference, ChatReferenceKind, build_chat_prompt_with_references,
-    chat_reference_suggestions, chat_reference_token, insert_chat_reference,
+    chat_reference_suggestions, chat_reference_token, insert_chat_reference, parse_chat_citation,
 };
 use super::{
     AssistantPanel, ChatTask, ChatTaskMessage, DesktopReader, FocusedMark, MarkRetention,
@@ -316,7 +317,7 @@ impl DesktopReader {
             } else {
                 book_title
             },
-            locator: "rebook://book".into(),
+            link: "rebook://book".into(),
             excerpt: None,
         }];
 
@@ -333,7 +334,7 @@ impl DesktopReader {
                 } else {
                     format!("当前章节 · {}", section_index + 1)
                 },
-                locator: format!("rebook://j/{section_index}"),
+                link: format!("rebook://j/{section_index}"),
                 excerpt: None,
             });
         }
@@ -384,23 +385,78 @@ impl DesktopReader {
         let Some(selection) = self.selection.clone() else {
             return;
         };
+        let selected_text = selection.text.trim();
+        let english = self.language == crate::preferences::AppLanguage::English;
         let question = match self.language {
             crate::preferences::AppLanguage::SimplifiedChinese => format!(
-                "请结合当前段落和章节语境解释选中的内容。说明它的直接含义、在本段中的作用，以及理解它所需的背景；不要脱离原文进行无依据推测。\n\n选中文字：\n{}",
-                selection.text.trim()
+                "请结合所引用的原文语境解释选中的内容。说明它的直接含义、在本段中的作用，以及理解它所需的背景；不要脱离原文进行无依据推测。\n\n选中文字：\n{selected_text}"
             ),
             crate::preferences::AppLanguage::English => format!(
-                "Explain the selected text in the context of the current paragraph and section. Cover its direct meaning, its role in the passage, and any background needed to understand it. Do not speculate beyond the source.\n\nSelected text:\n{}",
-                selection.text.trim()
+                "Explain the selected text using the referenced source context. Cover its direct meaning, its role in the passage, and any background needed to understand it. Do not speculate beyond the source.\n\nSelected text:\n{selected_text}"
             ),
         };
+        let references = selection_reference(
+            self.source.as_ref(),
+            &selection.ranges,
+            selected_text,
+            english,
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
+        let prompt = build_chat_prompt_with_references(&question, &references, english);
+        let display_content = Some(if english {
+            format!("Explain: “{}”", clip_chat_reference_text(selected_text, 72))
+        } else {
+            format!("解释：“{}”", clip_chat_reference_text(selected_text, 72))
+        });
         self.focused_mark = Some(FocusedMark::assistant(selection.ranges.clone()));
         self.cancel_text_selection();
         self.ui.assistant_panel = Some(AssistantPanel::Chat);
         if self.ui.assistant_motion.animate_to(1.0) {
             self.ui.last_motion_tick = Some(std::time::Instant::now());
         }
-        self.queue_chat(question, None);
+        self.queue_chat(prompt, display_content);
+    }
+
+    pub(super) fn open_chat_citation(&mut self, locator: &str) {
+        let Some(citation) = parse_chat_citation(locator) else {
+            return;
+        };
+        let target_range = citation.node.as_deref().and_then(|node| {
+            source_range_for_node(self.source.as_ref(), citation.section_index, node)
+        });
+        let result = if let Some(node) = citation.node {
+            if let Some(section) = self.source.book().sections.get(citation.section_index) {
+                self.reader.go_to_source(&SourceAnchor {
+                    spine: section.id.clone(),
+                    node,
+                    text_offset: 0,
+                })
+            } else {
+                self.reader.go_to_section(citation.section_index)
+            }
+        } else {
+            self.reader.go_to_section(citation.section_index)
+        };
+        match result {
+            Ok(result) => {
+                self.apply_snapshot(
+                    result.snapshot,
+                    SnapshotEffects {
+                        marks: MarkRetention::ClearSelectedHighlight,
+                        ..SnapshotEffects::navigation()
+                    },
+                );
+                self.focused_mark = target_range.map(|range| FocusedMark::assistant(vec![range]));
+            }
+            Err(error) => {
+                self.chat.error = Some(format!(
+                    "{}: {error}",
+                    self.language
+                        .text("无法跳转到引用", "Unable to open citation")
+                ));
+            }
+        }
     }
 
     pub(super) fn queue_chat(&mut self, question: String, display_content: Option<String>) {
@@ -737,8 +793,84 @@ fn paragraph_reference(
         } else {
             format!("段落 {paragraph_index} · {section_title}")
         },
-        locator: format!("rebook://j/{section_index}/{node}"),
+        link: format!("rebook://j/{section_index}/{node}"),
         excerpt: Some(excerpt),
+    }
+}
+
+fn selection_reference(
+    source: &dyn BookSource,
+    ranges: &[SourceRange],
+    selected_text: &str,
+    english: bool,
+) -> Option<ChatReference> {
+    let range = ranges.first()?;
+    let section_index = source
+        .book()
+        .sections
+        .iter()
+        .position(|section| section.id == range.start.spine)?;
+    let section = source.parse_section(section_index).ok()?;
+    let title = section_title(source, section_index, &section.blocks);
+    let paragraph = section.blocks.iter().find_map(|block| {
+        let source_range = block_source_range(block)?;
+        (source_range.start.node == range.start.node).then(|| block_text(block))
+    });
+    Some(ChatReference {
+        id: format!("selection:{section_index}:{}", range.start.node),
+        kind: ChatReferenceKind::Paragraph,
+        label: clip_chat_reference_text(selected_text, 32),
+        description: if english {
+            format!("Selected paragraph · {title}")
+        } else {
+            format!("选中段落 · {title}")
+        },
+        link: format!("rebook://j/{section_index}/{}", range.start.node),
+        excerpt: paragraph
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| clip_chat_reference_text(&text, 500)),
+    })
+}
+
+fn source_range_for_node(
+    source: &dyn BookSource,
+    section_index: usize,
+    node: &str,
+) -> Option<SourceRange> {
+    source
+        .parse_section(section_index)
+        .ok()?
+        .blocks
+        .iter()
+        .find_map(|block| {
+            let range = block_source_range(block)?;
+            (range.start.node == node).then(|| range.clone())
+        })
+}
+
+fn block_source_range(block: &Block) -> Option<&SourceRange> {
+    match block {
+        Block::Text(block) => block.source.as_ref(),
+        Block::Image(block) => block.source.as_ref(),
+        Block::Separator | Block::PageBreak => None,
+    }
+}
+
+fn block_text(block: &Block) -> String {
+    match block {
+        Block::Text(block) => block
+            .content
+            .iter()
+            .map(|inline| match inline {
+                Inline::Text(run) => run.text.as_str(),
+                Inline::Break => "\n",
+            })
+            .collect(),
+        Block::Image(block) => block
+            .text_layer
+            .as_ref()
+            .map_or_else(|| block.alt.clone(), |layer| layer.text.clone()),
+        Block::Separator | Block::PageBreak => String::new(),
     }
 }
 

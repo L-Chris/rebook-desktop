@@ -37,6 +37,8 @@ pub(crate) struct AnnotationState {
     pub book_id: String,
     pub ranges: Vec<SourceRange>,
     pub quote: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     pub created_at: u64,
     pub updated_at: HybridTimestamp,
     #[serde(default)]

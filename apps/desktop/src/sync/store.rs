@@ -15,6 +15,7 @@ use super::protocol::{
 };
 
 const DATABASE_FILE: &str = "sync-v1.sqlite3";
+const DATABASE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SyncStore {
@@ -58,6 +59,7 @@ impl SyncStore {
         book_id: String,
         ranges: Vec<SourceRange>,
         quote: String,
+        note: Option<String>,
         created_at: u64,
     ) -> SyncResult<AnnotationState> {
         let mut connection = self.connection()?;
@@ -68,6 +70,7 @@ impl SyncStore {
             book_id,
             ranges,
             quote,
+            note,
             created_at,
             updated_at,
             clock: BTreeMap::from([(self.device_id.clone(), 1)]),
@@ -80,46 +83,10 @@ impl SyncStore {
         Ok(annotation)
     }
 
-    pub(crate) fn import_legacy_annotation(
-        &self,
-        id: String,
-        book_id: String,
-        ranges: Vec<SourceRange>,
-        quote: String,
-        created_at: u64,
-    ) -> SyncResult<()> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        let exists = transaction
-            .query_row("SELECT 1 FROM annotations WHERE id = ?1", [&id], |_| Ok(()))
-            .optional()?
-            .is_some();
-        if !exists {
-            let updated_at = tick(&transaction, &self.device_id, Some(created_at))?;
-            write_annotation(
-                &transaction,
-                &AnnotationState {
-                    id,
-                    book_id,
-                    ranges,
-                    quote,
-                    created_at,
-                    updated_at,
-                    clock: BTreeMap::from([(self.device_id.clone(), 1)]),
-                    deleted_at: None,
-                    origin_device: self.device_id.clone(),
-                    conflict_of: None,
-                },
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
     pub(crate) fn annotations_for_book(&self, book_id: &str) -> SyncResult<Vec<AnnotationState>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, book_id, ranges_json, quote, created_at, updated_hlc, clock_json, \
+            "SELECT id, book_id, ranges_json, quote, note, created_at, updated_hlc, clock_json, \
              deleted_hlc, origin_device, conflict_of FROM annotations \
              WHERE book_id = ?1 AND deleted_hlc IS NULL ORDER BY created_at DESC",
         )?;
@@ -133,7 +100,7 @@ impl SyncStore {
     ) -> SyncResult<Vec<AnnotationState>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, book_id, ranges_json, quote, created_at, updated_hlc, clock_json, \
+            "SELECT id, book_id, ranges_json, quote, note, created_at, updated_hlc, clock_json, \
              deleted_hlc, origin_device, conflict_of FROM annotations \
              WHERE book_id = ?1 AND origin_device = ?2 ORDER BY id",
         )?;
@@ -370,6 +337,16 @@ impl SyncStore {
 
     fn initialize(&self) -> SyncResult<()> {
         let connection = self.connection()?;
+        let schema_version =
+            connection.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))?;
+        if schema_version != DATABASE_SCHEMA_VERSION {
+            connection.execute_batch(
+                "DROP TABLE IF EXISTS sync_meta;
+                 DROP TABLE IF EXISTS progress;
+                 DROP TABLE IF EXISTS annotations;
+                 DROP TABLE IF EXISTS book_membership;",
+            )?;
+        }
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -387,6 +364,7 @@ impl SyncStore {
                 book_id TEXT NOT NULL,
                 ranges_json TEXT NOT NULL,
                 quote TEXT NOT NULL,
+                note TEXT,
                 created_at INTEGER NOT NULL,
                 updated_hlc TEXT NOT NULL,
                 clock_json TEXT NOT NULL,
@@ -402,6 +380,7 @@ impl SyncStore {
                 changed_hlc TEXT NOT NULL
              );",
         )?;
+        connection.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -422,6 +401,7 @@ impl HighlightRepository for SyncStore {
                     book_id: annotation.book_id,
                     ranges: annotation.ranges,
                     quote: annotation.quote,
+                    note: annotation.note,
                     created_at: annotation.created_at,
                 })
                 .collect()
@@ -434,6 +414,7 @@ impl HighlightRepository for SyncStore {
             highlight.book_id.clone(),
             highlight.ranges.clone(),
             highlight.quote.clone(),
+            highlight.note.clone(),
             highlight.created_at,
         )?;
         Ok(())
@@ -441,16 +422,6 @@ impl HighlightRepository for SyncStore {
 
     fn remove_highlight(&self, id: &str) -> HighlightResult<bool> {
         self.delete_annotation(id)
-    }
-
-    fn import_legacy_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<()> {
-        self.import_legacy_annotation(
-            highlight.id.clone(),
-            highlight.book_id.clone(),
-            highlight.ranges.clone(),
-            highlight.quote.clone(),
-            highlight.created_at,
-        )
     }
 }
 
@@ -492,7 +463,7 @@ fn tick(
 fn read_annotation(transaction: &Transaction<'_>, id: &str) -> SyncResult<Option<AnnotationState>> {
     transaction
         .query_row(
-            "SELECT id, book_id, ranges_json, quote, created_at, updated_hlc, clock_json, \
+            "SELECT id, book_id, ranges_json, quote, note, created_at, updated_hlc, clock_json, \
              deleted_hlc, origin_device, conflict_of FROM annotations WHERE id = ?1",
             [id],
             read_annotation_row,
@@ -503,22 +474,23 @@ fn read_annotation(transaction: &Transaction<'_>, id: &str) -> SyncResult<Option
 
 fn read_annotation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnnotationState> {
     let ranges: String = row.get(2)?;
-    let updated_at: String = row.get(5)?;
-    let clock: String = row.get(6)?;
-    let deleted_at: Option<String> = row.get(7)?;
+    let updated_at: String = row.get(6)?;
+    let clock: String = row.get(7)?;
+    let deleted_at: Option<String> = row.get(8)?;
     Ok(AnnotationState {
         id: row.get(0)?,
         book_id: row.get(1)?,
         ranges: serde_json::from_str(&ranges).map_err(json_error)?,
         quote: row.get(3)?,
-        created_at: u64::try_from(row.get::<_, i64>(4)?).unwrap_or_default(),
+        note: row.get(4)?,
+        created_at: u64::try_from(row.get::<_, i64>(5)?).unwrap_or_default(),
         updated_at: serde_json::from_str(&updated_at).map_err(json_error)?,
         clock: serde_json::from_str(&clock).map_err(json_error)?,
         deleted_at: deleted_at
             .map(|value| serde_json::from_str(&value).map_err(json_error))
             .transpose()?,
-        origin_device: row.get(8)?,
-        conflict_of: row.get(9)?,
+        origin_device: row.get(9)?,
+        conflict_of: row.get(10)?,
     })
 }
 
@@ -528,11 +500,11 @@ fn json_error(error: serde_json::Error) -> rusqlite::Error {
 
 fn write_annotation(transaction: &Transaction<'_>, annotation: &AnnotationState) -> SyncResult<()> {
     transaction.execute(
-        "INSERT INTO annotations(id, book_id, ranges_json, quote, created_at, updated_hlc, \
+        "INSERT INTO annotations(id, book_id, ranges_json, quote, note, created_at, updated_hlc, \
          clock_json, deleted_hlc, origin_device, conflict_of) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
          ON CONFLICT(id) DO UPDATE SET book_id = excluded.book_id, \
-         ranges_json = excluded.ranges_json, quote = excluded.quote, \
+         ranges_json = excluded.ranges_json, quote = excluded.quote, note = excluded.note, \
          created_at = excluded.created_at, updated_hlc = excluded.updated_hlc, \
          clock_json = excluded.clock_json, deleted_hlc = excluded.deleted_hlc, \
          origin_device = excluded.origin_device, conflict_of = excluded.conflict_of",
@@ -541,6 +513,7 @@ fn write_annotation(transaction: &Transaction<'_>, annotation: &AnnotationState)
             annotation.book_id,
             serde_json::to_string(&annotation.ranges)?,
             annotation.quote,
+            annotation.note,
             i64::try_from(annotation.created_at).unwrap_or(i64::MAX),
             serde_json::to_string(&annotation.updated_at)?,
             serde_json::to_string(&annotation.clock)?,
@@ -615,7 +588,14 @@ mod tests {
         let store = test_store("tombstone");
         let range = source_range();
         store
-            .create_annotation("note".into(), "book".into(), vec![range], "quote".into(), 1)
+            .create_annotation(
+                "note".into(),
+                "book".into(),
+                vec![range],
+                "quote".into(),
+                Some("comment".into()),
+                1,
+            )
             .unwrap();
 
         assert!(store.delete_annotation("note").unwrap());
@@ -623,6 +603,7 @@ mod tests {
         let exported = store.annotations_for_device_book("book").unwrap();
         assert_eq!(exported.len(), 1);
         assert!(exported[0].deleted_at.is_some());
+        assert_eq!(exported[0].note.as_deref(), Some("comment"));
         cleanup(&store);
     }
 

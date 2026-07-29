@@ -42,12 +42,20 @@ impl Default for ChatMarkdownState {
 }
 
 impl ChatMarkdownState {
-    pub(super) fn show(&mut self, ui: &mut egui::Ui, source: &str, language: AppLanguage) {
+    pub(super) fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        source: &str,
+        language: AppLanguage,
+    ) -> Option<String> {
         self.drain_asset_results();
         let blocks = split_renderable_blocks(source);
+        let mut citation = None;
         for (index, block) in blocks.iter().enumerate() {
             match block {
-                RenderBlock::Markdown(markdown) => self.show_commonmark(ui, markdown),
+                RenderBlock::Markdown(markdown) => {
+                    citation = self.show_commonmark(ui, markdown).or(citation);
+                }
                 RenderBlock::Preview { kind, source } => {
                     self.show_code_preview(ui, *kind, source, language);
                 }
@@ -56,11 +64,16 @@ impl ChatMarkdownState {
                 ui.add_space(PREVIEW_GAP);
             }
         }
+        citation
     }
 
-    fn show_commonmark(&mut self, ui: &mut egui::Ui, markdown: &str) {
+    fn show_commonmark(&mut self, ui: &mut egui::Ui, markdown: &str) -> Option<String> {
         if markdown.trim().is_empty() {
-            return;
+            return None;
+        }
+        let citation_locators = citation_locators(markdown);
+        for locator in &citation_locators {
+            self.markdown_cache.add_link_hook(locator);
         }
         let formula_assets = self.prepare_markdown_math(markdown);
 
@@ -95,6 +108,14 @@ impl ChatMarkdownState {
                 .render_html_fn(Some(&html_renderer))
                 .show(ui, cache, markdown);
         });
+        let clicked = citation_locators
+            .iter()
+            .find(|locator| self.markdown_cache.get_link_hook(locator) == Some(true))
+            .cloned();
+        for locator in citation_locators {
+            self.markdown_cache.remove_link_hook(&locator);
+        }
+        clicked
     }
 
     fn show_code_preview(
@@ -542,6 +563,19 @@ fn markdown_options() -> Options {
         | Options::ENABLE_MATH
 }
 
+fn citation_locators(markdown: &str) -> Vec<String> {
+    let mut locators = Vec::new();
+    for event in Parser::new_ext(markdown, markdown_options()) {
+        if let Event::Start(Tag::Link { dest_url, .. }) = event {
+            let locator = dest_url.as_ref();
+            if locator.starts_with("rebook://j/") && !locators.iter().any(|item| item == locator) {
+                locators.push(locator.to_owned());
+            }
+        }
+    }
+    locators
+}
+
 fn stable_hash<T: Hash + ?Sized>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
@@ -620,6 +654,16 @@ flowchart LR
             events
                 .iter()
                 .any(|event| matches!(event, Event::DisplayMath(_)))
+        );
+    }
+
+    #[test]
+    fn extracts_only_internal_reader_citations_from_markdown_links() {
+        assert_eq!(
+            citation_locators(
+                "See [source](rebook://j/2/paragraph-3) and [web](https://example.com)."
+            ),
+            vec!["rebook://j/2/paragraph-3"]
         );
     }
 

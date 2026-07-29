@@ -67,6 +67,7 @@ impl DesktopReader {
         self.pending_page_turn = None;
         self.install_snapshot(snapshot);
         self.selection_toolbar_visible = false;
+        self.annotation_note_draft = None;
         self.selection_anchor = None;
         self.selection = None;
         match effects.marks {

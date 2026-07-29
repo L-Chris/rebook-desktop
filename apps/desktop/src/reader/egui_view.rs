@@ -10,7 +10,7 @@ use super::chat_autocomplete::{
     ChatReference, ChatReferenceKind, chat_reference_token, move_suggestion_index,
 };
 use super::chat_markdown::ChatMarkdownState;
-use super::{AssistantPanel, DesktopReader, ReaderOverlay, SidebarTab};
+use super::{AnnotationDraft, AssistantPanel, DesktopReader, ReaderOverlay, SidebarTab};
 use crate::plugins::{ChatCommand, ChatRole, chat_command_suggestions};
 use crate::ui::{
     ACCENT, ACCENT_SOFT, BACKGROUND, BORDER, MUTED, SURFACE, SURFACE_MUTED, TEXT,
@@ -395,10 +395,10 @@ impl DesktopReader {
                 }
                 if selectable_icon_button(
                     ui,
-                    Icon::Highlighter,
+                    Icon::MessageSquareText,
                     self.ui.sidebar_tab == SidebarTab::Highlights,
                 )
-                .on_hover_text(self.language.text("高亮", "Highlights"))
+                .on_hover_text(self.language.text("高亮与批注", "Highlights & notes"))
                 .clicked()
                 {
                     self.set_sidebar_tab(SidebarTab::Highlights);
@@ -608,6 +608,15 @@ impl DesktopReader {
                 ui.set_width(content_width);
                 for highlight in highlights {
                     let selected = self.selected_highlight_id.as_deref() == Some(&highlight.id);
+                    let label = highlight.note.as_ref().map_or_else(
+                        || highlight.quote.clone(),
+                        |note| format!("{}\n{}", highlight.quote, note),
+                    );
+                    let row_height = if highlight.note.is_some() {
+                        TOOLBAR_CONTROL_SIZE * 1.6
+                    } else {
+                        TOOLBAR_CONTROL_SIZE
+                    };
                     ui.horizontal(|ui| {
                         ui.set_width(content_width);
                         let quote_width = (ui.available_width()
@@ -616,14 +625,14 @@ impl DesktopReader {
                             .max(1.0);
                         let quote_response = ui
                             .add_sized(
-                                [quote_width, TOOLBAR_CONTROL_SIZE],
+                                [quote_width, row_height],
                                 egui::Button::selectable(
                                     selected,
-                                    RichText::new(&highlight.quote).size(12.0),
+                                    RichText::new(&label).size(12.0),
                                 )
                                 .truncate(),
                             )
-                            .on_hover_text(&highlight.quote);
+                            .on_hover_text(&label);
                         if quote_response.clicked() {
                             self.go_to_highlight(&highlight.id);
                         }
@@ -747,6 +756,7 @@ impl DesktopReader {
 
     fn assistant_conversation(&mut self, ui: &mut egui::Ui, height: f32, busy: bool) {
         let messages = self.chat.messages.clone();
+        let mut clicked_citation = None;
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .max_height(height)
@@ -780,7 +790,7 @@ impl DesktopReader {
                     );
                 }
                 for message in messages {
-                    chat_message_card(
+                    if let Some(locator) = chat_message_card(
                         ui,
                         message.role,
                         message
@@ -789,11 +799,13 @@ impl DesktopReader {
                             .unwrap_or(&message.content),
                         self.language,
                         &mut self.chat_markdown,
-                    );
+                    ) {
+                        clicked_citation = Some(locator);
+                    }
                     ui.add_space(10.0);
                 }
                 if busy {
-                    chat_message_card(
+                    let _ = chat_message_card(
                         ui,
                         ChatRole::Assistant,
                         self.language.text(
@@ -805,6 +817,9 @@ impl DesktopReader {
                     );
                 }
             });
+        if let Some(locator) = clicked_citation {
+            self.open_chat_citation(&locator);
+        }
     }
 
     fn assistant_error(&self, ui: &mut egui::Ui) {
@@ -1088,31 +1103,58 @@ impl DesktopReader {
                 page_rect.top() + rect.y + rect.height + 8.0,
             )
         });
+        let mut create_highlight = false;
+        let mut open_note = false;
+        let mut save_note = false;
+        let mut cancel_note = false;
+        let mut explain = false;
         egui::Area::new("selection-actions".into())
             .order(egui::Order::Tooltip)
             .pivot(egui::Align2::CENTER_TOP)
             .fixed_pos(position)
             .constrain(true)
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style())
-                    .inner_margin(4)
-                    .show(ui, |ui| {
+                let note_open = self.annotation_note_draft.is_some();
+                selection_popover_frame(if note_open { 12 } else { 4 }).show(ui, |ui| {
+                    if let Some(draft) = self.annotation_note_draft.as_mut() {
+                        match annotation_editor(ui, draft, self.language) {
+                            AnnotationEditorAction::None => {}
+                            AnnotationEditorAction::Save => save_note = true,
+                            AnnotationEditorAction::Cancel => cancel_note = true,
+                        }
+                    } else {
                         ui.horizontal(|ui| {
-                            if icon_button(ui, Icon::Highlighter)
+                            create_highlight = icon_button(ui, Icon::Highlighter)
                                 .on_hover_text(self.language.text("高亮", "Highlight"))
-                                .clicked()
-                            {
-                                self.create_highlight();
-                            }
-                            if icon_button(ui, Icon::MessageCircleQuestion)
+                                .clicked();
+                            open_note = icon_button(ui, Icon::MessageSquarePlus)
+                                .on_hover_text(self.language.text("添加批注", "Add note"))
+                                .clicked();
+                            explain = icon_button(ui, Icon::MessageCircleQuestion)
                                 .on_hover_text(self.language.text("解释", "Explain"))
-                                .clicked()
-                            {
-                                self.explain_selection();
-                            }
+                                .clicked();
                         });
-                    });
+                    }
+                });
             });
+        if create_highlight {
+            self.create_highlight(None);
+        } else if open_note {
+            self.annotation_note_draft = Some(AnnotationDraft {
+                focus_pending: true,
+                ..AnnotationDraft::default()
+            });
+        } else if save_note {
+            let note = self
+                .annotation_note_draft
+                .as_ref()
+                .map(|draft| draft.note.clone());
+            self.create_highlight(note);
+        } else if cancel_note {
+            self.annotation_note_draft = None;
+        } else if explain {
+            self.explain_selection();
+        }
     }
 
     fn pointer_interaction(&mut self, response: &egui::Response) {
@@ -1482,15 +1524,141 @@ fn compact_input_frame() -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(8, 4))
 }
 
+fn selection_popover_frame(inner_margin: i8) -> egui::Frame {
+    egui::Frame::new()
+        .fill(SURFACE)
+        .stroke(egui::Stroke::new(1.0, BORDER))
+        .corner_radius(10)
+        .inner_margin(inner_margin)
+        .shadow(egui::Shadow {
+            offset: [0, 4],
+            blur: 18,
+            spread: 0,
+            color: Color32::from_black_alpha(28),
+        })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnnotationEditorAction {
+    None,
+    Save,
+    Cancel,
+}
+
+fn annotation_editor(
+    ui: &mut egui::Ui,
+    draft: &mut AnnotationDraft,
+    language: crate::preferences::AppLanguage,
+) -> AnnotationEditorAction {
+    let mut action = AnnotationEditorAction::None;
+    ui.set_width(312.0);
+    ui.horizontal(|ui| {
+        ui.label(icon(Icon::MessageSquarePlus).size(16.0).color(ACCENT));
+        ui.label(
+            RichText::new(language.text("添加批注", "Add annotation"))
+                .size(13.0)
+                .strong()
+                .color(TEXT),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if icon_button(ui, Icon::X)
+                .on_hover_text(language.text("关闭", "Close"))
+                .clicked()
+            {
+                action = AnnotationEditorAction::Cancel;
+            }
+        });
+    });
+    ui.add_space(9.0);
+    annotation_text_editor(ui, draft, language);
+    ui.add_space(10.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if annotation_action_button(
+            ui,
+            language.text("保存", "Save"),
+            true,
+            !draft.note.trim().is_empty(),
+        )
+        .clicked()
+        {
+            action = AnnotationEditorAction::Save;
+        }
+        if annotation_action_button(ui, language.text("取消", "Cancel"), false, true).clicked() {
+            action = AnnotationEditorAction::Cancel;
+        }
+    });
+    action
+}
+
+fn annotation_text_editor(
+    ui: &mut egui::Ui,
+    draft: &mut AnnotationDraft,
+    language: crate::preferences::AppLanguage,
+) {
+    let input_id = ui.make_persistent_id("selection-annotation-input");
+    let input_focused = ui.memory(|memory| memory.has_focus(input_id));
+    let input = egui::Frame::new()
+        .fill(if input_focused { ACCENT } else { BORDER })
+        .corner_radius(7)
+        .inner_margin(1)
+        .show(ui, |ui| {
+            egui::Frame::new()
+                .fill(SURFACE)
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.add_sized(
+                        [ui.available_width(), 72.0],
+                        egui::TextEdit::multiline(&mut draft.note)
+                            .id(input_id)
+                            .frame(egui::Frame::NONE)
+                            .margin(0)
+                            .text_color(TEXT)
+                            .hint_text(language.text("写下你的想法…", "Write a note…")),
+                    )
+                })
+                .inner
+        })
+        .inner;
+    if draft.focus_pending {
+        input.request_focus();
+        draft.focus_pending = false;
+    }
+}
+
+fn annotation_action_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    primary: bool,
+    enabled: bool,
+) -> egui::Response {
+    let text = RichText::new(label)
+        .size(12.0)
+        .color(if primary { Color32::WHITE } else { TEXT });
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(text)
+            .fill(if primary { ACCENT } else { SURFACE })
+            .stroke(if primary {
+                egui::Stroke::NONE
+            } else {
+                egui::Stroke::new(1.0, BORDER)
+            })
+            .corner_radius(6)
+            .min_size(Vec2::new(68.0, 30.0)),
+    )
+}
+
 fn chat_message_card(
     ui: &mut egui::Ui,
     role: ChatRole,
     content: &str,
     language: crate::preferences::AppLanguage,
     markdown: &mut ChatMarkdownState,
-) {
+) -> Option<String> {
     let is_user = role == ChatRole::User;
     let width = ui.available_width();
+    let mut clicked_citation = None;
     egui::Frame::new()
         .fill(if is_user { ACCENT_SOFT } else { SURFACE })
         .stroke(egui::Stroke::new(
@@ -1523,9 +1691,10 @@ fn chat_message_card(
                         .selectable(true),
                 );
             } else {
-                markdown.show(ui, content, language);
+                clicked_citation = markdown.show(ui, content, language);
             }
         });
+    clicked_citation
 }
 
 fn color32(color: rebook_publication::Rgba) -> Color32 {
@@ -1547,7 +1716,7 @@ mod reference_suggestion_label_tests {
             kind,
             label: label.into(),
             description: description.into(),
-            locator: "rebook://test".into(),
+            link: "rebook://test".into(),
             excerpt: None,
         }
     }

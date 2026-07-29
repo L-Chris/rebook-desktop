@@ -77,7 +77,7 @@ pub(super) fn open_reader(
         TranslationBookSource::new(rewrite_source.clone(), plugin_settings.translation_mode)
     });
     let source: Arc<dyn BookSource> = translation_source.clone();
-    let highlight_store = HighlightStore::from_repository(local_store.clone())?;
+    let highlight_store = HighlightStore::from_repository(local_store.clone());
     let highlights = highlight_store.for_book(&book_id);
     let viewport = LayoutViewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
     let reader_preferences = preferences::load_reader_preferences().unwrap_or_else(|error| {
@@ -177,6 +177,7 @@ pub(super) struct DesktopReader {
     selection_anchor: Option<ReaderTextHit>,
     selection: Option<ReaderSelection>,
     selection_toolbar_visible: bool,
+    annotation_note_draft: Option<AnnotationDraft>,
     selected_highlight_id: Option<String>,
     focused_mark: Option<FocusedMark>,
     plugin_settings: PluginSettings,
@@ -577,6 +578,7 @@ impl DesktopReader {
             selection_anchor: None,
             selection: None,
             selection_toolbar_visible: false,
+            annotation_note_draft: None,
             selected_highlight_id: None,
             focused_mark: None,
             search: SearchUiState::default(),
@@ -615,6 +617,12 @@ impl DesktopReader {
             exit_requested: false,
         }
     }
+}
+
+#[derive(Default)]
+pub(super) struct AnnotationDraft {
+    note: String,
+    focus_pending: bool,
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

@@ -3941,7 +3941,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-desktop"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyrender",
  "atomicwrites",
@@ -3986,7 +3986,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-formats"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64",
  "crc32fast",
@@ -4007,7 +4007,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-html"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "rebook-publication",
  "roxmltree 0.21.1",
@@ -4016,7 +4016,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-inspect"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "rebook-formats",
  "rebook-publication",
@@ -4027,7 +4027,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-layout"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "image",
  "parley",
@@ -4038,7 +4038,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-math"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "cosmic-text",
  "latex2mathml",
@@ -4049,7 +4049,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-publication"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "percent-encoding",
  "serde",
@@ -4058,7 +4058,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-reader"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "rebook-layout",
  "rebook-publication",
@@ -4068,7 +4068,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-renderer"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyrender",
  "kurbo",

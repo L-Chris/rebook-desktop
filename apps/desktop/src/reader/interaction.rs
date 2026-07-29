@@ -11,6 +11,7 @@ impl DesktopReader {
 
     pub(in crate::reader) fn begin_text_selection(&mut self, x: f32, y: f32) {
         self.selection_toolbar_visible = false;
+        self.annotation_note_draft = None;
         match self.reader.hit_test_current_spread(x, y, true) {
             Ok(anchor) => {
                 self.selection_anchor = anchor;
@@ -55,6 +56,7 @@ impl DesktopReader {
         }
 
         self.selection_toolbar_visible = false;
+        self.annotation_note_draft = None;
         self.selection_anchor = None;
         self.selection = None;
         self.bump_scene_revision();
@@ -81,21 +83,28 @@ impl DesktopReader {
 
     pub(in crate::reader) fn cancel_text_selection(&mut self) {
         self.selection_toolbar_visible = false;
+        self.annotation_note_draft = None;
         self.selection_anchor = None;
         if self.selection.take().is_some() {
             self.bump_scene_revision();
         }
     }
 
-    pub(in crate::reader) fn create_highlight(&mut self) {
+    pub(in crate::reader) fn create_highlight(&mut self, note: Option<String>) {
         let Some(selection) = self.selection.clone() else {
             return;
         };
-        let highlight =
-            StoredHighlight::new(self.book_id.clone(), selection.ranges, selection.text);
+        let highlight = StoredHighlight::with_note(
+            self.book_id.clone(),
+            selection.ranges,
+            selection.text,
+            note,
+        );
         match self.highlight_store.insert(&highlight) {
             Ok(()) => {
                 self.highlights.insert(0, highlight);
+                self.selection_toolbar_visible = false;
+                self.annotation_note_draft = None;
                 self.selection_anchor = None;
                 self.selection = None;
                 self.selected_highlight_id = None;

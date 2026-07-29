@@ -13,7 +13,7 @@ pub(super) struct ChatReference {
     pub(super) kind: ChatReferenceKind,
     pub(super) label: String,
     pub(super) description: String,
-    pub(super) locator: String,
+    pub(super) link: String,
     pub(super) excerpt: Option<String>,
 }
 
@@ -22,6 +22,25 @@ pub(super) struct ChatReferenceToken {
     pub(super) start: usize,
     pub(super) end: usize,
     pub(super) query: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ChatCitation {
+    pub(super) section_index: usize,
+    pub(super) node: Option<String>,
+}
+
+pub(super) fn parse_chat_citation(locator: &str) -> Option<ChatCitation> {
+    let remainder = locator.strip_prefix("rebook://j/")?;
+    let (section, node) = remainder
+        .split_once('/')
+        .map_or((remainder, None), |(section, node)| (section, Some(node)));
+    let section_index = section.parse().ok()?;
+    let node = node.filter(|node| !node.is_empty()).map(ToOwned::to_owned);
+    Some(ChatCitation {
+        section_index,
+        node,
+    })
 }
 
 pub(super) fn chat_reference_token(
@@ -164,7 +183,7 @@ pub(super) fn build_chat_prompt_with_references(
                     if english { "Location" } else { "位置" },
                     reference.description
                 ),
-                format!("locator: {}", reference.locator),
+                format!("link: {}", reference.link),
             ];
             if let Some(excerpt) = &reference.excerpt {
                 lines.push(format!(
@@ -186,7 +205,7 @@ pub(super) fn build_chat_prompt_with_references(
     format!(
         "{base}\n\n{}\n\n{reference_text}",
         if english {
-            "The user referenced the following book content. Use it as the primary context and cite its locator when relevant:"
+            "The user referenced the following book content. Use it as the primary context and cite its link when relevant:"
         } else {
             "用户在输入框中引用了以下书籍内容。请优先以这些内容为上下文，并在相关时引用其位置："
         }
@@ -227,7 +246,7 @@ mod tests {
             kind,
             label: label.into(),
             description: description.into(),
-            locator: id.into(),
+            link: id.into(),
             excerpt: None,
         }
     }
@@ -302,5 +321,26 @@ mod tests {
         assert!(prompt.contains("概括主旨"));
         assert!(prompt.contains("searchBook"));
         assert!(prompt.contains("getContent"));
+        assert!(prompt.contains("link: book"));
+        assert!(!prompt.contains("locator:"));
+    }
+
+    #[test]
+    fn citation_locator_keeps_the_section_and_full_node_id() {
+        assert_eq!(
+            parse_chat_citation("rebook://j/3/chapter/paragraph-2"),
+            Some(ChatCitation {
+                section_index: 3,
+                node: Some("chapter/paragraph-2".into()),
+            })
+        );
+        assert_eq!(
+            parse_chat_citation("rebook://j/4"),
+            Some(ChatCitation {
+                section_index: 4,
+                node: None,
+            })
+        );
+        assert_eq!(parse_chat_citation("https://example.com"), None);
     }
 }
