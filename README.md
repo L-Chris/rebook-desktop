@@ -9,6 +9,12 @@
   把书留在自己的电脑里，安静地读，也更清楚地想。
 </p>
 
+<p align="center">
+  <a href="https://linux.do" aria-label="LINUX DO">
+    <img src="https://img.shields.io/badge/LINUX-DO-FFB003.svg" alt="LINUX DO">
+  </a>
+</p>
+
 ## 认识 Torto
 
 Torto（中文名“小龟阅读”）是一款为 Windows 设计的原生电子书阅读器。它可以管理本地书库，提供舒适的单页或双页阅读、目录导航、全文搜索、文字高亮、翻译和 AI 阅读助手，也可以通过 WebDAV 在自己的设备之间同步书籍与阅读状态。
