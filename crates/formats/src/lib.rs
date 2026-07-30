@@ -23,6 +23,8 @@ use thiserror::Error;
 
 use self::epub::{EpubError, EpubPublication};
 
+pub use self::pdf::cjk_fallback_font_bytes;
+
 /// E-book formats supported by the desktop application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BookFormat {

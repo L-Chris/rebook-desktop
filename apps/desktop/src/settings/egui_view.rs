@@ -4,7 +4,8 @@ use rebook_layout::{ReaderDefaultFont, SpreadMode};
 
 use super::{SettingsFeature, SettingsTab};
 use crate::plugins::{
-    AiProviderKind, PluginSettings, TARGET_LANGUAGE_ENGLISH, TARGET_LANGUAGE_INTERFACE,
+    AiProviderKind, CHAT_HISTORY_TURNS_MAX, CHAT_HISTORY_TURNS_MIN, CHAT_TOOL_STEPS_MAX,
+    CHAT_TOOL_STEPS_MIN, PluginSettings, TARGET_LANGUAGE_ENGLISH, TARGET_LANGUAGE_INTERFACE,
     TARGET_LANGUAGE_SIMPLIFIED_CHINESE, TranslationMode,
 };
 use crate::preferences::AppLanguage;
@@ -468,6 +469,28 @@ fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             &mut settings.chat_model,
             language,
         );
+        ui.add_space(10.0);
+        egui::Grid::new("ai-chat-limits-grid")
+            .num_columns(2)
+            .spacing([24.0, 16.0])
+            .show(ui, |ui| {
+                settings_u16_slider_row(
+                    ui,
+                    language.text("工具调用轮数", "Tool call steps"),
+                    &mut settings.chat_max_tool_steps,
+                    CHAT_TOOL_STEPS_MIN,
+                    CHAT_TOOL_STEPS_MAX,
+                    1,
+                );
+                settings_u16_slider_row(
+                    ui,
+                    language.text("历史记录轮数", "History turns"),
+                    &mut settings.chat_history_turns,
+                    CHAT_HISTORY_TURNS_MIN,
+                    CHAT_HISTORY_TURNS_MAX,
+                    1,
+                );
+            });
     });
 }
 

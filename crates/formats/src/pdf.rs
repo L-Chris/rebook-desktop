@@ -30,7 +30,11 @@ const PAGE_CACHE_CAPACITY: usize = 6;
 const PAGE_MAX_DIMENSION: f32 = 2_048.0;
 const COVER_MAX_DIMENSION: f32 = 384.0;
 const MAX_RENDER_SCALE: f32 = 2.0;
-const CJK_FALLBACK_FONT: &[u8] = include_bytes!("../../../assets/fonts/LXGWWenKai-Regular.ttf");
+static CJK_FALLBACK_FONT: &[u8] = include_bytes!("../../../assets/fonts/LXGWWenKai-Regular.ttf");
+
+pub fn cjk_fallback_font_bytes() -> &'static [u8] {
+    CJK_FALLBACK_FONT
+}
 
 pub(crate) struct PdfPublication {
     descriptor: DirectBookSource,
@@ -576,7 +580,7 @@ fn append_glyph_spans(spans: &mut Vec<FixedPageTextSpan>, rect: Rect, start: u64
 fn interpreter_settings() -> InterpreterSettings {
     let mut settings = InterpreterSettings::default();
     let default_resolver = Arc::clone(&settings.font_resolver);
-    let cjk_fallback: FontData = Arc::new(CJK_FALLBACK_FONT);
+    let cjk_fallback: FontData = Arc::new(cjk_fallback_font_bytes());
     settings.font_resolver = Arc::new(move |query| match query {
         FontQuery::Fallback(fallback) if fallback.character_collection.is_some() => {
             Some((Arc::clone(&cjk_fallback), 0))

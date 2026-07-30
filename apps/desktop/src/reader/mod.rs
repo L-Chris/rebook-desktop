@@ -196,6 +196,7 @@ pub(super) struct DesktopReader {
     pending_page_turn: Option<PageDirection>,
     settings_requested: bool,
     error: Option<String>,
+    error_timer: TransientMessageTimer,
     pub(super) exit_requested: bool,
 }
 
@@ -280,6 +281,16 @@ struct ChatTask {
 
 pub(crate) type ChatTaskMessage = TaskResult<ChatResponse>;
 
+pub(crate) struct ChatStreamMessage {
+    pub(crate) id: u64,
+    pub(crate) content: String,
+}
+
+struct ChatStreamingState {
+    task_id: u64,
+    content: String,
+}
+
 #[derive(Default)]
 struct ChatUiState {
     input: String,
@@ -290,7 +301,9 @@ struct ChatUiState {
     reference_options_location: Option<(usize, usize, usize)>,
     reference_options: Vec<ChatReference>,
     messages: Vec<ChatTurn>,
+    streaming: Option<ChatStreamingState>,
     error: Option<String>,
+    error_timer: TransientMessageTimer,
     task: TaskSlot<ChatTask>,
 }
 
@@ -340,6 +353,28 @@ impl TranslationUiState {
         }
         self.clear_error();
         true
+    }
+}
+
+#[derive(Default)]
+struct TransientMessageTimer {
+    message: Option<String>,
+    dismiss_at: Option<Instant>,
+}
+
+impl TransientMessageTimer {
+    fn advance(&mut self, current: &mut Option<String>, now: Instant) -> bool {
+        if self.message.as_deref() != current.as_deref() {
+            self.message.clone_from(current);
+            self.dismiss_at = current.as_ref().map(|_| now + NOTICE_AUTO_DISMISS_DELAY);
+        }
+        if self.dismiss_at.is_some_and(|deadline| now >= deadline) {
+            current.take();
+            self.message = None;
+            self.dismiss_at = None;
+            return true;
+        }
+        false
     }
 }
 
@@ -483,11 +518,13 @@ impl Motion {
 struct ReaderUiState {
     sidebar_open: bool,
     sidebar_pinned: bool,
+    sidebar_width: f32,
     sidebar_tab: SidebarTab,
     toolbar_hovered: bool,
     toolbar_hide_at: Option<Instant>,
     overlay: ReaderOverlay,
     assistant_panel: Option<AssistantPanel>,
+    assistant_width: f32,
     toolbar_motion: Motion,
     sidebar_motion: Motion,
     assistant_motion: Motion,
@@ -538,6 +575,41 @@ impl ReaderUiState {
 }
 
 impl DesktopReader {
+    pub(crate) fn log_diagnostic_snapshot(&self, event: &'static str, focused: Option<bool>) {
+        crate::diagnostics::log(
+            event,
+            &[
+                crate::diagnostics::Field::Text("screen", "reader"),
+                crate::diagnostics::Field::Text(
+                    "focus",
+                    match focused {
+                        Some(true) => "true",
+                        Some(false) => "false",
+                        None => "unknown",
+                    },
+                ),
+                crate::diagnostics::Field::Bool(
+                    "assistant_panel",
+                    self.ui.assistant_panel.is_some(),
+                ),
+                crate::diagnostics::Field::F32("assistant_value", self.ui.assistant_motion.value),
+                crate::diagnostics::Field::F32("assistant_start", self.ui.assistant_motion.start),
+                crate::diagnostics::Field::F32("assistant_target", self.ui.assistant_motion.target),
+                crate::diagnostics::Field::Bool(
+                    "assistant_animating",
+                    self.ui.assistant_motion.is_animating(),
+                ),
+                crate::diagnostics::Field::F32("assistant_width", self.ui.assistant_width),
+                crate::diagnostics::Field::Bool("sidebar_open", self.ui.sidebar_open),
+                crate::diagnostics::Field::Bool("sidebar_pinned", self.ui.sidebar_pinned),
+                crate::diagnostics::Field::F32("sidebar_width", self.ui.sidebar_width),
+                crate::diagnostics::Field::F32("sidebar_value", self.ui.sidebar_motion.value),
+                crate::diagnostics::Field::F32("sidebar_target", self.ui.sidebar_motion.target),
+                crate::diagnostics::Field::Bool("chat_pending", self.chat.task.is_pending()),
+            ],
+        );
+    }
+
     fn new(mut reader: ReaderSession, resources: DesktopReaderResources) -> Self {
         let DesktopReaderResources {
             source,
@@ -588,11 +660,13 @@ impl DesktopReader {
             ui: ReaderUiState {
                 sidebar_open: true,
                 sidebar_pinned: true,
+                sidebar_width: egui_view::SIDEBAR_WIDTH,
                 sidebar_tab: SidebarTab::Toc,
                 toolbar_hovered: false,
                 toolbar_hide_at: None,
                 overlay: ReaderOverlay::None,
                 assistant_panel: None,
+                assistant_width: egui_view::ASSISTANT_WIDTH,
                 toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
                 sidebar_motion: Motion::settled(1.0),
                 assistant_motion: Motion::settled(0.0),
@@ -614,6 +688,7 @@ impl DesktopReader {
             pending_page_turn: None,
             settings_requested: false,
             error,
+            error_timer: TransientMessageTimer::default(),
             exit_requested: false,
         }
     }
@@ -638,7 +713,8 @@ mod tests {
     use super::{
         BookDisplayMetadata, HashSet, Instant, MOTION_DURATION, Motion, NOTICE_AUTO_DISMISS_DELAY,
         ReaderOverlay, ReaderUiState, SidebarTab, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION,
-        TranslationUiState, logical_dimension, resolve_book_display_metadata,
+        TransientMessageTimer, TranslationUiState, logical_dimension,
+        resolve_book_display_metadata,
     };
 
     #[test]
@@ -685,11 +761,13 @@ mod tests {
         let mut ui = ReaderUiState {
             sidebar_open: false,
             sidebar_pinned: false,
+            sidebar_width: super::egui_view::SIDEBAR_WIDTH,
             sidebar_tab: SidebarTab::Toc,
             toolbar_hovered: false,
             toolbar_hide_at: None,
             overlay: ReaderOverlay::None,
             assistant_panel: None,
+            assistant_width: super::egui_view::ASSISTANT_WIDTH,
             toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
             sidebar_motion: Motion::settled(0.0),
             assistant_motion: Motion::settled(0.0),
@@ -763,5 +841,30 @@ mod tests {
 
         assert!(translation.error.is_none());
         assert!(translation.dismiss_at.is_none());
+    }
+
+    #[test]
+    fn every_transient_message_gets_a_fresh_auto_dismiss_deadline() {
+        let now = Instant::now();
+        let mut timer = TransientMessageTimer::default();
+        let mut message = Some("first".to_owned());
+
+        assert!(!timer.advance(&mut message, now));
+        assert_eq!(timer.dismiss_at, Some(now + NOTICE_AUTO_DISMISS_DELAY));
+
+        let replacement_time = now + NOTICE_AUTO_DISMISS_DELAY / 2;
+        message = Some("second".to_owned());
+        assert!(!timer.advance(&mut message, replacement_time));
+        assert_eq!(
+            timer.dismiss_at,
+            Some(replacement_time + NOTICE_AUTO_DISMISS_DELAY)
+        );
+        assert!(!timer.advance(
+            &mut message,
+            replacement_time + NOTICE_AUTO_DISMISS_DELAY / 2
+        ));
+        assert!(timer.advance(&mut message, replacement_time + NOTICE_AUTO_DISMISS_DELAY));
+        assert!(message.is_none());
+        assert!(timer.dismiss_at.is_none());
     }
 }

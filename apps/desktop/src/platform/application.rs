@@ -149,6 +149,7 @@ impl ApplicationHandler<UserEvent> for Application {
             UserEvent::RepaintAfter(delay) => self.schedule_repaint(event_loop, delay),
             UserEvent::ShelfSync(message) => self.app.complete_shelf_sync(message),
             UserEvent::ReaderSearch(message) => self.app.complete_reader_search(message),
+            UserEvent::ReaderChatStream(message) => self.app.update_reader_chat_stream(message),
             UserEvent::ReaderChat(message) => self.app.complete_reader_chat(message),
             UserEvent::ReaderTranslation(message) => self.app.complete_reader_translation(message),
             UserEvent::ReaderTocTranslation(message) => {
@@ -178,6 +179,30 @@ impl ApplicationHandler<UserEvent> for Application {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(focused) => {
+                let size = state.window.inner_size();
+                crate::diagnostics::log(
+                    "window.focus",
+                    &[
+                        crate::diagnostics::Field::Bool("focused", focused),
+                        crate::diagnostics::Field::U64("width", u64::from(size.width)),
+                        crate::diagnostics::Field::U64("height", u64::from(size.height)),
+                    ],
+                );
+                self.app
+                    .log_reader_diagnostics("window.focus.reader", Some(focused));
+                if focused {
+                    state.window.request_redraw();
+                }
+            }
+            WindowEvent::Occluded(occluded) => {
+                crate::diagnostics::log(
+                    "window.occluded",
+                    &[crate::diagnostics::Field::Bool("occluded", occluded)],
+                );
+                self.app
+                    .log_reader_diagnostics("window.occluded.reader", None);
+            }
             WindowEvent::Resized(size) => {
                 state.gpu.resize(size);
                 state.window.request_redraw();
@@ -196,6 +221,13 @@ impl ApplicationHandler<UserEvent> for Application {
                     &self.egui_ctx,
                     &mut state.egui_state,
                 ) {
+                    crate::diagnostics::log(
+                        "render.fatal",
+                        &[crate::diagnostics::Field::Usize(
+                            "error_chars",
+                            error.chars().count(),
+                        )],
+                    );
                     self.fatal_error = Some(error);
                     event_loop.exit();
                 } else {

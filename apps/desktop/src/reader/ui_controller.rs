@@ -89,8 +89,12 @@ impl DesktopReader {
             // the final frame cannot retain an intermediate scene revision.
             self.bump_scene_revision();
         }
+        let assistant_settled = assistant_was_animating && !self.ui.assistant_motion.is_animating();
         if !self.ui.assistant_motion.is_animating() && self.ui.assistant_motion.target <= 0.0 {
             self.ui.assistant_panel = None;
+        }
+        if assistant_settled {
+            self.log_diagnostic_snapshot("assistant.motion.settled", None);
         }
         if !self.ui.needs_motion_tick() {
             self.ui.last_motion_tick = None;
@@ -99,6 +103,19 @@ impl DesktopReader {
 
     pub(in crate::reader) fn advance_frame(&mut self, now: Instant) {
         self.advance_motion(now);
+        self.error_timer.advance(&mut self.error, now);
+        self.chat.error_timer.advance(&mut self.chat.error, now);
         self.retry_pending_page_turn();
+    }
+
+    pub(in crate::reader) fn next_transient_message_deadline(&self) -> Option<Instant> {
+        [
+            self.error_timer.dismiss_at,
+            self.chat.error_timer.dismiss_at,
+            self.translation.dismiss_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 }

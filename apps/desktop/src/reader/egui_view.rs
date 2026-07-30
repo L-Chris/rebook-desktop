@@ -18,10 +18,17 @@ use crate::ui::{
     selectable_icon_button, toggle_icon_button,
 };
 
-const SIDEBAR_WIDTH: f32 = 256.0;
+pub(super) const SIDEBAR_WIDTH: f32 = 256.0;
+const SIDEBAR_MIN_WIDTH: f32 = 220.0;
+const SIDEBAR_MAX_WIDTH: f32 = 420.0;
 const SIDEBAR_PADDING: i8 = 8;
-const ASSISTANT_WIDTH: f32 = 340.0;
+pub(super) const ASSISTANT_WIDTH: f32 = 340.0;
+const ASSISTANT_MIN_WIDTH: f32 = 300.0;
+const ASSISTANT_MAX_WIDTH: f32 = 560.0;
 const ASSISTANT_SIDE_PADDING: i8 = 14;
+const ASSISTANT_SCROLLBAR_GUTTER: f32 = 14.0;
+const MIN_READER_CONTENT_WIDTH: f32 = 200.0;
+const PANEL_RESIZE_HANDLE_WIDTH: f32 = 8.0;
 const ASSISTANT_EMPTY_TOP_PADDING: f32 = 12.0;
 const ASSISTANT_BOTTOM_PADDING: f32 = 12.0;
 const ASSISTANT_COMPOSER_RESERVED_HEIGHT: f32 = 52.0;
@@ -73,6 +80,72 @@ pub(crate) struct ReaderPageTexture {
     pub(crate) size: Vec2,
 }
 
+fn constrained_panel_widths(
+    viewport_width: f32,
+    sidebar_width: f32,
+    assistant_width: f32,
+    sidebar_consumes_width: bool,
+    assistant_consumes_width: bool,
+) -> (f32, f32) {
+    let mut sidebar_width = sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+    let mut assistant_width = assistant_width.clamp(ASSISTANT_MIN_WIDTH, ASSISTANT_MAX_WIDTH);
+    let available = (viewport_width - MIN_READER_CONTENT_WIDTH).max(0.0);
+
+    match (sidebar_consumes_width, assistant_consumes_width) {
+        (true, true) => {
+            let minimum_total = SIDEBAR_MIN_WIDTH + ASSISTANT_MIN_WIDTH;
+            if available < minimum_total {
+                sidebar_width = available * SIDEBAR_MIN_WIDTH / minimum_total;
+                assistant_width = available - sidebar_width;
+            } else {
+                let mut excess = (sidebar_width + assistant_width - available).max(0.0);
+                let assistant_reduction =
+                    excess.min((assistant_width - ASSISTANT_MIN_WIDTH).max(0.0));
+                assistant_width -= assistant_reduction;
+                excess -= assistant_reduction;
+                sidebar_width -= excess.min((sidebar_width - SIDEBAR_MIN_WIDTH).max(0.0));
+            }
+        }
+        (true, false) => sidebar_width = sidebar_width.min(available),
+        (false, true) => assistant_width = assistant_width.min(available),
+        (false, false) => {}
+    }
+
+    (sidebar_width, assistant_width)
+}
+
+fn panel_resize_pointer(ctx: &egui::Context, id: &'static str, edge_x: f32) -> Option<f32> {
+    let viewport = ctx.content_rect();
+    let response = egui::Area::new(id.into())
+        .order(egui::Order::Foreground)
+        .fixed_pos(Pos2::new(
+            edge_x - PANEL_RESIZE_HANDLE_WIDTH / 2.0,
+            viewport.top(),
+        ))
+        .show(ctx, |ui| {
+            let (rect, response) = ui.allocate_exact_size(
+                Vec2::new(PANEL_RESIZE_HANDLE_WIDTH, viewport.height()),
+                egui::Sense::drag(),
+            );
+            let response = response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+            let stroke = if response.dragged() {
+                egui::Stroke::new(2.0, ACCENT)
+            } else if response.hovered() {
+                egui::Stroke::new(1.0, MUTED)
+            } else {
+                egui::Stroke::new(1.0, BORDER)
+            };
+            ui.painter()
+                .vline(rect.center().x, rect.top()..=rect.bottom(), stroke);
+            response
+        })
+        .inner;
+    response
+        .dragged()
+        .then(|| response.interact_pointer_pos().map(|position| position.x))
+        .flatten()
+}
+
 impl DesktopReader {
     pub(crate) fn ui(
         &mut self,
@@ -81,38 +154,17 @@ impl DesktopReader {
         interaction_blocked: bool,
     ) -> ReaderFramePlan {
         let ctx = root_ui.ctx().clone();
-        self.advance_frame(Instant::now());
+        let now = Instant::now();
+        self.advance_frame(now);
         self.keyboard_shortcuts(&ctx, interaction_blocked);
         if self.ui.needs_motion_tick() || self.pending_page_turn.is_some() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
+        if let Some(deadline) = self.next_transient_message_deadline() {
+            ctx.request_repaint_after(deadline.saturating_duration_since(now));
+        }
 
-        let sidebar_progress = self.ui.sidebar_motion.value.clamp(0.0, 1.0);
-        let assistant_progress = self.ui.assistant_motion.value.clamp(0.0, 1.0);
-        if self.ui.sidebar_pinned && sidebar_progress > 0.001 {
-            egui::Panel::left("reader-sidebar")
-                .exact_size(SIDEBAR_WIDTH * sidebar_progress)
-                .resizable(false)
-                .show_separator_line(false)
-                .frame(
-                    egui::Frame::new()
-                        .fill(SURFACE)
-                        .inner_margin(SIDEBAR_PADDING),
-                )
-                .show(root_ui, |ui| self.sidebar(ui));
-        }
-        if self.ui.assistant_panel.is_some() && assistant_progress > 0.001 {
-            egui::Panel::right("reader-assistant")
-                .exact_size(ASSISTANT_WIDTH * assistant_progress)
-                .resizable(false)
-                .show_separator_line(false)
-                .frame(
-                    egui::Frame::new()
-                        .fill(BACKGROUND)
-                        .inner_margin(egui::Margin::symmetric(ASSISTANT_SIDE_PADDING, 0)),
-                )
-                .show(root_ui, |ui| self.assistant(ui));
-        }
+        let (sidebar_progress, assistant_progress) = self.show_side_panels(root_ui);
 
         let background = self.reader.style().background;
         let background_ui = color32(background);
@@ -163,6 +215,12 @@ impl DesktopReader {
         if !self.ui.sidebar_pinned && sidebar_progress > 0.001 {
             self.floating_sidebar(&ctx, sidebar_progress);
         }
+        self.resize_side_panels(
+            &ctx,
+            sidebar_progress,
+            assistant_progress,
+            interaction_blocked,
+        );
         self.menu(&ctx);
         self.selection_actions(&ctx, page_rect);
         self.feedback(&ctx);
@@ -176,6 +234,97 @@ impl DesktopReader {
                 background.blue,
                 background.alpha,
             ),
+        }
+    }
+
+    fn show_side_panels(&mut self, root_ui: &mut egui::Ui) -> (f32, f32) {
+        let sidebar_progress = self.ui.sidebar_motion.value.clamp(0.0, 1.0);
+        let assistant_progress = self.ui.assistant_motion.value.clamp(0.0, 1.0);
+        let viewport_width = root_ui.ctx().content_rect().width();
+        let sidebar_consumes_width = self.ui.sidebar_pinned && sidebar_progress > 0.001;
+        let assistant_consumes_width =
+            self.ui.assistant_panel.is_some() && assistant_progress > 0.001;
+        (self.ui.sidebar_width, self.ui.assistant_width) = constrained_panel_widths(
+            viewport_width,
+            self.ui.sidebar_width,
+            self.ui.assistant_width,
+            sidebar_consumes_width,
+            assistant_consumes_width,
+        );
+        if sidebar_consumes_width {
+            egui::Panel::left("reader-sidebar")
+                .exact_size(self.ui.sidebar_width * sidebar_progress)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(SURFACE)
+                        .inner_margin(SIDEBAR_PADDING),
+                )
+                .show(root_ui, |ui| self.sidebar(ui));
+        }
+        if assistant_consumes_width {
+            egui::Panel::right("reader-assistant")
+                .exact_size(self.ui.assistant_width * assistant_progress)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(BACKGROUND)
+                        .inner_margin(egui::Margin::symmetric(ASSISTANT_SIDE_PADDING, 0)),
+                )
+                .show(root_ui, |ui| self.assistant(ui));
+        }
+        (sidebar_progress, assistant_progress)
+    }
+
+    fn resize_side_panels(
+        &mut self,
+        ctx: &egui::Context,
+        sidebar_progress: f32,
+        assistant_progress: f32,
+        interaction_blocked: bool,
+    ) {
+        if interaction_blocked {
+            return;
+        }
+        let viewport = ctx.content_rect();
+        let assistant_visible = self.ui.assistant_panel.is_some() && assistant_progress > 0.001;
+        if sidebar_progress >= 0.999 {
+            let assistant_reservation = if self.ui.sidebar_pinned && assistant_visible {
+                self.ui.assistant_width
+            } else {
+                0.0
+            };
+            let sidebar_max = (viewport.width() - MIN_READER_CONTENT_WIDTH - assistant_reservation)
+                .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+            if let Some(pointer_x) = panel_resize_pointer(
+                ctx,
+                "reader-sidebar-resize",
+                viewport.left() + self.ui.sidebar_width,
+            ) {
+                self.ui.sidebar_width =
+                    (pointer_x - viewport.left()).clamp(SIDEBAR_MIN_WIDTH, sidebar_max);
+                ctx.request_repaint();
+            }
+        }
+        if assistant_visible && assistant_progress >= 0.999 {
+            let sidebar_reservation = if self.ui.sidebar_pinned && sidebar_progress > 0.001 {
+                self.ui.sidebar_width
+            } else {
+                0.0
+            };
+            let assistant_max = (viewport.width() - MIN_READER_CONTENT_WIDTH - sidebar_reservation)
+                .clamp(ASSISTANT_MIN_WIDTH, ASSISTANT_MAX_WIDTH);
+            if let Some(pointer_x) = panel_resize_pointer(
+                ctx,
+                "reader-assistant-resize",
+                viewport.right() - self.ui.assistant_width,
+            ) {
+                self.ui.assistant_width =
+                    (viewport.right() - pointer_x).clamp(ASSISTANT_MIN_WIDTH, assistant_max);
+                ctx.request_repaint();
+            }
         }
     }
 
@@ -440,7 +589,7 @@ impl DesktopReader {
             });
         egui::Area::new("reader-sidebar-floating".into())
             .order(egui::Order::Foreground)
-            .fixed_pos(Pos2::new(-SIDEBAR_WIDTH * (1.0 - progress), 0.0))
+            .fixed_pos(Pos2::new(-self.ui.sidebar_width * (1.0 - progress), 0.0))
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(SURFACE)
@@ -448,7 +597,7 @@ impl DesktopReader {
                     .inner_margin(SIDEBAR_PADDING)
                     .show(ui, |ui| {
                         let sidebar_inset = f32::from(SIDEBAR_PADDING) * 2.0;
-                        ui.set_width(SIDEBAR_WIDTH - sidebar_inset);
+                        ui.set_width(self.ui.sidebar_width - sidebar_inset);
                         ui.set_height(ctx.content_rect().height() - sidebar_inset);
                         self.sidebar(ui);
                     });
@@ -756,6 +905,11 @@ impl DesktopReader {
 
     fn assistant_conversation(&mut self, ui: &mut egui::Ui, height: f32, busy: bool) {
         let messages = self.chat.messages.clone();
+        let streaming_content = self
+            .chat
+            .streaming
+            .as_ref()
+            .map(|streaming| streaming.content.clone());
         let mut clicked_citation = None;
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
@@ -763,6 +917,9 @@ impl DesktopReader {
             .min_scrolled_height(height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let content_width =
+                    (ui.available_width() - ASSISTANT_SCROLLBAR_GUTTER).max(1.0);
+                ui.set_width(content_width);
                 if messages.is_empty() && !busy {
                     ui.allocate_ui_with_layout(
                         Vec2::new(ui.available_width(), height),
@@ -789,7 +946,7 @@ impl DesktopReader {
                         },
                     );
                 }
-                for message in messages {
+                for (message_ordinal, message) in messages.iter().enumerate() {
                     if let Some(locator) = chat_message_card(
                         ui,
                         message.role,
@@ -799,21 +956,31 @@ impl DesktopReader {
                             .unwrap_or(&message.content),
                         self.language,
                         &mut self.chat_markdown,
+                        message_ordinal,
+                        false,
                     ) {
                         clicked_citation = Some(locator);
                     }
                     ui.add_space(10.0);
                 }
                 if busy {
+                    let content = streaming_content
+                        .as_deref()
+                        .filter(|content| !content.is_empty())
+                        .unwrap_or_else(|| {
+                            self.language.text(
+                                "正在阅读和检索书籍…",
+                                "Reading and searching the book…",
+                            )
+                        });
                     let _ = chat_message_card(
                         ui,
                         ChatRole::Assistant,
-                        self.language.text(
-                            "正在阅读和检索书籍…",
-                            "Reading and searching the book…",
-                        ),
+                        content,
                         self.language,
                         &mut self.chat_markdown,
+                        messages.len(),
+                        true,
                     );
                 }
             });
@@ -1655,6 +1822,8 @@ fn chat_message_card(
     content: &str,
     language: crate::preferences::AppLanguage,
     markdown: &mut ChatMarkdownState,
+    message_ordinal: usize,
+    streaming: bool,
 ) -> Option<String> {
     let is_user = role == ChatRole::User;
     let width = ui.available_width();
@@ -1691,7 +1860,7 @@ fn chat_message_card(
                         .selectable(true),
                 );
             } else {
-                clicked_citation = markdown.show(ui, content, language);
+                clicked_citation = markdown.show(ui, content, language, message_ordinal, streaming);
             }
         });
     clicked_citation
@@ -1792,5 +1961,21 @@ mod reference_suggestion_label_tests {
         assert!((destination.top() - page_rect.top()).abs() < 0.01);
         assert!((destination.width() - previous_texture_size.x).abs() < 0.01);
         assert!((destination.height() - previous_texture_size.y).abs() < 0.01);
+    }
+
+    #[test]
+    fn side_panel_widths_leave_room_for_reader_content() {
+        assert_eq!(
+            constrained_panel_widths(1_200.0, SIDEBAR_WIDTH, ASSISTANT_WIDTH, true, true),
+            (SIDEBAR_WIDTH, ASSISTANT_WIDTH)
+        );
+        assert_eq!(
+            constrained_panel_widths(720.0, SIDEBAR_MAX_WIDTH, ASSISTANT_MAX_WIDTH, true, true,),
+            (SIDEBAR_MIN_WIDTH, ASSISTANT_MIN_WIDTH)
+        );
+        assert_eq!(
+            constrained_panel_widths(720.0, SIDEBAR_MAX_WIDTH, ASSISTANT_MAX_WIDTH, false, true,),
+            (SIDEBAR_MAX_WIDTH, 520.0)
+        );
     }
 }

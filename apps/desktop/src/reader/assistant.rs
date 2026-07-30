@@ -6,7 +6,7 @@ use rebook_reader::ReaderVisibleTextFragment;
 
 use crate::platform::UserEvent;
 use crate::plugins::{
-    BookSearchResult, ChatCommand, ChatCommandResolution, ChatRole, ChatTurn,
+    BookSearchResult, ChatCommand, ChatCommandResolution, ChatResponse, ChatRole, ChatTurn,
     TranslationBlockInput, chat_with_book, resolve_chat_command, search_book, section_title,
     translate_blocks,
 };
@@ -16,9 +16,10 @@ use super::chat_autocomplete::{
     chat_reference_suggestions, chat_reference_token, insert_chat_reference, parse_chat_citation,
 };
 use super::{
-    AssistantPanel, ChatTask, ChatTaskMessage, DesktopReader, FocusedMark, MarkRetention,
-    SearchTask, SearchTaskMessage, SidebarTab, SnapshotEffects, TocTranslationTask,
-    TocTranslationTaskMessage, TranslationTask, TranslationTaskMessage,
+    AssistantPanel, ChatStreamMessage, ChatStreamingState, ChatTask, ChatTaskMessage,
+    DesktopReader, FocusedMark, MarkRetention, SearchTask, SearchTaskMessage, SidebarTab,
+    SnapshotEffects, TocTranslationTask, TocTranslationTaskMessage, TranslationTask,
+    TranslationTaskMessage,
 };
 
 impl DesktopReader {
@@ -43,6 +44,21 @@ impl DesktopReader {
         }
         if let Some(request) = self.chat.task.take_pending() {
             let proxy = proxy.clone();
+            crate::diagnostics::log(
+                "chat.task.start",
+                &[
+                    crate::diagnostics::Field::U64("id", request.id),
+                    crate::diagnostics::Field::Usize(
+                        "history_turns",
+                        request.payload.history.len(),
+                    ),
+                    crate::diagnostics::Field::Usize(
+                        "question_chars",
+                        request.payload.question.chars().count(),
+                    ),
+                ],
+            );
+            let stream_proxy = proxy.clone();
             runtime.spawn(async move {
                 let id = request.id;
                 let payload = request.payload;
@@ -53,6 +69,11 @@ impl DesktopReader {
                     payload.question,
                     payload.current_section,
                     payload.response_language,
+                    move |content| {
+                        let _ = stream_proxy.send_event(UserEvent::ReaderChatStream(
+                            ChatStreamMessage { id, content },
+                        ));
+                    },
                 )
                 .await;
                 let _ = proxy.send_event(UserEvent::ReaderChat(ChatTaskMessage { id, result }));
@@ -159,6 +180,7 @@ impl DesktopReader {
     }
 
     pub(super) fn toggle_assistant_panel(&mut self, panel: AssistantPanel) {
+        self.log_diagnostic_snapshot("assistant.toggle.before", None);
         self.cancel_text_selection();
         if self.ui.assistant_panel == Some(panel) && self.ui.assistant_motion.target > 0.5 {
             self.close_assistant_panel();
@@ -168,12 +190,15 @@ impl DesktopReader {
                 self.ui.last_motion_tick = Some(std::time::Instant::now());
             }
         }
+        self.log_diagnostic_snapshot("assistant.toggle.after", None);
     }
 
     pub(super) fn close_assistant_panel(&mut self) {
+        self.log_diagnostic_snapshot("assistant.close.before", None);
         if self.ui.assistant_motion.animate_to(0.0) {
             self.ui.last_motion_tick = Some(std::time::Instant::now());
         }
+        self.log_diagnostic_snapshot("assistant.close.after", None);
     }
 
     pub(super) fn send_chat(&mut self) {
@@ -461,6 +486,13 @@ impl DesktopReader {
 
     pub(super) fn queue_chat(&mut self, question: String, display_content: Option<String>) {
         if let Err(error) = self.plugin_settings.chat_endpoint() {
+            crate::diagnostics::log(
+                "chat.queue.rejected",
+                &[
+                    crate::diagnostics::Field::Text("reason", "invalid_endpoint"),
+                    crate::diagnostics::Field::Usize("error_chars", error.chars().count()),
+                ],
+            );
             self.chat.error = Some(error);
             self.ui.assistant_panel = Some(AssistantPanel::Chat);
             if self.ui.assistant_motion.animate_to(1.0) {
@@ -475,7 +507,10 @@ impl DesktopReader {
             display_content,
         });
         self.chat.error = None;
-        self.chat.task.begin(ChatTask {
+        let history_turns = history.len();
+        let question_chars = question.chars().count();
+        let question_lines = question.lines().count();
+        let id = self.chat.task.begin(ChatTask {
             source: Arc::clone(&self.source),
             settings: self.plugin_settings.clone(),
             history,
@@ -483,14 +518,33 @@ impl DesktopReader {
             current_section: self.snapshot.location.section_index,
             response_language: self.language.translation_target().into(),
         });
+        self.chat.streaming = Some(ChatStreamingState {
+            task_id: id,
+            content: String::new(),
+        });
+        crate::diagnostics::log(
+            "chat.queue",
+            &[
+                crate::diagnostics::Field::U64("id", id),
+                crate::diagnostics::Field::Usize("history_turns", history_turns),
+                crate::diagnostics::Field::Usize("question_chars", question_chars),
+                crate::diagnostics::Field::Usize("question_lines", question_lines),
+            ],
+        );
     }
 
     pub(crate) fn complete_chat(&mut self, message: ChatTaskMessage) {
         if self.chat.task.complete(message.id).is_none() {
+            crate::diagnostics::log(
+                "chat.complete.stale",
+                &[crate::diagnostics::Field::U64("id", message.id)],
+            );
             return;
         }
+        self.chat.streaming = None;
         match message.result {
             Ok(response) => {
+                log_completed_chat(message.id, &response);
                 if !response.rewrites.is_empty() {
                     let transaction = match self.rewrite_source.apply_rewrites(&response.rewrites) {
                         Ok(transaction) => transaction,
@@ -550,7 +604,33 @@ impl DesktopReader {
                 });
                 self.chat.error = None;
             }
-            Err(error) => self.chat.error = Some(error),
+            Err(error) => {
+                crate::diagnostics::log(
+                    "chat.complete.error",
+                    &[
+                        crate::diagnostics::Field::U64("id", message.id),
+                        crate::diagnostics::Field::Usize("error_chars", error.chars().count()),
+                    ],
+                );
+                self.chat.error = Some(error);
+            }
+        }
+    }
+
+    pub(crate) fn update_chat_stream(&mut self, message: ChatStreamMessage) {
+        let Some(streaming) = self.chat.streaming.as_mut() else {
+            return;
+        };
+        if streaming.task_id != message.id {
+            return;
+        }
+        let first_content = streaming.content.is_empty() && !message.content.is_empty();
+        streaming.content = message.content;
+        if first_content {
+            crate::diagnostics::log(
+                "chat.stream.first",
+                &[crate::diagnostics::Field::U64("id", message.id)],
+            );
         }
     }
 
@@ -796,6 +876,26 @@ fn paragraph_reference(
         link: format!("rebook://j/{section_index}/{node}"),
         excerpt: Some(excerpt),
     }
+}
+
+fn log_completed_chat(id: u64, response: &ChatResponse) {
+    let summary = super::chat_markdown::diagnostic_summary(&response.content);
+    crate::diagnostics::log(
+        "chat.complete.ok",
+        &[
+            crate::diagnostics::Field::U64("id", id),
+            crate::diagnostics::Field::Usize("response_chars", response.content.chars().count()),
+            crate::diagnostics::Field::Usize("response_lines", response.content.lines().count()),
+            crate::diagnostics::Field::Usize("rewrites", response.rewrites.len()),
+            crate::diagnostics::Field::Usize("render_blocks", summary.render_blocks),
+            crate::diagnostics::Field::Usize("plain_fences", summary.plain_fenced_code),
+            crate::diagnostics::Field::Usize("tables", summary.tables),
+            crate::diagnostics::Field::Usize("emoji_like", summary.emoji_like),
+            crate::diagnostics::Field::Usize("svg_previews", summary.svg_previews),
+            crate::diagnostics::Field::Usize("mermaid_previews", summary.mermaid_previews),
+            crate::diagnostics::Field::Usize("formulas", summary.formulas),
+        ],
+    );
 }
 
 fn selection_reference(

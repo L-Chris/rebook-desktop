@@ -69,7 +69,7 @@ impl SettingsFeature {
             draft_plugin_settings: applied.plugin_settings.clone(),
             draft_language: applied.language,
             draft_sync_settings: applied.sync_settings.clone(),
-            draft_sync_password: String::new(),
+            draft_sync_password: applied.sync_password.clone(),
             available_font_families,
             applied,
             revision: 0,
@@ -87,7 +87,8 @@ impl SettingsFeature {
         self.draft_language = self.applied.language;
         self.draft_sync_settings
             .clone_from(&self.applied.sync_settings);
-        self.draft_sync_password.clear();
+        self.draft_sync_password
+            .clone_from(&self.applied.sync_password);
         self.error = None;
         self.open = true;
     }
@@ -145,7 +146,8 @@ impl SettingsFeature {
             sync_settings,
             sync_password,
         };
-        self.draft_sync_password.clear();
+        self.draft_sync_password
+            .clone_from(&self.applied.sync_password);
         self.error = None;
         self.revision = self.revision.wrapping_add(1);
         self.close_overlay();

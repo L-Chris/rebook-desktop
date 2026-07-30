@@ -7,7 +7,8 @@ use vello::Scene;
 use crate::library::LocalLibrary;
 use crate::platform::UserEvent;
 use crate::reader::{
-    ChatTaskMessage, SearchTaskMessage, TocTranslationTaskMessage, TranslationTaskMessage,
+    ChatStreamMessage, ChatTaskMessage, SearchTaskMessage, TocTranslationTaskMessage,
+    TranslationTaskMessage,
 };
 use crate::reader::{DesktopReader, ReaderFramePlan, ReaderPageTexture};
 use crate::settings::{SettingsFeature, settings_overlay};
@@ -93,6 +94,12 @@ impl DesktopApp {
         }
     }
 
+    pub(crate) fn update_reader_chat_stream(&mut self, message: ChatStreamMessage) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.update_chat_stream(message);
+        }
+    }
+
     pub(crate) fn complete_reader_translation(&mut self, message: TranslationTaskMessage) {
         if let Some(reader) = self.reader.as_mut() {
             reader.complete_translation(message);
@@ -102,6 +109,27 @@ impl DesktopApp {
     pub(crate) fn complete_reader_toc_translation(&mut self, message: TocTranslationTaskMessage) {
         if let Some(reader) = self.reader.as_mut() {
             reader.complete_toc_translation(message);
+        }
+    }
+
+    pub(crate) fn log_reader_diagnostics(&self, event: &'static str, focused: Option<bool>) {
+        if let Some(reader) = self.reader.as_ref() {
+            reader.log_diagnostic_snapshot(event, focused);
+        } else {
+            crate::diagnostics::log(
+                event,
+                &[
+                    crate::diagnostics::Field::Text("screen", "shelf"),
+                    crate::diagnostics::Field::Text(
+                        "focus",
+                        match focused {
+                            Some(true) => "true",
+                            Some(false) => "false",
+                            None => "unknown",
+                        },
+                    ),
+                ],
+            );
         }
     }
 

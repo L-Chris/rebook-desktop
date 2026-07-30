@@ -1166,8 +1166,6 @@ dependencies = [
 [[package]]
 name = "egui_commonmark_backend"
 version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5758a1110eb8259743c9b220241c30ff014b2dec53c1a2b861d464e41fa3483e"
 dependencies = [
  "data-url",
  "egui",
@@ -3941,7 +3939,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-desktop"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyrender",
  "atomicwrites",
@@ -3950,6 +3948,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "egui_commonmark",
+ "egui_commonmark_backend",
  "egui_extras",
  "image",
  "keyring",
@@ -3986,7 +3985,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-formats"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64",
  "crc32fast",
@@ -4007,7 +4006,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-html"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rebook-publication",
  "roxmltree 0.21.1",
@@ -4016,7 +4015,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-inspect"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rebook-formats",
  "rebook-publication",
@@ -4027,7 +4026,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-layout"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "image",
  "parley",
@@ -4038,7 +4037,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-math"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cosmic-text",
  "latex2mathml",
@@ -4049,7 +4048,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-publication"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "percent-encoding",
  "serde",
@@ -4058,7 +4057,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-reader"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rebook-layout",
  "rebook-publication",
@@ -4068,7 +4067,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-renderer"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyrender",
  "kurbo",

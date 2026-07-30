@@ -4,6 +4,7 @@
 
 mod app;
 mod async_task;
+mod diagnostics;
 mod fonts;
 mod highlights;
 mod library;
@@ -37,6 +38,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    diagnostics::install_panic_hook();
     let launch = parse_arguments()?;
     let reader_fonts = fonts::embedded_reader_fonts();
 

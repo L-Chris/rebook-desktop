@@ -31,6 +31,12 @@ const SETTINGS_FILE: &str = "plugins.json";
 const AI_CREDENTIAL_SERVICE: &str = "Rebook AI";
 const DEFAULT_PROVIDER_ID: &str = "openai";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
+const DEFAULT_CHAT_MAX_TOOL_STEPS: u16 = 5;
+const DEFAULT_CHAT_HISTORY_TURNS: u16 = 10;
+pub(crate) const CHAT_TOOL_STEPS_MIN: u16 = 1;
+pub(crate) const CHAT_TOOL_STEPS_MAX: u16 = 10;
+pub(crate) const CHAT_HISTORY_TURNS_MIN: u16 = 1;
+pub(crate) const CHAT_HISTORY_TURNS_MAX: u16 = 50;
 pub(crate) const TARGET_LANGUAGE_INTERFACE: &str = "interface";
 pub(crate) const TARGET_LANGUAGE_SIMPLIFIED_CHINESE: &str = "zh-CN";
 pub(crate) const TARGET_LANGUAGE_ENGLISH: &str = "en";
@@ -130,6 +136,8 @@ pub struct PluginSettings {
     pub providers: Vec<AiProvider>,
     pub chat_provider: String,
     pub chat_model: String,
+    pub chat_max_tool_steps: u16,
+    pub chat_history_turns: u16,
     pub translation_provider: String,
     pub translation_model: String,
     pub target_language: String,
@@ -147,6 +155,8 @@ impl Default for PluginSettings {
             providers: vec![AiProvider::default()],
             chat_provider: DEFAULT_PROVIDER_ID.into(),
             chat_model: DEFAULT_MODEL.into(),
+            chat_max_tool_steps: DEFAULT_CHAT_MAX_TOOL_STEPS,
+            chat_history_turns: DEFAULT_CHAT_HISTORY_TURNS,
             translation_provider: DEFAULT_PROVIDER_ID.into(),
             translation_model: DEFAULT_MODEL.into(),
             target_language: TARGET_LANGUAGE_INTERFACE.into(),
@@ -247,6 +257,12 @@ impl PluginSettings {
             &mut self.translation_provider,
             &mut self.translation_model,
         );
+        self.chat_max_tool_steps = self
+            .chat_max_tool_steps
+            .clamp(CHAT_TOOL_STEPS_MIN, CHAT_TOOL_STEPS_MAX);
+        self.chat_history_turns = self
+            .chat_history_turns
+            .clamp(CHAT_HISTORY_TURNS_MIN, CHAT_HISTORY_TURNS_MAX);
         self.target_language = normalize_target_language(&self.target_language);
     }
 
@@ -528,6 +544,22 @@ mod tests {
         assert_eq!(settings.resolved_target_language("简体中文"), "English");
         assert_eq!(settings.translation_mode, TranslationMode::Bilingual);
         assert!(settings.translate_toc);
+        assert_eq!(settings.chat_max_tool_steps, DEFAULT_CHAT_MAX_TOOL_STEPS);
+        assert_eq!(settings.chat_history_turns, DEFAULT_CHAT_HISTORY_TURNS);
+    }
+
+    #[test]
+    fn ai_chat_limits_are_normalized_to_supported_ranges() {
+        let mut settings = PluginSettings {
+            chat_max_tool_steps: 0,
+            chat_history_turns: u16::MAX,
+            ..PluginSettings::default()
+        };
+
+        settings.normalize();
+
+        assert_eq!(settings.chat_max_tool_steps, CHAT_TOOL_STEPS_MIN);
+        assert_eq!(settings.chat_history_turns, CHAT_HISTORY_TURNS_MAX);
     }
 
     #[test]

@@ -12,15 +12,20 @@ use crate::library::{LibraryBook, LocalLibrary};
 use crate::preferences::{self, AppLanguage};
 use crate::reader::{BookDisplayMetadata, DesktopReader, open_reader};
 use crate::settings::AppliedSettings;
-use crate::sync::{LocalSyncBook, SyncReport, SyncSettings, SyncStore, run_sync};
+use crate::sync::{
+    LocalSyncBook, SyncReport, SyncSettings, SyncStore, append_sync_log, format_error_chain,
+    run_sync,
+};
 use crate::ui::{
-    ACCENT, ACCENT_SOFT, BACKGROUND, BORDER, MUTED, SURFACE, SURFACE_MUTED, TEXT,
-    decode_color_image, icon, icon_button,
+    ACCENT, ACCENT_SOFT, BACKGROUND, BORDER, MUTED, SURFACE, TEXT, decode_color_image, icon,
+    icon_button,
 };
 
 const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
+const TOAST_MAX_WIDTH: f32 = 400.0;
+const SHELF_SCROLLBAR_GUTTER: f32 = 16.0;
 const CARD_WIDTH: f32 = 180.0;
-const CARD_HEIGHT: f32 = 318.0;
+const CARD_HEIGHT: f32 = 336.0;
 const COVER_WIDTH: f32 = 160.0;
 const COVER_HEIGHT: f32 = 228.0;
 
@@ -41,6 +46,7 @@ struct ShelfState {
     notice: Option<String>,
     notice_dismiss_at: Option<Instant>,
     error: Option<String>,
+    error_dismiss_at: Option<Instant>,
     remove_confirmation: Option<ShelfRemoveConfirmation>,
 }
 
@@ -100,16 +106,21 @@ impl ShelfFeature {
                 |error| (None, Some(format!("打开本地阅读数据库失败：{error}"))),
                 |store| (Some(store), None),
             );
+        let initial_error = language_error
+            .or(settings_error)
+            .or(password_error)
+            .or(store_error);
+        let initial_error_dismiss_at = initial_error
+            .as_ref()
+            .map(|_| Instant::now() + NOTICE_AUTO_DISMISS_DELAY);
         Self {
             shelf: ShelfState {
                 library,
                 query: String::new(),
                 notice: None,
                 notice_dismiss_at: None,
-                error: language_error
-                    .or(settings_error)
-                    .or(password_error)
-                    .or(store_error),
+                error: initial_error,
+                error_dismiss_at: initial_error_dismiss_at,
                 remove_confirmation: None,
             },
             pending_reader: None,
@@ -129,7 +140,7 @@ impl ShelfFeature {
 
     pub(crate) fn open_book(&mut self, path: &Path) {
         let Some(local_store) = self.local_store.clone() else {
-            self.shelf.error = Some(
+            self.show_error(
                 self.language
                     .text(
                         "本地阅读数据库不可用，无法打开书籍",
@@ -150,9 +161,10 @@ impl ShelfFeature {
             Ok(reader) => {
                 self.pending_reader = Some(reader);
                 self.shelf.error = None;
+                self.shelf.error_dismiss_at = None;
             }
             Err(error) => {
-                self.shelf.error = Some(format!(
+                self.show_error(format!(
                     "{}: {error}",
                     self.language.text("无法打开书籍", "Unable to open book")
                 ));
@@ -186,7 +198,7 @@ impl ShelfFeature {
                 self.show_notice(message);
             }
             Err(error) => {
-                self.shelf.error = Some(format!(
+                self.show_error(format!(
                     "{}: {error}",
                     self.language.text("导入失败", "Import failed")
                 ));
@@ -211,7 +223,7 @@ impl ShelfFeature {
                 self.shelf.error = None;
             }
             Ok(false) => {
-                self.shelf.error = Some(
+                self.show_error(
                     self.language
                         .text(
                             "书籍已不在本地书架中",
@@ -221,7 +233,7 @@ impl ShelfFeature {
                 );
             }
             Err(error) => {
-                self.shelf.error = Some(format!(
+                self.show_error(format!(
                     "{}: {error}",
                     self.language.text("移除失败", "Remove failed")
                 ));
@@ -256,14 +268,14 @@ impl ShelfFeature {
             return;
         }
         if let Err(error) = self.sync.settings.validate() {
-            self.shelf.error = Some(format!(
+            self.show_error(format!(
                 "{}: {error}",
                 self.language.text("无法开始同步", "Unable to start sync")
             ));
             return;
         }
         if self.sync.password.is_empty() {
-            self.shelf.error = Some(
+            self.show_error(
                 self.language
                     .text(
                         "无法开始同步：请先填写 WebDAV 密码",
@@ -310,9 +322,35 @@ impl ShelfFeature {
         runtime.spawn(async move {
             let id = request.id;
             let payload = request.payload;
-            let result = run_sync(payload.settings, payload.password, payload.books)
-                .await
-                .map_err(|error| error.to_string());
+            if let Err(log_error) = append_sync_log(
+                "INFO",
+                &format!("sync started books={}", payload.books.len()),
+            ) {
+                tracing::warn!(%log_error, "failed to append WebDAV sync log");
+            }
+            let result = match run_sync(payload.settings, payload.password, payload.books).await {
+                Ok(report) => {
+                    if let Err(log_error) = append_sync_log(
+                        "INFO",
+                        &format!(
+                            "sync completed uploaded_books={} downloads={} updated_progress={}",
+                            report.uploaded_books,
+                            report.downloads.len(),
+                            report.updated_progress,
+                        ),
+                    ) {
+                        tracing::warn!(%log_error, "failed to append WebDAV sync log");
+                    }
+                    Ok(report)
+                }
+                Err(error) => {
+                    let detail = format_error_chain(error.as_ref());
+                    if let Err(log_error) = append_sync_log("ERROR", &detail) {
+                        tracing::warn!(%log_error, "failed to append WebDAV sync log");
+                    }
+                    Err(detail)
+                }
+            };
             let _ = proxy.send_event(crate::platform::UserEvent::ShelfSync(SyncTaskMessage {
                 id,
                 result,
@@ -332,7 +370,7 @@ impl ShelfFeature {
                         Ok(true) => imported += 1,
                         Ok(false) => {}
                         Err(error) => {
-                            self.shelf.error = Some(error.to_string());
+                            self.show_error(error.to_string());
                             return;
                         }
                     }
@@ -350,7 +388,7 @@ impl ShelfFeature {
                 self.show_notice(self.sync.status.clone());
             }
             Err(error) => {
-                self.shelf.error = Some(format!(
+                self.show_error(format!(
                     "{}: {error}",
                     self.language.text("WebDAV 同步失败", "WebDAV sync failed")
                 ));
@@ -360,12 +398,17 @@ impl ShelfFeature {
 
     pub(crate) fn ui(&mut self, root_ui: &mut egui::Ui) {
         let ctx = root_ui.ctx().clone();
-        self.dismiss_notice_if_due();
+        self.dismiss_transient_messages_if_due(&ctx);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(BACKGROUND)
-                    .inner_margin(egui::Margin::symmetric(36, 28)),
+                    .inner_margin(egui::Margin {
+                        left: 36,
+                        right: 16,
+                        top: 28,
+                        bottom: 28,
+                    }),
             )
             .show(root_ui, |ui| {
                 self.shelf_header(ui);
@@ -383,7 +426,12 @@ impl ShelfFeature {
                 if books.is_empty() {
                     self.empty_shelf(ui, query.is_empty());
                 } else {
-                    egui::ScrollArea::vertical().show(ui, |ui| self.book_grid(ui, &books));
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.set_width(
+                            (ui.available_width() - SHELF_SCROLLBAR_GUTTER).max(CARD_WIDTH),
+                        );
+                        self.book_grid(ui, &books);
+                    });
                 }
             });
         self.dialogs(&ctx);
@@ -511,7 +559,7 @@ impl ShelfFeature {
             rect.min + Vec2::splat(10.0),
             Vec2::new(COVER_WIDTH, COVER_HEIGHT),
         );
-        painter.rect_filled(cover_rect, 6.0, SURFACE_MUTED);
+        painter.rect_filled(cover_rect, 6.0, SURFACE);
         if let Some(texture) = texture {
             let image_rect = contain_rect(cover_rect, texture.size_vec2());
             painter.image(
@@ -534,12 +582,12 @@ impl ShelfFeature {
             egui::pos2(rect.left() + 12.0, cover_rect.bottom() + 12.0),
             Vec2::new(CARD_WIDTH - 24.0, 42.0),
         );
-        let title = painter.layout(
+        let title = painter.layout_job(two_line_card_text_job(
             book.title.clone(),
             egui::FontId::proportional(14.0),
             TEXT,
             title_rect.width(),
-        );
+        ));
         painter
             .with_clip_rect(title_rect)
             .galley(title_rect.min, title, TEXT);
@@ -548,9 +596,14 @@ impl ShelfFeature {
         if !authors.is_empty() {
             let author_rect = egui::Rect::from_min_size(
                 egui::pos2(rect.left() + 12.0, title_rect.bottom() + 4.0),
-                Vec2::new(CARD_WIDTH - 24.0, 20.0),
+                Vec2::new(CARD_WIDTH - 24.0, 34.0),
             );
-            let author = painter.layout_no_wrap(authors, egui::FontId::proportional(12.0), MUTED);
+            let author = painter.layout_job(two_line_card_text_job(
+                authors,
+                egui::FontId::proportional(12.0),
+                MUTED,
+                author_rect.width(),
+            ));
             painter
                 .with_clip_rect(author_rect)
                 .galley(author_rect.min, author, MUTED);
@@ -590,23 +643,9 @@ impl ShelfFeature {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         if let Some(error) = &self.shelf.error {
-            egui::Area::new("shelf-error".into())
-                .anchor(egui::Align2::RIGHT_TOP, [-24.0, 24.0])
-                .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style())
-                        .fill(Color32::from_rgb(69, 32, 32))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(error).color(Color32::WHITE));
-                        });
-                });
+            shelf_toast(ctx, "shelf-error", error, ShelfToastKind::Error);
         } else if let Some(notice) = &self.shelf.notice {
-            egui::Area::new("shelf-notice".into())
-                .anchor(egui::Align2::RIGHT_TOP, [-24.0, 24.0])
-                .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style()).fill(ACCENT).show(ui, |ui| {
-                        ui.label(RichText::new(notice).color(Color32::WHITE));
-                    });
-                });
+            shelf_toast(ctx, "shelf-notice", notice, ShelfToastKind::Success);
         }
         let confirmation = self.shelf.remove_confirmation.clone();
         if let Some(confirmation) = confirmation {
@@ -635,20 +674,103 @@ impl ShelfFeature {
     }
 
     fn show_notice(&mut self, message: String) {
+        self.shelf.error = None;
+        self.shelf.error_dismiss_at = None;
         self.shelf.notice = Some(message);
         self.shelf.notice_dismiss_at = Some(Instant::now() + NOTICE_AUTO_DISMISS_DELAY);
     }
 
-    fn dismiss_notice_if_due(&mut self) {
+    fn show_error(&mut self, message: String) {
+        self.shelf.notice = None;
+        self.shelf.notice_dismiss_at = None;
+        self.shelf.error = Some(message);
+        self.shelf.error_dismiss_at = Some(Instant::now() + NOTICE_AUTO_DISMISS_DELAY);
+    }
+
+    fn dismiss_transient_messages_if_due(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
         if self
             .shelf
             .notice_dismiss_at
-            .is_some_and(|deadline| Instant::now() >= deadline)
+            .is_some_and(|deadline| now >= deadline)
         {
             self.shelf.notice = None;
             self.shelf.notice_dismiss_at = None;
         }
+        if self
+            .shelf
+            .error_dismiss_at
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.shelf.error = None;
+            self.shelf.error_dismiss_at = None;
+        }
+        if let Some(deadline) = [self.shelf.notice_dismiss_at, self.shelf.error_dismiss_at]
+            .into_iter()
+            .flatten()
+            .min()
+        {
+            ctx.request_repaint_after(deadline.saturating_duration_since(now));
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ShelfToastKind {
+    Success,
+    Error,
+}
+
+fn shelf_toast(ctx: &egui::Context, id: &'static str, message: &str, kind: ShelfToastKind) {
+    let available_width = (ctx.content_rect().width() - 48.0).max(200.0);
+    let width = TOAST_MAX_WIDTH.min(available_width);
+    let (icon_kind, fill, border, foreground) = match kind {
+        ShelfToastKind::Success => (
+            Icon::CheckCircle,
+            ACCENT_SOFT,
+            Color32::from_rgb(184, 214, 197),
+            ACCENT,
+        ),
+        ShelfToastKind::Error => (
+            Icon::AlertCircle,
+            Color32::from_rgb(252, 239, 238),
+            Color32::from_rgb(235, 193, 190),
+            Color32::from_rgb(157, 57, 54),
+        ),
+    };
+
+    egui::Area::new(id.into())
+        .order(egui::Order::Tooltip)
+        .anchor(egui::Align2::RIGHT_TOP, [-24.0, 24.0])
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .fill(fill)
+                .stroke(egui::Stroke::new(1.0, border))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::symmetric(14, 11))
+                .show(ui, |ui| {
+                    ui.set_width((width - 28.0).max(0.0));
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.label(icon(icon_kind).size(18.0).color(foreground));
+                        ui.add(
+                            egui::Label::new(RichText::new(message).size(13.0).color(foreground))
+                                .wrap(),
+                        );
+                    });
+                });
+        });
+}
+
+fn two_line_card_text_job(
+    text: String,
+    font_id: egui::FontId,
+    color: Color32,
+    max_width: f32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::simple(text, font_id, color, max_width);
+    job.wrap.max_rows = 2;
+    job
 }
 
 fn shelf_search_field(ui: &mut egui::Ui, query: &mut String, hint: &str) {

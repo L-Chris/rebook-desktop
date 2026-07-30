@@ -7,7 +7,9 @@ const BITTER_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Bitter-Italic
 const ROBOTO_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Roboto-wdth-wght.ttf");
 const ROBOTO_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/Roboto-Italic-wdth-wght.ttf");
 const FIRA_CODE: &[u8] = include_bytes!("../../../assets/fonts/FiraCode-wght.ttf");
-const LXGW_WENKAI: &[u8] = include_bytes!("../../../assets/fonts/LXGWWenKai-Regular.ttf");
+pub(crate) fn cjk_font_bytes() -> &'static [u8] {
+    rebook_formats::cjk_fallback_font_bytes()
+}
 
 pub fn embedded_reader_fonts() -> Arc<[Blob<u8>]> {
     [
@@ -16,7 +18,7 @@ pub fn embedded_reader_fonts() -> Arc<[Blob<u8>]> {
         font_blob(ROBOTO_REGULAR),
         font_blob(ROBOTO_ITALIC),
         font_blob(FIRA_CODE),
-        font_blob(LXGW_WENKAI),
+        font_blob(cjk_font_bytes()),
     ]
     .into()
 }

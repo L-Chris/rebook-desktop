@@ -32,10 +32,7 @@ pub(crate) fn configure(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert(
         "reader-cjk".into(),
-        FontData::from_static(include_bytes!(
-            "../../../../assets/fonts/LXGWWenKai-Regular.ttf"
-        ))
-        .into(),
+        FontData::from_static(crate::fonts::cjk_font_bytes()).into(),
     );
     fonts.font_data.insert(
         "lucide".into(),
