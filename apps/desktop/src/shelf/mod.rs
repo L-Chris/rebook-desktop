@@ -16,10 +16,7 @@ use crate::sync::{
     LocalSyncBook, SyncReport, SyncSettings, SyncStore, append_sync_log, format_error_chain,
     run_sync,
 };
-use crate::ui::{
-    ACCENT, ACCENT_SOFT, BACKGROUND, BORDER, MUTED, SURFACE, TEXT, decode_color_image, icon,
-    icon_button,
-};
+use crate::ui::{decode_color_image, icon, icon_button, palette};
 
 const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 const TOAST_MAX_WIDTH: f32 = 400.0;
@@ -402,7 +399,7 @@ impl ShelfFeature {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(BACKGROUND)
+                    .fill(palette().background)
                     .inner_margin(egui::Margin {
                         left: 36,
                         right: 16,
@@ -443,12 +440,12 @@ impl ShelfFeature {
             Vec2::new(ui.available_width(), 44.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(icon(Icon::BookOpen).size(23.0).color(ACCENT));
+                ui.label(icon(Icon::BookOpen).size(23.0).color(palette().accent));
                 ui.label(
                     RichText::new(self.language.text("书架", "Library"))
                         .size(22.0)
                         .strong()
-                        .color(TEXT),
+                        .color(palette().text),
                 );
                 ui.label(
                     RichText::new(match self.language {
@@ -456,7 +453,7 @@ impl ShelfFeature {
                         AppLanguage::English => format!("{book_count} books"),
                     })
                     .size(12.0)
-                    .color(MUTED),
+                    .color(palette().muted),
                 );
                 ui.add_space(22.0);
                 shelf_search_field(
@@ -493,7 +490,7 @@ impl ShelfFeature {
             egui::Layout::centered_and_justified(egui::Direction::TopDown),
             |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.label(icon(Icon::BookOpen).size(30.0).color(MUTED));
+                    ui.label(icon(Icon::BookOpen).size(30.0).color(palette().muted));
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(if no_books {
@@ -503,7 +500,7 @@ impl ShelfFeature {
                         })
                         .size(16.0)
                         .strong()
-                        .color(TEXT),
+                        .color(palette().text),
                     );
                     if no_books {
                         ui.label(
@@ -512,7 +509,7 @@ impl ShelfFeature {
                                 "Import EPUB, MOBI, PDF, and other books to begin",
                             ))
                             .size(12.0)
-                            .color(MUTED),
+                            .color(palette().muted),
                         );
                     }
                 });
@@ -550,16 +547,16 @@ impl ShelfFeature {
             rect,
             10.0,
             if response.hovered() {
-                ACCENT_SOFT.gamma_multiply(0.42)
+                palette().accent_soft.gamma_multiply(0.42)
             } else {
-                SURFACE
+                palette().surface
             },
         );
         let cover_rect = egui::Rect::from_min_size(
             rect.min + Vec2::splat(10.0),
             Vec2::new(COVER_WIDTH, COVER_HEIGHT),
         );
-        painter.rect_filled(cover_rect, 6.0, SURFACE);
+        painter.rect_filled(cover_rect, 6.0, palette().surface);
         if let Some(texture) = texture {
             let image_rect = contain_rect(cover_rect, texture.size_vec2());
             painter.image(
@@ -574,7 +571,7 @@ impl ShelfFeature {
                 egui::Align2::CENTER_CENTER,
                 Icon::BookOpen.unicode(),
                 egui::FontId::new(24.0, egui::FontFamily::Name("lucide".into())),
-                MUTED,
+                palette().muted,
             );
         }
 
@@ -585,12 +582,12 @@ impl ShelfFeature {
         let title = painter.layout_job(two_line_card_text_job(
             book.title.clone(),
             egui::FontId::proportional(14.0),
-            TEXT,
+            palette().text,
             title_rect.width(),
         ));
         painter
             .with_clip_rect(title_rect)
-            .galley(title_rect.min, title, TEXT);
+            .galley(title_rect.min, title, palette().text);
 
         let authors = book.authors.join(" / ");
         if !authors.is_empty() {
@@ -601,12 +598,12 @@ impl ShelfFeature {
             let author = painter.layout_job(two_line_card_text_job(
                 authors,
                 egui::FontId::proportional(12.0),
-                MUTED,
+                palette().muted,
                 author_rect.width(),
             ));
             painter
                 .with_clip_rect(author_rect)
-                .galley(author_rect.min, author, MUTED);
+                .galley(author_rect.min, author, palette().muted);
         }
 
         if response.clicked() {
@@ -727,15 +724,15 @@ fn shelf_toast(ctx: &egui::Context, id: &'static str, message: &str, kind: Shelf
     let (icon_kind, fill, border, foreground) = match kind {
         ShelfToastKind::Success => (
             Icon::CheckCircle,
-            ACCENT_SOFT,
-            Color32::from_rgb(184, 214, 197),
-            ACCENT,
+            palette().accent_soft,
+            palette().accent_border,
+            palette().accent,
         ),
         ShelfToastKind::Error => (
             Icon::AlertCircle,
-            Color32::from_rgb(252, 239, 238),
-            Color32::from_rgb(235, 193, 190),
-            Color32::from_rgb(157, 57, 54),
+            palette().error_fill,
+            palette().error_stroke,
+            palette().error_text,
         ),
     };
 
@@ -776,14 +773,14 @@ fn two_line_card_text_job(
 fn shelf_search_field(ui: &mut egui::Ui, query: &mut String, hint: &str) {
     let width = ui.available_width().clamp(180.0, 320.0);
     egui::Frame::new()
-        .fill(SURFACE)
-        .stroke(egui::Stroke::new(1.0, BORDER))
+        .fill(palette().surface)
+        .stroke(egui::Stroke::new(1.0, palette().border))
         .corner_radius(8.0)
         .inner_margin(egui::Margin::symmetric(10, 5))
         .show(ui, |ui| {
             ui.set_width(width - 22.0);
             ui.horizontal_centered(|ui| {
-                ui.label(icon(Icon::Search).size(15.0).color(MUTED));
+                ui.label(icon(Icon::Search).size(15.0).color(palette().muted));
                 ui.add(
                     egui::TextEdit::singleline(query)
                         .hint_text(hint)
@@ -799,11 +796,11 @@ fn shelf_import_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(80.0, 36.0), egui::Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
     let fill = if response.is_pointer_button_down_on() {
-        ACCENT.gamma_multiply(0.84)
+        palette().accent.gamma_multiply(0.84)
     } else if response.hovered() {
-        ACCENT.gamma_multiply(0.92)
+        palette().accent.gamma_multiply(0.92)
     } else {
-        ACCENT
+        palette().accent
     };
     let painter = ui.painter();
     painter.rect_filled(rect, 8.0, fill);

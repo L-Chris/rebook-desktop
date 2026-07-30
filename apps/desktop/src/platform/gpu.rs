@@ -32,6 +32,7 @@ pub(super) struct GpuState {
     vello_renderer: VelloRenderer,
     page_target: Option<PageTarget>,
     retired_page_textures: Vec<TextureId>,
+    clear_color: wgpu::Color,
 }
 
 impl GpuState {
@@ -89,6 +90,12 @@ impl GpuState {
             vello_renderer,
             page_target: None,
             retired_page_textures: Vec::new(),
+            clear_color: wgpu::Color {
+                r: 0.965,
+                g: 0.957,
+                b: 0.937,
+                a: 1.0,
+            },
         })
     }
 
@@ -99,6 +106,10 @@ impl GpuState {
         self.surface_config.width = size.width;
         self.surface_config.height = size.height;
         self.surface.configure(&self.device, &self.surface_config);
+    }
+
+    pub(super) fn set_clear_color(&mut self, color: wgpu::Color) {
+        self.clear_color = color;
     }
 
     fn take_egui_input(
@@ -197,12 +208,7 @@ impl GpuState {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.965,
-                            g: 0.957,
-                            b: 0.937,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(self.clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

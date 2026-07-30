@@ -42,11 +42,21 @@ impl AppLanguage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum AppTheme {
+    #[default]
+    #[serde(rename = "light")]
+    Light,
+    #[serde(rename = "dark")]
+    Dark,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ReaderPreferences {
     pub(crate) typography: ReaderTypography,
     pub(crate) language: AppLanguage,
     pub(crate) spread: SpreadMode,
+    pub(crate) theme: AppTheme,
 }
 
 impl Default for ReaderPreferences {
@@ -55,6 +65,7 @@ impl Default for ReaderPreferences {
             typography: ReaderTypography::default(),
             language: AppLanguage::default(),
             spread: SpreadMode::Double,
+            theme: AppTheme::default(),
         }
     }
 }
@@ -66,6 +77,8 @@ struct StoredReaderPreferences {
     typography: ReaderTypography,
     #[serde(default)]
     language: AppLanguage,
+    #[serde(default)]
+    theme: AppTheme,
     #[serde(default = "default_spread")]
     spread: StoredSpreadMode,
 }
@@ -136,6 +149,7 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
         typography,
         language: stored.language,
         spread: stored.spread.into(),
+        theme: stored.theme,
     })
 }
 
@@ -151,6 +165,7 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
         typography,
         language: preferences.language,
         spread: preferences.spread.into(),
+        theme: preferences.theme,
     };
     write_json_atomic(path, &stored)?;
     Ok(())
@@ -180,6 +195,7 @@ mod tests {
             typography,
             language: AppLanguage::English,
             spread: SpreadMode::Single,
+            theme: AppTheme::Dark,
         };
         save_to(&path, &preferences).unwrap();
         let loaded = load_from(path.clone()).unwrap();
@@ -191,6 +207,7 @@ mod tests {
         assert_eq!(loaded.typography.font_weight, 600);
         assert_eq!(loaded.language, AppLanguage::English);
         assert_eq!(loaded.spread, SpreadMode::Single);
+        assert_eq!(loaded.theme, AppTheme::Dark);
         fs::remove_file(path).unwrap();
     }
 
@@ -200,6 +217,7 @@ mod tests {
         let stored: StoredReaderPreferences = serde_json::from_str(json).unwrap();
         assert_eq!(stored.language, AppLanguage::SimplifiedChinese);
         assert!(matches!(stored.spread, StoredSpreadMode::Double));
+        assert_eq!(stored.theme, AppTheme::Light);
     }
 
     fn test_path() -> PathBuf {

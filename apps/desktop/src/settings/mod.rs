@@ -2,7 +2,7 @@ use peniko::Blob;
 use rebook_layout::{LayoutEngine, ReaderTypography, SpreadMode};
 
 use crate::plugins::PluginSettings;
-use crate::preferences::{self, AppLanguage, ReaderPreferences};
+use crate::preferences::{self, AppLanguage, AppTheme, ReaderPreferences};
 use crate::sync::SyncSettings;
 
 mod egui_view;
@@ -15,6 +15,7 @@ pub(crate) struct AppliedSettings {
     pub(crate) typography: ReaderTypography,
     pub(crate) plugin_settings: PluginSettings,
     pub(crate) language: AppLanguage,
+    pub(crate) theme: AppTheme,
     pub(crate) sync_settings: SyncSettings,
     pub(crate) sync_password: String,
 }
@@ -25,6 +26,7 @@ pub(crate) struct SettingsFeature {
     draft_typography: ReaderTypography,
     draft_plugin_settings: PluginSettings,
     draft_language: AppLanguage,
+    draft_theme: AppTheme,
     draft_sync_settings: SyncSettings,
     draft_sync_password: String,
     available_font_families: Vec<String>,
@@ -59,6 +61,7 @@ impl SettingsFeature {
             typography: preferences.typography,
             plugin_settings,
             language: preferences.language,
+            theme: preferences.theme,
             sync_settings,
             sync_password,
         };
@@ -68,6 +71,7 @@ impl SettingsFeature {
             draft_typography: applied.typography.clone(),
             draft_plugin_settings: applied.plugin_settings.clone(),
             draft_language: applied.language,
+            draft_theme: applied.theme,
             draft_sync_settings: applied.sync_settings.clone(),
             draft_sync_password: applied.sync_password.clone(),
             available_font_families,
@@ -85,6 +89,7 @@ impl SettingsFeature {
         self.draft_plugin_settings
             .clone_from(&self.applied.plugin_settings);
         self.draft_language = self.applied.language;
+        self.draft_theme = self.applied.theme;
         self.draft_sync_settings
             .clone_from(&self.applied.sync_settings);
         self.draft_sync_password
@@ -113,6 +118,7 @@ impl SettingsFeature {
         let mut sync_settings = self.draft_sync_settings.clone();
         sync_settings.normalize();
         let language = self.draft_language;
+        let theme = self.draft_theme;
         if sync_settings.enabled
             && let Err(error) = sync_settings.validate()
         {
@@ -127,6 +133,7 @@ impl SettingsFeature {
             &typography,
             &plugin_settings,
             language,
+            theme,
             &sync_settings,
             &self.draft_sync_password,
         ) {
@@ -143,6 +150,7 @@ impl SettingsFeature {
             typography,
             plugin_settings,
             language,
+            theme,
             sync_settings,
             sync_password,
         };
@@ -163,6 +171,7 @@ fn persist_settings(
     typography: &ReaderTypography,
     plugin_settings: &PluginSettings,
     language: AppLanguage,
+    theme: AppTheme,
     sync_settings: &SyncSettings,
     sync_password: &str,
 ) -> Result<(), String> {
@@ -175,6 +184,7 @@ fn persist_settings(
     preferences::save_reader_preferences(&ReaderPreferences {
         typography: typography.clone(),
         language,
+        theme,
         spread,
     })
     .map_err(|error| {

@@ -13,8 +13,7 @@ use super::chat_markdown::ChatMarkdownState;
 use super::{AnnotationDraft, AssistantPanel, DesktopReader, ReaderOverlay, SidebarTab};
 use crate::plugins::{ChatCommand, ChatRole, chat_command_suggestions};
 use crate::ui::{
-    ACCENT, ACCENT_SOFT, BACKGROUND, BORDER, MUTED, SURFACE, SURFACE_MUTED, TEXT,
-    decode_color_image, icon, icon_button, navigation_button, navigation_text_button,
+    decode_color_image, icon, icon_button, navigation_button, navigation_text_button, palette,
     selectable_icon_button, toggle_icon_button,
 };
 
@@ -129,11 +128,11 @@ fn panel_resize_pointer(ctx: &egui::Context, id: &'static str, edge_x: f32) -> O
             );
             let response = response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
             let stroke = if response.dragged() {
-                egui::Stroke::new(2.0, ACCENT)
+                egui::Stroke::new(2.0, palette().accent)
             } else if response.hovered() {
-                egui::Stroke::new(1.0, MUTED)
+                egui::Stroke::new(1.0, palette().muted)
             } else {
-                egui::Stroke::new(1.0, BORDER)
+                egui::Stroke::new(1.0, palette().border)
             };
             ui.painter()
                 .vline(rect.center().x, rect.top()..=rect.bottom(), stroke);
@@ -209,7 +208,7 @@ impl DesktopReader {
                     track.min,
                     Vec2::new(track.width() * progress, track.height()),
                 );
-                ui.painter().rect_filled(filled, 0.0, ACCENT);
+                ui.painter().rect_filled(filled, 0.0, palette().accent);
             });
 
         if !self.ui.sidebar_pinned && sidebar_progress > 0.001 {
@@ -258,7 +257,7 @@ impl DesktopReader {
                 .show_separator_line(false)
                 .frame(
                     egui::Frame::new()
-                        .fill(SURFACE)
+                        .fill(palette().surface)
                         .inner_margin(SIDEBAR_PADDING),
                 )
                 .show(root_ui, |ui| self.sidebar(ui));
@@ -270,7 +269,7 @@ impl DesktopReader {
                 .show_separator_line(false)
                 .frame(
                     egui::Frame::new()
-                        .fill(BACKGROUND)
+                        .fill(palette().background)
                         .inner_margin(egui::Margin::symmetric(ASSISTANT_SIDE_PADDING, 0)),
                 )
                 .show(root_ui, |ui| self.assistant(ui));
@@ -453,7 +452,7 @@ impl DesktopReader {
                     if opacity > 0.02 || self.ui.overlay == ReaderOverlay::Menu {
                         ui.label(
                             RichText::new(&self.display_metadata.title)
-                                .color(TEXT)
+                                .color(palette().text)
                                 .size(TOOLBAR_TITLE_SIZE),
                         );
                         ui.scope_builder(
@@ -592,8 +591,8 @@ impl DesktopReader {
             .fixed_pos(Pos2::new(-self.ui.sidebar_width * (1.0 - progress), 0.0))
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(SURFACE)
-                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .fill(palette().surface)
+                    .stroke(egui::Stroke::new(1.0, palette().border))
                     .inner_margin(SIDEBAR_PADDING)
                     .show(ui, |ui| {
                         let sidebar_inset = f32::from(SIDEBAR_PADDING) * 2.0;
@@ -621,13 +620,13 @@ impl DesktopReader {
                 ui.add(egui::Image::new(texture).fit_to_exact_size(Vec2::new(52.0, 74.0)));
             } else {
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(52.0, 74.0), egui::Sense::hover());
-                ui.painter().rect_filled(rect, 5.0, SURFACE_MUTED);
+                ui.painter().rect_filled(rect, 5.0, palette().surface_muted);
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
                     self.format.label(),
                     egui::FontId::proportional(10.0),
-                    ACCENT,
+                    palette().accent,
                 );
             }
             let summary_width = ui.available_width().max(1.0);
@@ -638,12 +637,12 @@ impl DesktopReader {
                     ui.label(
                         RichText::new(&self.display_metadata.title)
                             .strong()
-                            .color(TEXT),
+                            .color(palette().text),
                     )
                     .on_hover_text(&self.display_metadata.title);
                     let authors = self.display_metadata.authors.join(" / ");
                     if !authors.is_empty() {
-                        ui.label(RichText::new(authors).size(12.0).color(MUTED));
+                        ui.label(RichText::new(authors).size(12.0).color(palette().muted));
                     }
                 },
             );
@@ -691,7 +690,7 @@ impl DesktopReader {
                         did_auto_scroll = true;
                     }
                     let row_fill = if selected {
-                        ACCENT_SOFT
+                        palette().accent_soft
                     } else if row_response.hovered() {
                         ui.visuals().widgets.hovered.weak_bg_fill
                     } else {
@@ -830,7 +829,11 @@ impl DesktopReader {
         }
         if !self.search.status.is_empty() {
             ui.add_space(8.0);
-            ui.label(RichText::new(&self.search.status).size(12.0).color(MUTED));
+            ui.label(
+                RichText::new(&self.search.status)
+                    .size(12.0)
+                    .color(palette().muted),
+            );
         }
         let results = self.search.results.clone();
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -870,12 +873,12 @@ impl DesktopReader {
             Vec2::new(width, TOOLBAR_HEIGHT),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(icon(Icon::MessageCircle).color(MUTED));
+                ui.label(icon(Icon::MessageCircle).color(palette().muted));
                 ui.label(
                     RichText::new(self.language.text("AI 对话", "AI chat"))
                         .size(14.0)
                         .strong()
-                        .color(TEXT),
+                        .color(palette().text),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_button(ui, Icon::X)
@@ -898,7 +901,7 @@ impl DesktopReader {
         ui.painter().hline(
             header.response.rect.left()..=header.response.rect.right(),
             header.response.rect.bottom(),
-            egui::Stroke::new(1.0, BORDER),
+            egui::Stroke::new(1.0, palette().border),
         );
         ui.add_space(10.0);
     }
@@ -926,14 +929,14 @@ impl DesktopReader {
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
                             ui.add_space(ASSISTANT_EMPTY_TOP_PADDING);
-                            ui.label(icon(Icon::MessageCircle).size(27.0).color(MUTED));
+                            ui.label(icon(Icon::MessageCircle).size(27.0).color(palette().muted));
                             ui.label(
                                 RichText::new(
                                     self.language
                                         .text("围绕当前书籍提问", "Ask about this book"),
                                 )
                                 .strong()
-                                .color(TEXT),
+                                .color(palette().text),
                             );
                             ui.label(
                                 RichText::new(self.language.text(
@@ -941,7 +944,7 @@ impl DesktopReader {
                                     "Summarize sections, explain a selection,\nor find concepts in the book.",
                                 ))
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(palette().muted),
                             );
                         },
                     );
@@ -992,16 +995,12 @@ impl DesktopReader {
     fn assistant_error(&self, ui: &mut egui::Ui) {
         if let Some(error) = &self.chat.error {
             egui::Frame::new()
-                .fill(Color32::from_rgb(252, 239, 238))
-                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(226, 180, 176)))
+                .fill(palette().error_fill)
+                .stroke(egui::Stroke::new(1.0, palette().error_stroke))
                 .corner_radius(8)
                 .inner_margin(9)
                 .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(error)
-                            .size(12.0)
-                            .color(Color32::from_rgb(151, 54, 50)),
-                    );
+                    ui.label(RichText::new(error).size(12.0).color(palette().error_text));
                 });
         }
     }
@@ -1215,7 +1214,7 @@ impl DesktopReader {
             )
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
-                    .fill(SURFACE)
+                    .fill(palette().surface)
                     .corner_radius(9)
                     .inner_margin(6)
                     .show(ui, |ui| {
@@ -1354,7 +1353,7 @@ impl DesktopReader {
                 .anchor(egui::Align2::RIGHT_TOP, [-18.0, 62.0])
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style())
-                        .fill(Color32::from_rgb(78, 39, 39))
+                        .fill(palette().toast_error_fill)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(error).color(Color32::WHITE));
@@ -1372,7 +1371,7 @@ impl DesktopReader {
                 .anchor(egui::Align2::RIGHT_TOP, [-18.0, 62.0])
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style())
-                        .fill(Color32::from_rgb(78, 39, 39))
+                        .fill(palette().toast_error_fill)
                         .show(ui, |ui| {
                             ui.label(RichText::new(error).color(Color32::WHITE));
                         });
@@ -1385,7 +1384,11 @@ fn paint_toc_label(ui: &egui::Ui, rect: Rect, label: &str, selected: bool) -> bo
     if rect.width() <= 0.0 {
         return false;
     }
-    let color = if selected { ACCENT } else { TEXT };
+    let color = if selected {
+        palette().accent
+    } else {
+        palette().text
+    };
     let font_id = egui::TextStyle::Body.resolve(ui.style());
     let painter = ui.painter();
     let (display_label, elided) = elide_text_to_width(label, rect.width(), |text| {
@@ -1472,7 +1475,11 @@ fn toc_toggle_button(
             Icon::ChevronRight.unicode()
         },
         egui::FontId::new(15.0, egui::FontFamily::Name("lucide".into())),
-        if selected { ACCENT } else { TEXT },
+        if selected {
+            palette().accent
+        } else {
+            palette().text
+        },
     );
     response.clicked()
 }
@@ -1550,9 +1557,9 @@ fn chat_reference_chips(
             let label = format!("{kind} · {}  ×", reference.label);
             if ui
                 .add(
-                    egui::Button::new(RichText::new(label).size(10.5).color(ACCENT))
-                        .fill(ACCENT_SOFT)
-                        .stroke(egui::Stroke::new(1.0, BORDER))
+                    egui::Button::new(RichText::new(label).size(10.5).color(palette().accent))
+                        .fill(palette().accent_soft)
+                        .stroke(egui::Stroke::new(1.0, palette().border))
                         .corner_radius(10),
                 )
                 .on_hover_text(&reference.description)
@@ -1600,8 +1607,8 @@ fn assistant_suggestion_popup(
         .fixed_pos(Pos2::new(anchor.left(), anchor.top() - 7.0))
         .show(&context, |ui| {
             egui::Frame::new()
-                .fill(SURFACE)
-                .stroke(egui::Stroke::new(1.0, BORDER))
+                .fill(palette().surface)
+                .stroke(egui::Stroke::new(1.0, palette().border))
                 .corner_radius(8)
                 .inner_margin(4)
                 .show(ui, |ui| {
@@ -1685,16 +1692,16 @@ fn page_texture_destination(page_rect: Rect, texture_size: Vec2) -> Rect {
 
 fn compact_input_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(SURFACE)
-        .stroke(egui::Stroke::new(1.0, BORDER))
+        .fill(palette().surface)
+        .stroke(egui::Stroke::new(1.0, palette().border))
         .corner_radius(9)
         .inner_margin(egui::Margin::symmetric(8, 4))
 }
 
 fn selection_popover_frame(inner_margin: i8) -> egui::Frame {
     egui::Frame::new()
-        .fill(SURFACE)
-        .stroke(egui::Stroke::new(1.0, BORDER))
+        .fill(palette().surface)
+        .stroke(egui::Stroke::new(1.0, palette().border))
         .corner_radius(10)
         .inner_margin(inner_margin)
         .shadow(egui::Shadow {
@@ -1720,12 +1727,16 @@ fn annotation_editor(
     let mut action = AnnotationEditorAction::None;
     ui.set_width(312.0);
     ui.horizontal(|ui| {
-        ui.label(icon(Icon::MessageSquarePlus).size(16.0).color(ACCENT));
+        ui.label(
+            icon(Icon::MessageSquarePlus)
+                .size(16.0)
+                .color(palette().accent),
+        );
         ui.label(
             RichText::new(language.text("添加批注", "Add annotation"))
                 .size(13.0)
                 .strong()
-                .color(TEXT),
+                .color(palette().text),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if icon_button(ui, Icon::X)
@@ -1765,12 +1776,16 @@ fn annotation_text_editor(
     let input_id = ui.make_persistent_id("selection-annotation-input");
     let input_focused = ui.memory(|memory| memory.has_focus(input_id));
     let input = egui::Frame::new()
-        .fill(if input_focused { ACCENT } else { BORDER })
+        .fill(if input_focused {
+            palette().accent
+        } else {
+            palette().border
+        })
         .corner_radius(7)
         .inner_margin(1)
         .show(ui, |ui| {
             egui::Frame::new()
-                .fill(SURFACE)
+                .fill(palette().surface)
                 .corner_radius(6)
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
@@ -1780,7 +1795,7 @@ fn annotation_text_editor(
                             .id(input_id)
                             .frame(egui::Frame::NONE)
                             .margin(0)
-                            .text_color(TEXT)
+                            .text_color(palette().text)
                             .hint_text(language.text("写下你的想法…", "Write a note…")),
                     )
                 })
@@ -1799,17 +1814,23 @@ fn annotation_action_button(
     primary: bool,
     enabled: bool,
 ) -> egui::Response {
-    let text = RichText::new(label)
-        .size(12.0)
-        .color(if primary { Color32::WHITE } else { TEXT });
+    let text = RichText::new(label).size(12.0).color(if primary {
+        Color32::WHITE
+    } else {
+        palette().text
+    });
     ui.add_enabled(
         enabled,
         egui::Button::new(text)
-            .fill(if primary { ACCENT } else { SURFACE })
+            .fill(if primary {
+                palette().accent
+            } else {
+                palette().surface
+            })
             .stroke(if primary {
                 egui::Stroke::NONE
             } else {
-                egui::Stroke::new(1.0, BORDER)
+                egui::Stroke::new(1.0, palette().border)
             })
             .corner_radius(6)
             .min_size(Vec2::new(68.0, 30.0)),
@@ -1829,13 +1850,17 @@ fn chat_message_card(
     let width = ui.available_width();
     let mut clicked_citation = None;
     egui::Frame::new()
-        .fill(if is_user { ACCENT_SOFT } else { SURFACE })
+        .fill(if is_user {
+            palette().accent_soft
+        } else {
+            palette().surface
+        })
         .stroke(egui::Stroke::new(
             1.0,
             if is_user {
-                Color32::from_rgb(177, 209, 190)
+                palette().accent_border
             } else {
-                BORDER
+                palette().border
             },
         ))
         .corner_radius(8)
@@ -1850,12 +1875,16 @@ fn chat_message_card(
                 })
                 .size(10.5)
                 .strong()
-                .color(if is_user { ACCENT } else { MUTED }),
+                .color(if is_user {
+                    palette().accent
+                } else {
+                    palette().muted
+                }),
             );
             ui.add_space(3.0);
             if is_user {
                 ui.add(
-                    egui::Label::new(RichText::new(content).size(12.5).color(TEXT))
+                    egui::Label::new(RichText::new(content).size(12.5).color(palette().text))
                         .wrap()
                         .selectable(true),
                 );

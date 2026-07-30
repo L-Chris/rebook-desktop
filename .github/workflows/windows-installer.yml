@@ -2,6 +2,8 @@ name: Build Windows installer
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "*"
 
@@ -44,6 +46,7 @@ jobs:
           version: "v0.16.0"
 
       - name: Validate tag and package version
+        if: startsWith(github.ref, 'refs/tags/')
         id: version
         shell: pwsh
         run: |
@@ -77,7 +80,12 @@ jobs:
         if: steps.cargo-wix-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-wix --version $env:CARGO_WIX_VERSION --locked
 
+      - name: Warm release build cache
+        if: github.ref == 'refs/heads/main'
+        run: cargo build --locked --release --package rebook-desktop
+
       - name: Build MSI installer
+        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -87,6 +95,7 @@ jobs:
             --output "dist\Torto-$env:TORTO_VERSION-x86_64.msi"
 
       - name: Upload workflow artifact
+        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v7
         with:
           name: Torto-${{ steps.version.outputs.version }}-windows-x86_64
@@ -94,6 +103,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*.msi

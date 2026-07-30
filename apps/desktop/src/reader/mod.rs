@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use peniko::{Blob, Color};
 use rebook_formats::{BookFormat, open_file as open_publication_file};
 use rebook_layout::{LayoutViewport, ReaderStyle};
-use rebook_publication::{BookSource, SourceRange};
+use rebook_publication::{BookSource, Rgba, SourceRange};
 use rebook_reader::{PageDirection, ReaderSelection, ReaderSession, ReaderSnapshot, ReaderTextHit};
 
 use crate::async_task::{TaskResult, TaskSlot};
@@ -16,7 +16,7 @@ use crate::plugins::{
     BlockTranslation, BookSearchResult, ChatResponse, ChatTurn, PluginSettings, RewriteBookSource,
     TranslationBlockInput, TranslationBookSource, TranslationMode,
 };
-use crate::preferences::{self, AppLanguage, ReaderPreferences};
+use crate::preferences::{self, AppLanguage, AppTheme, ReaderPreferences};
 use crate::sync::{SyncSettings, SyncStore};
 
 const INITIAL_WIDTH: u32 = 1200;
@@ -42,6 +42,36 @@ mod ui_controller;
 use chat_autocomplete::ChatReference;
 pub(crate) use egui_view::{ReaderFramePlan, ReaderPageTexture};
 use render::{PageSceneKey, PageSceneLayers};
+
+// Reader page colors follow the app theme; the light pair matches
+// ReaderStyle::default so existing books keep their warm paper look.
+fn apply_theme_colors(style: &mut ReaderStyle, theme: AppTheme) {
+    match theme {
+        AppTheme::Light => {
+            style.foreground = Rgba::BLACK;
+            style.background = Rgba {
+                red: 250,
+                green: 248,
+                blue: 243,
+                alpha: 255,
+            };
+        }
+        AppTheme::Dark => {
+            style.foreground = Rgba {
+                red: 210,
+                green: 207,
+                blue: 200,
+                alpha: 255,
+            };
+            style.background = Rgba {
+                red: 24,
+                green: 23,
+                blue: 21,
+                alpha: 255,
+            };
+        }
+    }
+}
 
 pub(super) fn open_reader(
     path: &Path,
@@ -92,6 +122,7 @@ pub(super) fn open_reader(
     if format == BookFormat::Pdf {
         style.column_gap = 0.0;
     }
+    apply_theme_colors(&mut style, reader_preferences.theme);
     let sync_settings = SyncSettings::load_default().unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to load WebDAV settings; using defaults");
         SyncSettings::new_device()

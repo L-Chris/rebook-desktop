@@ -6,6 +6,7 @@ use vello::Scene;
 
 use crate::library::LocalLibrary;
 use crate::platform::UserEvent;
+use crate::preferences::AppTheme;
 use crate::reader::{
     ChatStreamMessage, ChatTaskMessage, SearchTaskMessage, TocTranslationTaskMessage,
     TranslationTaskMessage,
@@ -42,7 +43,7 @@ impl DesktopApp {
         ui: &mut egui::Ui,
         page_texture: Option<ReaderPageTexture>,
     ) -> Option<ReaderFramePlan> {
-        self.reconcile_state();
+        self.reconcile_state(ui.ctx());
         let interaction_blocked = self.settings.is_open();
         let plan = if let Some(reader) = self.reader.as_mut() {
             Some(reader.ui(ui, page_texture, interaction_blocked))
@@ -59,7 +60,7 @@ impl DesktopApp {
             self.settings.open();
         }
         settings_overlay(ui.ctx(), &mut self.settings);
-        self.apply_settings_if_changed();
+        self.apply_settings_if_changed(ui.ctx());
         plan
     }
 
@@ -133,7 +134,7 @@ impl DesktopApp {
         }
     }
 
-    fn reconcile_state(&mut self) {
+    fn reconcile_state(&mut self, ctx: &egui::Context) {
         if self
             .reader
             .as_ref()
@@ -143,7 +144,7 @@ impl DesktopApp {
             self.shelf.resume();
         }
         self.promote_opened_reader();
-        self.apply_settings_if_changed();
+        self.apply_settings_if_changed(ctx);
     }
 
     fn promote_opened_reader(&mut self) {
@@ -152,16 +153,25 @@ impl DesktopApp {
         }
     }
 
-    fn apply_settings_if_changed(&mut self) {
+    fn apply_settings_if_changed(&mut self, ctx: &egui::Context) {
         let revision = self.settings.revision();
         if revision == self.applied_settings_revision {
             return;
         }
         let applied = self.settings.applied().clone();
+        if applied.theme != crate::ui::theme() {
+            crate::ui::set_theme(applied.theme);
+            crate::ui::apply_visuals(ctx, &crate::ui::palette());
+            ctx.request_repaint();
+        }
         self.shelf.apply_global_settings(&applied);
         if let Some(reader) = self.reader.as_mut() {
             reader.apply_global_settings(&applied);
         }
         self.applied_settings_revision = revision;
+    }
+
+    pub(crate) fn theme(&self) -> AppTheme {
+        self.settings.applied().theme
     }
 }

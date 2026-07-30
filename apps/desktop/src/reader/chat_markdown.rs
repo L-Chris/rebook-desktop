@@ -5,13 +5,13 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
-use egui::{Color32, FontFamily, FontId, ImageSource, RichText, Sense, TextStyle, Vec2};
+use egui::{FontFamily, FontId, ImageSource, RichText, Sense, TextStyle, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use lucide_icons::Icon;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use crate::preferences::AppLanguage;
-use crate::ui::{ACCENT_SOFT, BORDER, MUTED, SURFACE, SURFACE_MUTED, TEXT, icon_button};
+use crate::ui::{icon_button, palette};
 
 const MARKDOWN_FONT_SIZE: f32 = 12.5;
 const MARKDOWN_HEADING_FONT_SIZE: f32 = 16.0;
@@ -135,14 +135,19 @@ impl ChatMarkdownState {
         let mut state = self.preview_states.remove(&preview_id).unwrap_or_default();
 
         egui::Frame::new()
-            .fill(SURFACE_MUTED)
-            .stroke(egui::Stroke::new(1.0, BORDER))
+            .fill(palette().surface_muted)
+            .stroke(egui::Stroke::new(1.0, palette().border))
             .corner_radius(7)
             .inner_margin(egui::Margin::symmetric(8, 7))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(kind.label()).size(11.0).strong().color(MUTED));
+                    ui.label(
+                        RichText::new(kind.label())
+                            .size(11.0)
+                            .strong()
+                            .color(palette().muted),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         preview_mode_control(ui, &mut state.mode, language);
                         if state.mode == PreviewMode::Preview {
@@ -360,7 +365,7 @@ fn show_commonmark_fragment(
             TextStyle::Monospace,
             FontId::new(12.0, FontFamily::Monospace),
         );
-        egui_commonmark_backend::misc::set_strong_background_color(ui, ACCENT_SOFT);
+        egui_commonmark_backend::misc::set_strong_background_color(ui, palette().accent_soft);
         CommonMarkViewer::new()
             .indentation_spaces(2)
             .render_math_fn(Some(&math_renderer))
@@ -383,7 +388,7 @@ fn show_markdown_heading(ui: &mut egui::Ui, level: usize, source: &str, add_top_
             RichText::new(markdown_plain_text(source))
                 .size(size)
                 .strong()
-                .color(TEXT),
+                .color(palette().text),
         )
         .wrap()
         .selectable(true),
@@ -414,21 +419,23 @@ fn show_markdown_table(ui: &mut egui::Ui, table: &MarkdownTable) {
                         .get(column_index)
                         .map_or_else(String::new, |cell| markdown_plain_text(cell));
                     let fill = if row_index == 0 {
-                        SURFACE_MUTED
+                        palette().surface_muted
                     } else if row_index % 2 == 0 {
-                        Color32::from_rgb(249, 249, 247)
+                        palette().card_fill
                     } else {
-                        SURFACE
+                        palette().surface
                     };
                     egui::Frame::new()
                         .fill(fill)
-                        .stroke(egui::Stroke::new(1.0, BORDER))
+                        .stroke(egui::Stroke::new(1.0, palette().border))
                         .inner_margin(egui::Margin::symmetric(6, 5))
                         .show(ui, |ui| {
                             let content_width = (cell_width - 14.0).max(28.0);
                             ui.set_min_width(content_width);
                             ui.set_max_width(content_width);
-                            let mut text = RichText::new(text).size(MARKDOWN_FONT_SIZE).color(TEXT);
+                            let mut text = RichText::new(text)
+                                .size(MARKDOWN_FONT_SIZE)
+                                .color(palette().text);
                             if row_index == 0 {
                                 text = text.strong();
                             }
@@ -610,11 +617,19 @@ fn paint_asset(
         Some(AssetStatus::Pending { .. }) | None => {
             ui.ctx().request_repaint_after(ASSET_REPAINT_INTERVAL);
             if inline {
-                ui.label(RichText::new("…").size(MARKDOWN_FONT_SIZE).color(MUTED));
+                ui.label(
+                    RichText::new("…")
+                        .size(MARKDOWN_FONT_SIZE)
+                        .color(palette().muted),
+                );
             } else {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new("Rendering…").size(11.5).color(MUTED));
+                    ui.label(
+                        RichText::new("Rendering…")
+                            .size(11.5)
+                            .color(palette().muted),
+                    );
                 });
             }
         }
@@ -687,32 +702,33 @@ fn paint_svg(ui: &mut egui::Ui, bytes: &[u8], namespace: &str, inline: bool) {
 
 fn preview_error(ui: &mut egui::Ui, error: &str) {
     egui::Frame::new()
-        .fill(Color32::from_rgb(252, 239, 238))
+        .fill(palette().error_fill)
         .corner_radius(5)
         .inner_margin(6)
         .show(ui, |ui| {
             ui.add(
-                egui::Label::new(
-                    RichText::new(error)
-                        .size(11.5)
-                        .color(Color32::from_rgb(151, 54, 50)),
-                )
-                .wrap()
-                .selectable(true),
+                egui::Label::new(RichText::new(error).size(11.5).color(palette().error_text))
+                    .wrap()
+                    .selectable(true),
             );
         });
 }
 
 fn show_source_code(ui: &mut egui::Ui, source: &str) {
     egui::Frame::new()
-        .fill(SURFACE)
+        .fill(palette().surface)
         .corner_radius(5)
         .inner_margin(7)
         .show(ui, |ui| {
             ui.add(
-                egui::Label::new(RichText::new(source).monospace().size(11.5).color(TEXT))
-                    .wrap()
-                    .selectable(true),
+                egui::Label::new(
+                    RichText::new(source)
+                        .monospace()
+                        .size(11.5)
+                        .color(palette().text),
+                )
+                .wrap()
+                .selectable(true),
             );
         });
 }
@@ -736,17 +752,17 @@ fn preview_mode_control(ui: &mut egui::Ui, mode: &mut PreviewMode, language: App
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        painter.rect_filled(rect, 16.0, Color32::from_rgb(231, 235, 242));
+        painter.rect_filled(rect, 16.0, palette().pill_fill);
         let selected_rect = match mode {
             PreviewMode::Preview => preview_rect,
             PreviewMode::Code => code_rect,
         }
         .shrink(2.0);
-        painter.rect_filled(selected_rect, 14.0, SURFACE);
+        painter.rect_filled(selected_rect, 14.0, palette().surface);
         painter.rect_stroke(
             selected_rect,
             14.0,
-            egui::Stroke::new(1.0, Color32::from_rgb(220, 223, 228)),
+            egui::Stroke::new(1.0, palette().pill_stroke),
             egui::StrokeKind::Inside,
         );
 
@@ -767,7 +783,11 @@ fn preview_mode_control(ui: &mut egui::Ui, mode: &mut PreviewMode, language: App
                 egui::Align2::CENTER_CENTER,
                 label,
                 FontId::new(if selected { 11.5 } else { 11.0 }, FontFamily::Proportional),
-                if selected { TEXT } else { MUTED },
+                if selected {
+                    palette().text
+                } else {
+                    palette().muted
+                },
             );
         }
     }

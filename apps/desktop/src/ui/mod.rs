@@ -1,19 +1,128 @@
 mod svg_loader;
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use egui::{
     Align2, Color32, ColorImage, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
     Response, Sense, Stroke, TextStyle, Ui, Vec2, WidgetInfo, WidgetType,
 };
 use lucide_icons::Icon;
 
-pub(crate) const BACKGROUND: Color32 = Color32::from_rgb(246, 244, 239);
-pub(crate) const SURFACE: Color32 = Color32::from_rgb(255, 255, 255);
-pub(crate) const SURFACE_MUTED: Color32 = Color32::from_rgb(240, 238, 233);
-pub(crate) const TEXT: Color32 = Color32::from_rgb(38, 38, 36);
-pub(crate) const MUTED: Color32 = Color32::from_rgb(118, 116, 109);
-pub(crate) const BORDER: Color32 = Color32::from_rgb(218, 215, 207);
-pub(crate) const ACCENT: Color32 = Color32::from_rgb(68, 137, 103);
-pub(crate) const ACCENT_SOFT: Color32 = Color32::from_rgb(222, 237, 228);
+use crate::preferences::AppTheme;
+
+/// Theme-dependent color set. Chrome reads colors through `palette()` so a
+/// saved theme switch recolors the whole app without threading state through
+/// every view.
+#[derive(Clone, Copy)]
+pub(crate) struct Palette {
+    pub(crate) dark: bool,
+    pub(crate) background: Color32,
+    pub(crate) surface: Color32,
+    pub(crate) surface_muted: Color32,
+    pub(crate) text: Color32,
+    pub(crate) muted: Color32,
+    pub(crate) border: Color32,
+    pub(crate) accent: Color32,
+    pub(crate) accent_soft: Color32,
+    pub(crate) hovered_fill: Color32,
+    pub(crate) hovered_weak_fill: Color32,
+    pub(crate) hovered_stroke: Color32,
+    pub(crate) active_fill: Color32,
+    pub(crate) active_weak_fill: Color32,
+    pub(crate) open_fill: Color32,
+    pub(crate) selection_fill: Color32,
+    pub(crate) error: Color32,
+    pub(crate) error_fill: Color32,
+    pub(crate) error_stroke: Color32,
+    pub(crate) error_text: Color32,
+    pub(crate) toast_error_fill: Color32,
+    pub(crate) card_fill: Color32,
+    pub(crate) accent_border: Color32,
+    pub(crate) pill_fill: Color32,
+    pub(crate) pill_stroke: Color32,
+}
+
+impl Palette {
+    fn light() -> Self {
+        Self {
+            dark: false,
+            background: Color32::from_rgb(246, 244, 239),
+            surface: Color32::from_rgb(255, 255, 255),
+            surface_muted: Color32::from_rgb(240, 238, 233),
+            text: Color32::from_rgb(38, 38, 36),
+            muted: Color32::from_rgb(118, 116, 109),
+            border: Color32::from_rgb(218, 215, 207),
+            accent: Color32::from_rgb(68, 137, 103),
+            accent_soft: Color32::from_rgb(222, 237, 228),
+            hovered_fill: Color32::from_rgb(231, 235, 228),
+            hovered_weak_fill: Color32::from_rgb(237, 240, 235),
+            hovered_stroke: Color32::from_rgb(171, 184, 174),
+            active_fill: Color32::from_rgb(219, 229, 221),
+            active_weak_fill: Color32::from_rgb(228, 237, 230),
+            open_fill: Color32::from_rgb(237, 240, 235),
+            selection_fill: Color32::from_rgba_unmultiplied(68, 137, 103, 64),
+            error: Color32::from_rgb(180, 55, 55),
+            error_fill: Color32::from_rgb(252, 239, 238),
+            error_stroke: Color32::from_rgb(226, 180, 176),
+            error_text: Color32::from_rgb(151, 54, 50),
+            toast_error_fill: Color32::from_rgb(78, 39, 39),
+            card_fill: Color32::from_rgb(251, 250, 247),
+            accent_border: Color32::from_rgb(177, 209, 190),
+            pill_fill: Color32::from_rgb(231, 235, 242),
+            pill_stroke: Color32::from_rgb(220, 223, 228),
+        }
+    }
+
+    fn dark() -> Self {
+        Self {
+            dark: true,
+            background: Color32::from_rgb(32, 31, 28),
+            surface: Color32::from_rgb(42, 41, 37),
+            surface_muted: Color32::from_rgb(52, 50, 45),
+            text: Color32::from_rgb(232, 230, 225),
+            muted: Color32::from_rgb(150, 147, 138),
+            border: Color32::from_rgb(64, 62, 56),
+            accent: Color32::from_rgb(88, 148, 114),
+            accent_soft: Color32::from_rgb(44, 62, 52),
+            hovered_fill: Color32::from_rgb(52, 57, 51),
+            hovered_weak_fill: Color32::from_rgb(46, 49, 44),
+            hovered_stroke: Color32::from_rgb(90, 102, 92),
+            active_fill: Color32::from_rgb(48, 58, 51),
+            active_weak_fill: Color32::from_rgb(44, 54, 48),
+            open_fill: Color32::from_rgb(46, 49, 44),
+            selection_fill: Color32::from_rgba_unmultiplied(88, 148, 114, 72),
+            error: Color32::from_rgb(219, 120, 111),
+            error_fill: Color32::from_rgb(64, 40, 38),
+            error_stroke: Color32::from_rgb(110, 64, 60),
+            error_text: Color32::from_rgb(224, 138, 130),
+            toast_error_fill: Color32::from_rgb(96, 46, 44),
+            card_fill: Color32::from_rgb(47, 46, 42),
+            accent_border: Color32::from_rgb(62, 94, 78),
+            pill_fill: Color32::from_rgb(54, 53, 48),
+            pill_stroke: Color32::from_rgb(72, 70, 64),
+        }
+    }
+}
+
+static CURRENT_THEME: AtomicU8 = AtomicU8::new(0);
+
+pub(crate) fn set_theme(theme: AppTheme) {
+    CURRENT_THEME.store(theme as u8, Ordering::Relaxed);
+}
+
+pub(crate) fn theme() -> AppTheme {
+    match CURRENT_THEME.load(Ordering::Relaxed) {
+        1 => AppTheme::Dark,
+        _ => AppTheme::Light,
+    }
+}
+
+pub(crate) fn palette() -> Palette {
+    match theme() {
+        AppTheme::Light => Palette::light(),
+        AppTheme::Dark => Palette::dark(),
+    }
+}
 
 pub(crate) fn configure(ctx: &egui::Context) {
     egui_extras::install_image_loaders(ctx);
@@ -50,33 +159,7 @@ pub(crate) fn configure(ctx: &egui::Context) {
     }
     ctx.set_fonts(fonts);
 
-    let mut visuals = egui::Visuals::light();
-    visuals.panel_fill = BACKGROUND;
-    visuals.window_fill = SURFACE;
-    visuals.window_stroke = Stroke::new(1.0, BORDER);
-    visuals.window_corner_radius = CornerRadius::same(10);
-    visuals.text_edit_bg_color = Some(SURFACE);
-    visuals.widgets.inactive.bg_fill = SURFACE_MUTED;
-    visuals.widgets.inactive.weak_bg_fill = SURFACE_MUTED;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-    visuals.widgets.inactive.corner_radius = CornerRadius::same(6);
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(231, 235, 228);
-    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(237, 240, 235);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(171, 184, 174));
-    visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(219, 229, 221);
-    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(228, 237, 230);
-    visuals.widgets.active.bg_stroke = Stroke::new(1.5, ACCENT);
-    visuals.widgets.active.corner_radius = CornerRadius::same(6);
-    visuals.widgets.open.bg_fill = Color32::from_rgb(237, 240, 235);
-    visuals.widgets.open.weak_bg_fill = Color32::from_rgb(237, 240, 235);
-    visuals.widgets.open.bg_stroke = Stroke::new(1.5, ACCENT);
-    visuals.widgets.open.corner_radius = CornerRadius::same(6);
-    visuals.text_cursor.stroke = Stroke::new(1.5, ACCENT);
-    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(68, 137, 103, 64);
-    visuals.selection.stroke = Stroke::new(1.0, TEXT);
-    ctx.set_visuals(visuals);
+    apply_visuals(ctx, &Palette::light());
     ctx.all_styles_mut(|style| {
         // Application chrome should not behave like selectable document text.
         // Reader text selection is handled by the Vello-backed reader itself.
@@ -103,6 +186,42 @@ pub(crate) fn configure(ctx: &egui::Context) {
         scroll.active_handle_opacity = 0.72;
         scroll.interact_handle_opacity = 0.95;
     });
+}
+
+// Rebuild egui visuals from a palette. Startup applies the light palette;
+// a saved theme change re-applies the matching palette and repaints.
+pub(crate) fn apply_visuals(ctx: &egui::Context, palette: &Palette) {
+    let mut visuals = if palette.dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    visuals.panel_fill = palette.background;
+    visuals.window_fill = palette.surface;
+    visuals.window_stroke = Stroke::new(1.0, palette.border);
+    visuals.window_corner_radius = CornerRadius::same(10);
+    visuals.text_edit_bg_color = Some(palette.surface);
+    visuals.widgets.inactive.bg_fill = palette.surface_muted;
+    visuals.widgets.inactive.weak_bg_fill = palette.surface_muted;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, palette.border);
+    visuals.widgets.inactive.corner_radius = CornerRadius::same(6);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, palette.text);
+    visuals.widgets.hovered.bg_fill = palette.hovered_fill;
+    visuals.widgets.hovered.weak_bg_fill = palette.hovered_weak_fill;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, palette.hovered_stroke);
+    visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
+    visuals.widgets.active.bg_fill = palette.active_fill;
+    visuals.widgets.active.weak_bg_fill = palette.active_weak_fill;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.5, palette.accent);
+    visuals.widgets.active.corner_radius = CornerRadius::same(6);
+    visuals.widgets.open.bg_fill = palette.open_fill;
+    visuals.widgets.open.weak_bg_fill = palette.open_fill;
+    visuals.widgets.open.bg_stroke = Stroke::new(1.5, palette.accent);
+    visuals.widgets.open.corner_radius = CornerRadius::same(6);
+    visuals.text_cursor.stroke = Stroke::new(1.5, palette.accent);
+    visuals.selection.bg_fill = palette.selection_fill;
+    visuals.selection.stroke = Stroke::new(1.0, palette.text);
+    ctx.set_visuals(visuals);
 }
 
 pub(crate) fn icon(icon: Icon) -> egui::RichText {
@@ -135,8 +254,9 @@ pub(crate) fn toggle_icon_button(
     off_label: &str,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(52.0, 32.0), Sense::click());
+    let palette = palette();
     let fill = if selected {
-        ACCENT_SOFT
+        palette.accent_soft
     } else if response.is_pointer_button_down_on() {
         ui.visuals().widgets.active.weak_bg_fill
     } else if response.hovered() {
@@ -144,7 +264,11 @@ pub(crate) fn toggle_icon_button(
     } else {
         Color32::TRANSPARENT
     };
-    let foreground = if selected { ACCENT } else { MUTED };
+    let foreground = if selected {
+        palette.accent
+    } else {
+        palette.muted
+    };
     let state_label = if selected { on_label } else { off_label };
 
     if ui.is_rect_visible(rect) {
@@ -185,8 +309,9 @@ pub(crate) fn toggle_icon_button(
 
 fn painted_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+    let palette = palette();
     let fill = if selected {
-        ACCENT_SOFT
+        palette.accent_soft
     } else if response.is_pointer_button_down_on() {
         ui.visuals().widgets.active.weak_bg_fill
     } else if response.hovered() {
@@ -194,7 +319,11 @@ fn painted_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -> Response {
     } else {
         Color32::TRANSPARENT
     };
-    let foreground = if selected { ACCENT } else { TEXT };
+    let foreground = if selected {
+        palette.accent
+    } else {
+        palette.text
+    };
     let label = glyph.unicode().to_string();
 
     if ui.is_rect_visible(rect) {
@@ -217,8 +346,9 @@ fn painted_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -> Response {
 pub(crate) fn navigation_button(ui: &mut Ui, glyph: Icon, label: &str, selected: bool) -> Response {
     let desired_size = Vec2::new(ui.available_width(), 36.0);
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
+    let palette = palette();
     let fill = if selected {
-        ACCENT_SOFT
+        palette.accent_soft
     } else if response.is_pointer_button_down_on() {
         ui.visuals().widgets.active.bg_fill
     } else if response.hovered() {
@@ -226,7 +356,11 @@ pub(crate) fn navigation_button(ui: &mut Ui, glyph: Icon, label: &str, selected:
     } else {
         Color32::TRANSPARENT
     };
-    let foreground = if selected { ACCENT } else { TEXT };
+    let foreground = if selected {
+        palette.accent
+    } else {
+        palette.text
+    };
 
     if ui.is_rect_visible(rect) {
         ui.painter().rect_filled(rect, 6.0, fill);
@@ -253,8 +387,9 @@ pub(crate) fn navigation_button(ui: &mut Ui, glyph: Icon, label: &str, selected:
 pub(crate) fn navigation_text_button(ui: &mut Ui, label: &str, selected: bool) -> Response {
     let desired_size = Vec2::new(ui.available_width(), 36.0);
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
+    let palette = palette();
     let fill = if selected {
-        ACCENT_SOFT
+        palette.accent_soft
     } else if response.is_pointer_button_down_on() {
         ui.visuals().widgets.active.bg_fill
     } else if response.hovered() {
@@ -262,7 +397,11 @@ pub(crate) fn navigation_text_button(ui: &mut Ui, label: &str, selected: bool) -
     } else {
         Color32::TRANSPARENT
     };
-    let foreground = if selected { ACCENT } else { TEXT };
+    let foreground = if selected {
+        palette.accent
+    } else {
+        palette.text
+    };
 
     if ui.is_rect_visible(rect) {
         ui.painter().rect_filled(rect, 6.0, fill);

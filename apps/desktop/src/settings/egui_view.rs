@@ -8,12 +8,9 @@ use crate::plugins::{
     CHAT_TOOL_STEPS_MIN, PluginSettings, TARGET_LANGUAGE_ENGLISH, TARGET_LANGUAGE_INTERFACE,
     TARGET_LANGUAGE_SIMPLIFIED_CHINESE, TranslationMode,
 };
-use crate::preferences::AppLanguage;
+use crate::preferences::{AppLanguage, AppTheme};
 use crate::sync::{CloudProviderKind, SYNC_INTERVAL_OPTIONS};
-use crate::ui::{
-    ACCENT, ACCENT_SOFT, BACKGROUND, BORDER, MUTED, SURFACE, SURFACE_MUTED, TEXT, icon_button,
-    navigation_button,
-};
+use crate::ui::{icon_button, navigation_button, palette};
 
 const SETTINGS_SELECT_WIDTH: f32 = 156.0;
 const SETTINGS_MODEL_SELECT_WIDTH: f32 = 280.0;
@@ -54,7 +51,7 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
         .backdrop_color(Color32::BLACK.gamma_multiply(0.46 * visible))
         .frame(
             egui::Frame::new()
-                .fill(SURFACE)
+                .fill(palette().surface)
                 .stroke(egui::Stroke::NONE)
                 .corner_radius(12)
                 .inner_margin(0),
@@ -70,7 +67,7 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
             let content_width = (modal_size.x - sidebar_width).max(1.0);
             ui.horizontal(|ui| {
                 egui::Frame::new()
-                    .fill(BACKGROUND)
+                    .fill(palette().background)
                     .corner_radius(egui::CornerRadius {
                         nw: 12,
                         ne: 0,
@@ -87,7 +84,7 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
                         });
                     });
                 egui::Frame::new()
-                    .fill(SURFACE)
+                    .fill(palette().surface)
                     .corner_radius(egui::CornerRadius {
                         nw: 0,
                         ne: 12,
@@ -108,7 +105,7 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
     ctx.layer_painter(response.response.layer_id).rect_stroke(
         response.response.rect,
         12,
-        egui::Stroke::new(1.0, BORDER),
+        egui::Stroke::new(1.0, palette().border),
         egui::StrokeKind::Inside,
     );
     if response.should_close() {
@@ -120,7 +117,7 @@ fn settings_sidebar(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     ui.heading(
         RichText::new(state.draft_language.text("设置", "Settings"))
             .size(19.0)
-            .color(TEXT),
+            .color(palette().text),
     );
     ui.add_space(18.0);
     for (tab, glyph, zh, en) in [
@@ -166,7 +163,7 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 SettingsTab::Translation => state.draft_language.text("翻译", "Translation"),
                 SettingsTab::Cloud => state.draft_language.text("云盘同步", "Cloud sync"),
             };
-            ui.heading(RichText::new(title).size(18.0).color(TEXT));
+            ui.heading(RichText::new(title).size(18.0).color(palette().text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, Icon::X)
                     .on_hover_text(state.draft_language.text("关闭", "Close"))
@@ -198,7 +195,7 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             });
             if let Some(error) = &state.error {
                 ui.add_space(8.0);
-                ui.colored_label(Color32::from_rgb(180, 55, 55), error);
+                ui.colored_label(palette().error, error);
             }
             ui.add_space(12.0);
         });
@@ -214,7 +211,7 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                         RichText::new(state.draft_language.text("保存", "Save"))
                             .color(Color32::WHITE),
                     )
-                    .fill(ACCENT)
+                    .fill(palette().accent)
                     .stroke(egui::Stroke::NONE)
                     .corner_radius(6),
                 )
@@ -266,6 +263,23 @@ fn reading_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     .clicked()
                     {
                         state.draft_spread = SpreadMode::Double;
+                    }
+                });
+                ui.end_row();
+
+                settings_row_label(ui, state.draft_language.text("主题", "Theme"));
+                settings_row_control_sized(ui, 250.0, |ui| {
+                    let light = state.draft_theme == AppTheme::Light;
+                    if choice_button(ui, state.draft_language.text("浅色", "Light"), light, 72.0)
+                        .clicked()
+                    {
+                        state.draft_theme = AppTheme::Light;
+                    }
+                    let dark = state.draft_theme == AppTheme::Dark;
+                    if choice_button(ui, state.draft_language.text("深色", "Dark"), dark, 72.0)
+                        .clicked()
+                    {
+                        state.draft_theme = AppTheme::Dark;
                     }
                 });
                 ui.end_row();
@@ -670,18 +684,22 @@ fn choice_button(ui: &mut egui::Ui, text: &str, selected: bool, width: f32) -> R
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 32.0), egui::Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
     let fill = if selected {
-        ACCENT_SOFT
+        palette().accent_soft
     } else if response.hovered() || response.is_pointer_button_down_on() {
-        SURFACE_MUTED
+        palette().surface_muted
     } else {
-        SURFACE
+        palette().surface
     };
     let stroke = if selected {
-        egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.38))
+        egui::Stroke::new(1.0, palette().accent.gamma_multiply(0.38))
     } else {
-        egui::Stroke::new(1.0, BORDER)
+        egui::Stroke::new(1.0, palette().border)
     };
-    let text_color = if selected { ACCENT } else { TEXT };
+    let text_color = if selected {
+        palette().accent
+    } else {
+        palette().text
+    };
     if ui.is_rect_visible(rect) {
         ui.painter()
             .rect(rect, 6.0, fill, stroke, egui::StrokeKind::Inside);
@@ -762,7 +780,7 @@ fn target_language_label(value: &str, language: AppLanguage) -> String {
 }
 
 fn field_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).size(12.0).color(MUTED));
+    ui.label(RichText::new(text).size(12.0).color(palette().muted));
 }
 
 fn settings_row_label(ui: &mut egui::Ui, text: &str) {
@@ -882,15 +900,17 @@ fn smooth_numeric_slider(
         egui::pos2(thumb_x, track_rect.center().y),
         Vec2::new(4.0, 18.0),
     );
-    ui.painter().rect_filled(track_rect, 3.0, SURFACE_MUTED);
-    ui.painter().rect_filled(filled_rect, 3.0, ACCENT_SOFT);
-    ui.painter().rect_filled(thumb_rect, 2.0, ACCENT);
+    ui.painter()
+        .rect_filled(track_rect, 3.0, palette().surface_muted);
+    ui.painter()
+        .rect_filled(filled_rect, 3.0, palette().accent_soft);
+    ui.painter().rect_filled(thumb_rect, 2.0, palette().accent);
     ui.painter().text(
         egui::pos2(rect.right(), rect.center().y),
         egui::Align2::RIGHT_CENTER,
         format!("{next:.0}{suffix}"),
         egui::TextStyle::Body.resolve(ui.style()),
-        TEXT,
+        palette().text,
     );
     response = response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
     (response, next)
@@ -899,8 +919,8 @@ fn smooth_numeric_slider(
 fn settings_card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     let width = ui.available_width();
     egui::Frame::new()
-        .fill(Color32::from_rgb(251, 250, 247))
-        .stroke(egui::Stroke::new(1.0, BORDER))
+        .fill(palette().card_fill)
+        .stroke(egui::Stroke::new(1.0, palette().border))
         .corner_radius(9)
         .inner_margin(14)
         .show(ui, |ui| {
@@ -927,10 +947,13 @@ fn text_field_sized(ui: &mut egui::Ui, value: &mut String, password: bool, width
 
 fn secondary_button(ui: &mut egui::Ui, text: &str) -> Response {
     ui.add(
-        egui::Button::new(RichText::new(text).color(ACCENT))
+        egui::Button::new(RichText::new(text).color(palette().accent))
             .min_size(Vec2::new(0.0, 32.0))
-            .fill(crate::ui::ACCENT_SOFT)
-            .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.22)))
+            .fill(crate::ui::palette().accent_soft)
+            .stroke(egui::Stroke::new(
+                1.0,
+                palette().accent.gamma_multiply(0.22),
+            ))
             .corner_radius(6),
     )
     .on_hover_cursor(egui::CursorIcon::PointingHand)

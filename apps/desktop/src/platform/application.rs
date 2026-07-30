@@ -34,6 +34,16 @@ pub(crate) fn run(app: DesktopApp) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn clear_color() -> wgpu::Color {
+    let background = crate::ui::palette().background;
+    wgpu::Color {
+        r: f64::from(background.r()) / 255.0,
+        g: f64::from(background.g()) / 255.0,
+        b: f64::from(background.b()) / 255.0,
+        a: 1.0,
+    }
+}
+
 struct WindowState {
     window: Arc<Window>,
     gpu: GpuState,
@@ -58,6 +68,8 @@ impl Application {
     ) -> Self {
         let egui_ctx = egui::Context::default();
         crate::ui::configure(&egui_ctx);
+        crate::ui::set_theme(app.theme());
+        crate::ui::apply_visuals(&egui_ctx, &crate::ui::palette());
         let repaint_proxy = proxy.clone();
         egui_ctx.set_request_repaint_callback(move |request| {
             let _ = repaint_proxy.send_event(UserEvent::RepaintAfter(request.delay));
@@ -123,6 +135,8 @@ impl ApplicationHandler<UserEvent> for Application {
                 return;
             }
         };
+        let mut gpu = gpu;
+        gpu.set_clear_color(clear_color());
         window.request_redraw();
         self.window = Some(WindowState {
             window,
@@ -231,6 +245,9 @@ impl ApplicationHandler<UserEvent> for Application {
                     self.fatal_error = Some(error);
                     event_loop.exit();
                 } else {
+                    // A theme switch lands during render; keep the surface
+                    // clear color in step for the next frame.
+                    state.gpu.set_clear_color(clear_color());
                     self.app.spawn_pending_tasks(&self.runtime, &self.proxy);
                 }
             }

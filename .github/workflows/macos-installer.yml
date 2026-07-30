@@ -1,0 +1,179 @@
+name: Build macOS installers
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-installers-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-macos-installer:
+    name: Build macOS DMG (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+
+    env:
+      CARGO_BUNDLE_VERSION: "0.11.0"
+      CARGO_INCREMENTAL: "0"
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-macos-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-macos-
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: "v0.16.0"
+
+      - name: Add Rust target
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Validate tag and package version
+        if: startsWith(github.ref, 'refs/tags/')
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$({ cargo metadata --no-deps --format-version 1; } | jq -r '.packages[] | select(.name == "rebook-desktop") | .version')"
+
+          if [[ -z "$package_version" || "$package_version" == "null" ]]; then
+            echo "Could not find the rebook-desktop package in Cargo metadata." >&2
+            exit 1
+          fi
+
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "Tag '$GITHUB_REF_NAME' does not match rebook-desktop version '$package_version'. Use tag 'v$package_version'." >&2
+            exit 1
+          fi
+
+          echo "TORTO_VERSION=$package_version" >> "$GITHUB_ENV"
+          echo "version=$package_version" >> "$GITHUB_OUTPUT"
+
+      - name: Run tests
+        run: cargo test --locked --workspace --target "${{ matrix.target }}"
+
+      - name: Restore cargo-bundle
+        id: cargo-bundle-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/cargo-bundle
+          key: cargo-bundle-macos-${{ matrix.arch }}-${{ env.CARGO_BUNDLE_VERSION }}
+
+      - name: Install cargo-bundle
+        if: steps.cargo-bundle-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-bundle --version "$CARGO_BUNDLE_VERSION" --locked
+
+      - name: Warm release build cache
+        if: github.ref == 'refs/heads/main'
+        run: cargo build --locked --release --package rebook-desktop --target "${{ matrix.target }}"
+
+      - name: Build and verify DMG
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo build --locked --release --package rebook-desktop --target "$TARGET"
+          CARGO_BUNDLE_SKIP_BUILD=1 cargo bundle \
+            --release \
+            --package rebook-desktop \
+            --format osx \
+            --target "$TARGET"
+
+          app_bundle="target/$TARGET/release/bundle/osx/Torto.app"
+          executable="$app_bundle/Contents/MacOS/torto"
+          if [[ ! -x "$executable" ]]; then
+            echo "Bundled executable is missing: $executable" >&2
+            exit 1
+          fi
+
+          file "$executable" | grep -F "$ARCH"
+          plutil -lint "$app_bundle/Contents/Info.plist"
+          codesign --force --deep --sign - "$app_bundle"
+          codesign --verify --deep --strict --verbose=2 "$app_bundle"
+
+          staging_dir="dist/dmg-root"
+          dmg_name="Torto-$TORTO_VERSION-macos-$ARCH.dmg"
+          dmg_path="dist/$dmg_name"
+          mkdir -p "$staging_dir"
+          ditto "$app_bundle" "$staging_dir/Torto.app"
+          ln -s /Applications "$staging_dir/Applications"
+          hdiutil create \
+            -volname "Torto" \
+            -srcfolder "$staging_dir" \
+            -ov \
+            -format UDZO \
+            "$dmg_path"
+          hdiutil verify "$dmg_path"
+          (cd dist && shasum -a 256 "$dmg_name" > "$dmg_name.sha256")
+
+      - name: Upload workflow artifact
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
+        with:
+          name: Torto-${{ steps.version.outputs.version }}-macos-${{ matrix.arch }}
+          path: |
+            dist/*.dmg
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish-macos-installers:
+    name: Publish macOS installers
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-macos-installer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: Torto-*-macos-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.dmg
+            dist/*.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
