@@ -16,7 +16,15 @@ path = "src/main.rs"
 [package.metadata.bundle]
 name = "Torto"
 identifier = "io.github.l-chris.torto"
-icon = ["assets/logo.png"]
+icon = [
+    "assets/macos/torto-16.png",
+    "assets/macos/torto-32.png",
+    "assets/macos/torto-64.png",
+    "assets/macos/torto-128.png",
+    "assets/macos/torto-256.png",
+    "assets/macos/torto-512.png",
+    "assets/macos/torto-512@2x.png",
+]
 category = "public.app-category.reference"
 short_description = "Torto native e-book reader"
 long_description = "A native desktop reader for PDF, EPUB, MOBI, AZW3, FB2, and CBZ books."
