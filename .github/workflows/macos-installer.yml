@@ -151,9 +151,21 @@ jobs:
           echo "Disk usage before creating DMG:"
           df -h .
 
+          # hdiutil can underestimate the filesystem space needed by -srcfolder,
+          # especially after accounting for per-file metadata and allocation blocks.
+          # Add proportional and fixed headroom; UDZO compresses the unused capacity.
+          dmg_source_kib="$(du -sk "$staging_dir" | awk '{print $1}')"
+          if ! [[ "$dmg_source_kib" =~ ^[0-9]+$ ]] || [[ "$dmg_source_kib" -le 0 ]]; then
+            echo "Unable to determine DMG staging size: $dmg_source_kib" >&2
+            exit 1
+          fi
+          dmg_capacity_kib=$((dmg_source_kib + dmg_source_kib / 2 + 262144))
+          echo "DMG staging size: ${dmg_source_kib} KiB; filesystem capacity: ${dmg_capacity_kib} KiB"
+
           hdiutil create \
             -volname "Torto" \
             -srcfolder "$staging_dir" \
+            -size "${dmg_capacity_kib}k" \
             -ov \
             -format UDZO \
             "$dmg_path"
