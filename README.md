@@ -5,7 +5,7 @@
 <h1 align="center">Torto · 小龟阅读</h1>
 
 <p align="center">
-  一款专注、轻巧的 Windows 本地电子书阅读器。<br>
+  一款专注、轻巧的本地电子书阅读器，支持 Windows 和 macOS。<br>
   把书留在自己的电脑里，安静地读，也更清楚地想。
 </p>
 
@@ -17,7 +17,7 @@
 
 ## 认识 Torto
 
-Torto（中文名“小龟阅读”）是一款为 Windows 设计的原生电子书阅读器。它可以管理本地书库，提供舒适的单页或双页阅读、目录导航、全文搜索、文字高亮、翻译和 AI 阅读助手，也可以通过 WebDAV 在自己的设备之间同步书籍与阅读状态。
+Torto（中文名“小龟阅读”）是一款 Windows 和 macOS 原生电子书阅读器。它可以管理本地书库，提供舒适的单页或双页阅读、目录导航、全文搜索、文字高亮、翻译和 AI 阅读助手，也可以通过 WebDAV 在自己的设备之间同步书籍与阅读状态。
 
 书籍默认保存在本机。阅读正文不依赖浏览器或 WebView，翻页和排版由原生渲染引擎完成。
 
@@ -39,17 +39,18 @@ Torto（中文名“小龟阅读”）是一款为 Windows 设计的原生电子
 
 - 本地书架：批量导入、封面展示、书名与作者搜索、重复书籍识别。
 - 舒适排版：单页/双页布局、字号与字体调整、字重设置、图片自适应页面。
+- 界面主题：浅色、深色、玻璃三种主题，阅读页面配色随主题切换。
 - 阅读导航：层级目录、章节跟随、键盘和鼠标滚轮翻页、全书进度显示。
-- 阅读标记：文字划选、高亮和快速定位。
+- 阅读标记：文字划选、高亮批注和快速定位。
 - 全文搜索：在当前电子书中查找内容并直接跳转。
-- AI 阅读助手：围绕当前书籍提问，支持 Markdown、公式、SVG 和 Mermaid 内容展示。
+- AI 阅读助手：围绕当前书籍提问，回答附书中引用出处，支持 Markdown、公式、SVG 和 Mermaid 内容展示。
 - 翻译阅读：支持替换或双语模式，也可以翻译目录。
 - WebDAV 同步：内置坚果云等常用提供商，也支持自定义 WebDAV 地址。
 - 多种格式：支持无 DRM 的 EPUB、MOBI、AZW、AZW3/KF8、FB2、FBZ、CBZ 和 PDF。
 
 ## 下载与使用
 
-前往 [Releases](https://github.com/L-Chris/rebook-desktop/releases) 下载最新的 `Torto-*-x86_64.msi`，按安装向导完成安装。
+前往 [Releases](https://github.com/L-Chris/rebook-desktop/releases) 下载最新安装包：Windows 选择 `Torto-*-x86_64.msi`，按安装向导完成安装；macOS 选择 `Torto-*-macos-arm64.dmg`（Apple 芯片）或 `Torto-*-macos-x86_64.dmg`（Intel），打开后将 Torto 拖入「应用程序」。
 
 首次打开后：
 
@@ -59,12 +60,12 @@ Torto（中文名“小龟阅读”）是一款为 Windows 设计的原生电子
 4. 使用 `Ctrl + F` 搜索全书内容。
 5. 在右上角菜单中打开设置，调整字体、分页、翻译、AI 和云同步。
 
-当前安装包面向 64 位 Windows 10/11。为获得更流畅的原生渲染体验，建议使用已更新显卡驱动的设备。
+Windows 安装包面向 64 位 Windows 10/11；macOS 安装包要求 macOS 12 或更高版本。为获得更流畅的原生渲染体验，建议使用已更新显卡驱动的设备。
 
 ## 数据与隐私
 
 - 导入的电子书和阅读数据保存在本机应用数据目录。
-- WebDAV 密码和 AI API Key 保存在 Windows 凭据管理器中，不会写入普通配置文件。
+- WebDAV 密码和 AI API Key 保存在系统安全凭据存储中（Windows 凭据管理器、macOS 钥匙串），不会写入普通配置文件。
 - AI 与翻译功能默认不会自动启用；只有在你配置服务并主动使用时，相关内容才会发送到所选服务商。
 - WebDAV 同步由桌面端直接连接你选择的云盘，不经过 Torto 自建中转服务。
 
@@ -108,10 +109,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-重新生成 Windows 多尺寸图标：
+重新生成 Windows / macOS 多尺寸图标：
 
 ```powershell
 cargo run -p rebook-desktop --example generate_windows_icons
+cargo run -p rebook-desktop --example generate_macos_icons
 ```
 
 核心架构采用 `parser → Reading IR → layout → renderer`，正文由 Parley、Vello 和 wgpu 完成原生排版与渲染。详细设计见 [docs](docs/)。
