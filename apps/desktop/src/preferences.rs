@@ -49,6 +49,8 @@ pub(crate) enum AppTheme {
     Light,
     #[serde(rename = "dark")]
     Dark,
+    #[serde(rename = "glass")]
+    Glass,
 }
 
 #[derive(Clone, Debug, PartialEq)]

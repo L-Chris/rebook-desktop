@@ -70,6 +70,20 @@ fn apply_theme_colors(style: &mut ReaderStyle, theme: AppTheme) {
                 alpha: 255,
             };
         }
+        AppTheme::Glass => {
+            style.foreground = Rgba {
+                red: 30,
+                green: 41,
+                blue: 59,
+                alpha: 255,
+            };
+            style.background = Rgba {
+                red: 232,
+                green: 238,
+                blue: 246,
+                alpha: 255,
+            };
+        }
     }
 }
 

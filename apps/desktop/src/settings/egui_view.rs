@@ -281,6 +281,12 @@ fn reading_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     {
                         state.draft_theme = AppTheme::Dark;
                     }
+                    let glass = state.draft_theme == AppTheme::Glass;
+                    if choice_button(ui, state.draft_language.text("玻璃", "Glass"), glass, 72.0)
+                        .clicked()
+                    {
+                        state.draft_theme = AppTheme::Glass;
+                    }
                 });
                 ui.end_row();
 

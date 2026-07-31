@@ -102,17 +102,55 @@ impl Palette {
             pill_stroke: Color32::from_rgb(72, 70, 64),
         }
     }
+
+    // Glassmorphism approximation: egui has no backdrop blur, so frosted
+    // surfaces are translucent white layers over a cool slate background.
+    fn glass() -> Self {
+        Self {
+            dark: false,
+            background: Color32::from_rgb(219, 227, 238),
+            surface: Color32::from_rgba_unmultiplied(255, 255, 255, 168),
+            surface_muted: Color32::from_rgba_unmultiplied(255, 255, 255, 108),
+            text: Color32::from_rgb(30, 41, 59),
+            muted: Color32::from_rgb(100, 116, 139),
+            border: Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+            accent: Color32::from_rgb(79, 70, 229),
+            accent_soft: Color32::from_rgba_unmultiplied(99, 102, 241, 42),
+            hovered_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+            hovered_weak_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 96),
+            hovered_stroke: Color32::from_rgba_unmultiplied(148, 163, 184, 140),
+            active_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 176),
+            active_weak_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 128),
+            open_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 96),
+            selection_fill: Color32::from_rgba_unmultiplied(99, 102, 241, 72),
+            error: Color32::from_rgb(220, 38, 38),
+            error_fill: Color32::from_rgba_unmultiplied(254, 226, 226, 200),
+            error_stroke: Color32::from_rgba_unmultiplied(252, 165, 165, 200),
+            error_text: Color32::from_rgb(185, 28, 28),
+            toast_error_fill: Color32::from_rgb(78, 39, 39),
+            card_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 140),
+            accent_border: Color32::from_rgba_unmultiplied(99, 102, 241, 128),
+            pill_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 120),
+            pill_stroke: Color32::from_rgba_unmultiplied(148, 163, 184, 110),
+        }
+    }
 }
 
 static CURRENT_THEME: AtomicU8 = AtomicU8::new(0);
 
 pub(crate) fn set_theme(theme: AppTheme) {
-    CURRENT_THEME.store(theme as u8, Ordering::Relaxed);
+    let value = match theme {
+        AppTheme::Light => 0,
+        AppTheme::Dark => 1,
+        AppTheme::Glass => 2,
+    };
+    CURRENT_THEME.store(value, Ordering::Relaxed);
 }
 
 pub(crate) fn theme() -> AppTheme {
     match CURRENT_THEME.load(Ordering::Relaxed) {
         1 => AppTheme::Dark,
+        2 => AppTheme::Glass,
         _ => AppTheme::Light,
     }
 }
@@ -121,6 +159,7 @@ pub(crate) fn palette() -> Palette {
     match theme() {
         AppTheme::Light => Palette::light(),
         AppTheme::Dark => Palette::dark(),
+        AppTheme::Glass => Palette::glass(),
     }
 }
 
