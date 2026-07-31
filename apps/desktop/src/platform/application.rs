@@ -9,7 +9,9 @@ use winit::window::{Icon, Window, WindowId};
 
 use super::UserEvent;
 use super::gpu::GpuState;
+use super::window_appearance;
 use crate::app::DesktopApp;
+use crate::preferences::AppTheme;
 
 const INITIAL_WIDTH: u32 = 1200;
 const INITIAL_HEIGHT: u32 = 800;
@@ -48,6 +50,7 @@ struct WindowState {
     window: Arc<Window>,
     gpu: GpuState,
     egui_state: egui_winit::State,
+    applied_theme: AppTheme,
 }
 
 struct Application {
@@ -119,6 +122,8 @@ impl ApplicationHandler<UserEvent> for Application {
                 return;
             }
         };
+        let applied_theme = self.app.theme();
+        window_appearance::apply(&window, applied_theme);
         let egui_state = egui_winit::State::new(
             self.egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -142,6 +147,7 @@ impl ApplicationHandler<UserEvent> for Application {
             window,
             gpu,
             egui_state,
+            applied_theme,
         });
     }
 
@@ -248,6 +254,11 @@ impl ApplicationHandler<UserEvent> for Application {
                     // A theme switch lands during render; keep the surface
                     // clear color in step for the next frame.
                     state.gpu.set_clear_color(clear_color());
+                    let theme = crate::ui::theme();
+                    if state.applied_theme != theme {
+                        window_appearance::apply(&state.window, theme);
+                        state.applied_theme = theme;
+                    }
                     self.app.spawn_pending_tasks(&self.runtime, &self.proxy);
                 }
             }
