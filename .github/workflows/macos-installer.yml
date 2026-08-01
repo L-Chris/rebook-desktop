@@ -82,6 +82,10 @@ jobs:
           echo "TORTO_VERSION=$package_version" >> "$GITHUB_ENV"
           echo "version=$package_version" >> "$GITHUB_OUTPUT"
 
+      - name: Validate release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        run: python3 scripts/validate_release_notes.py "${{ github.ref_name }}"
+
       - name: Run tests
         run: cargo test --locked --workspace --target "${{ matrix.target }}"
 
@@ -191,6 +195,9 @@ jobs:
       contents: write
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
       - name: Download macOS artifacts
         uses: actions/download-artifact@v8
         with:
@@ -205,4 +212,5 @@ jobs:
             dist/*.dmg
             dist/*.sha256
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+          append_body: false

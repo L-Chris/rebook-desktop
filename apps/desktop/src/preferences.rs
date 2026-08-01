@@ -10,6 +10,8 @@ use crate::persistence::write_json_atomic;
 
 const SETTINGS_VERSION: u32 = 1;
 const SETTINGS_FILE: &str = "reader-settings.json";
+pub(crate) const SYSTEM_INTERFACE_FONT: &str = "System UI";
+pub(crate) const DEFAULT_INTERFACE_FONT_SIZE: f32 = 14.0;
 
 pub type PreferencesResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -55,6 +57,7 @@ pub(crate) enum AppTheme {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ReaderPreferences {
+    pub(crate) interface_typography: InterfaceTypography,
     pub(crate) typography: ReaderTypography,
     pub(crate) language: AppLanguage,
     pub(crate) spread: SpreadMode,
@@ -64,6 +67,7 @@ pub(crate) struct ReaderPreferences {
 impl Default for ReaderPreferences {
     fn default() -> Self {
         Self {
+            interface_typography: InterfaceTypography::default(),
             typography: ReaderTypography::default(),
             language: AppLanguage::default(),
             spread: SpreadMode::Double,
@@ -72,9 +76,39 @@ impl Default for ReaderPreferences {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct InterfaceTypography {
+    pub(crate) font_family: String,
+    pub(crate) font_size: f32,
+}
+
+impl InterfaceTypography {
+    pub(crate) fn normalize(&mut self) {
+        self.font_family = self.font_family.trim().to_owned();
+        if self.font_family.is_empty() {
+            self.font_family = SYSTEM_INTERFACE_FONT.into();
+        }
+        if !self.font_size.is_finite() {
+            self.font_size = DEFAULT_INTERFACE_FONT_SIZE;
+        }
+        self.font_size = self.font_size.clamp(10.0, 24.0);
+    }
+}
+
+impl Default for InterfaceTypography {
+    fn default() -> Self {
+        Self {
+            font_family: SYSTEM_INTERFACE_FONT.into(),
+            font_size: DEFAULT_INTERFACE_FONT_SIZE,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredReaderPreferences {
     version: u32,
+    #[serde(default)]
+    interface_typography: InterfaceTypography,
     #[serde(default)]
     typography: ReaderTypography,
     #[serde(default)]
@@ -145,9 +179,12 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
         )
         .into());
     }
+    let mut interface_typography = stored.interface_typography;
+    interface_typography.normalize();
     let mut typography = stored.typography;
     typography.normalize();
     Ok(ReaderPreferences {
+        interface_typography,
         typography,
         language: stored.language,
         spread: stored.spread.into(),
@@ -160,10 +197,13 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "阅读设置路径没有父目录"))?;
     fs::create_dir_all(parent)?;
+    let mut interface_typography = preferences.interface_typography.clone();
+    interface_typography.normalize();
     let mut typography = preferences.typography.clone();
     typography.normalize();
     let stored = StoredReaderPreferences {
         version: SETTINGS_VERSION,
+        interface_typography,
         typography,
         language: preferences.language,
         spread: preferences.spread.into(),
@@ -194,6 +234,10 @@ mod tests {
         };
 
         let preferences = ReaderPreferences {
+            interface_typography: InterfaceTypography {
+                font_family: "  Microsoft YaHei UI  ".into(),
+                font_size: 15.0,
+            },
             typography,
             language: AppLanguage::English,
             spread: SpreadMode::Single,
@@ -203,6 +247,11 @@ mod tests {
         let loaded = load_from(path.clone()).unwrap();
 
         assert_eq!(loaded.typography.default_font, ReaderDefaultFont::SansSerif);
+        assert_eq!(
+            loaded.interface_typography.font_family,
+            "Microsoft YaHei UI"
+        );
+        assert!((loaded.interface_typography.font_size - 15.0).abs() < f32::EPSILON);
         assert_eq!(loaded.typography.default_cjk_font, "Microsoft YaHei");
         assert!((loaded.typography.font_size - 18.0).abs() < f32::EPSILON);
         assert!((loaded.typography.minimum_font_size - 9.0).abs() < f32::EPSILON);
@@ -218,8 +267,23 @@ mod tests {
         let json = r#"{"version":1}"#;
         let stored: StoredReaderPreferences = serde_json::from_str(json).unwrap();
         assert_eq!(stored.language, AppLanguage::SimplifiedChinese);
+        assert_eq!(stored.interface_typography, InterfaceTypography::default());
         assert!(matches!(stored.spread, StoredSpreadMode::Double));
         assert_eq!(stored.theme, AppTheme::Light);
+    }
+
+    #[test]
+    fn interface_typography_normalizes_missing_and_out_of_range_values() {
+        let mut typography = InterfaceTypography {
+            font_family: "   ".into(),
+            font_size: f32::NAN,
+        };
+        typography.normalize();
+        assert_eq!(typography, InterfaceTypography::default());
+
+        typography.font_size = 100.0;
+        typography.normalize();
+        assert!((typography.font_size - 24.0).abs() < f32::EPSILON);
     }
 
     fn test_path() -> PathBuf {

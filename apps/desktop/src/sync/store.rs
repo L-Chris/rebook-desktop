@@ -128,6 +128,30 @@ impl SyncStore {
         Ok(true)
     }
 
+    pub(crate) fn update_annotation_note(
+        &self,
+        id: &str,
+        note: Option<String>,
+    ) -> SyncResult<bool> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let Some(mut annotation) = read_annotation(&transaction, id)? else {
+            return Ok(false);
+        };
+        if annotation.deleted_at.is_some() {
+            return Ok(false);
+        }
+        let updated_at = tick(&transaction, &self.device_id, None)?;
+        let counter = annotation.clock.entry(self.device_id.clone()).or_default();
+        *counter = counter.saturating_add(1);
+        annotation.note = note;
+        annotation.updated_at = updated_at;
+        annotation.origin_device.clone_from(&self.device_id);
+        write_annotation(&transaction, &annotation)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub(crate) fn merge_annotations(&self, annotations: &[AnnotationState]) -> SyncResult<usize> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -420,6 +444,10 @@ impl HighlightRepository for SyncStore {
         Ok(())
     }
 
+    fn update_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<bool> {
+        self.update_annotation_note(&highlight.id, highlight.note.clone())
+    }
+
     fn remove_highlight(&self, id: &str) -> HighlightResult<bool> {
         self.delete_annotation(id)
     }
@@ -604,6 +632,33 @@ mod tests {
         assert_eq!(exported.len(), 1);
         assert!(exported[0].deleted_at.is_some());
         assert_eq!(exported[0].note.as_deref(), Some("comment"));
+        cleanup(&store);
+    }
+
+    #[test]
+    fn updating_an_annotation_note_advances_its_sync_state() {
+        let store = test_store("update-note");
+        store
+            .create_annotation(
+                "note".into(),
+                "book".into(),
+                vec![source_range()],
+                "quote".into(),
+                Some("before".into()),
+                1,
+            )
+            .unwrap();
+        let before = store.annotations_for_book("book").unwrap().remove(0);
+
+        assert!(
+            store
+                .update_annotation_note("note", Some("after".into()))
+                .unwrap()
+        );
+        let after = store.annotations_for_book("book").unwrap().remove(0);
+        assert_eq!(after.note.as_deref(), Some("after"));
+        assert!(after.clock["device-a"] > before.clock["device-a"]);
+        assert!(after.updated_at >= before.updated_at);
         cleanup(&store);
     }
 

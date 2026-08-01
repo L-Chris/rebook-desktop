@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::persistence::write_json_atomic;
 
-pub use ai::{ChatResponse, ChatRole, ChatTurn, chat_with_book, translate_blocks};
+pub(crate) use ai::{ChatAnnotationAction, ChatSelection, chat_citation_link};
+pub use ai::{
+    ChatReadingContext, ChatResponse, ChatRole, ChatTurn, chat_with_book, translate_blocks,
+};
 pub use commands::{
     ChatCommand, ChatCommandResolution, chat_command_suggestions, resolve_chat_command,
 };
@@ -31,10 +34,11 @@ const SETTINGS_FILE: &str = "plugins.json";
 const AI_CREDENTIAL_SERVICE: &str = "Rebook AI";
 const DEFAULT_PROVIDER_ID: &str = "openai";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
-const DEFAULT_CHAT_MAX_TOOL_STEPS: u16 = 5;
+const DEFAULT_CHAT_MAX_TOOL_STEPS: u16 = 24;
+const CHAT_TOOL_DEFAULTS_VERSION: u8 = 1;
 const DEFAULT_CHAT_HISTORY_TURNS: u16 = 10;
 pub(crate) const CHAT_TOOL_STEPS_MIN: u16 = 1;
-pub(crate) const CHAT_TOOL_STEPS_MAX: u16 = 10;
+pub(crate) const CHAT_TOOL_STEPS_MAX: u16 = 24;
 pub(crate) const CHAT_HISTORY_TURNS_MIN: u16 = 1;
 pub(crate) const CHAT_HISTORY_TURNS_MAX: u16 = 50;
 pub(crate) const TARGET_LANGUAGE_INTERFACE: &str = "interface";
@@ -143,6 +147,8 @@ pub struct PluginSettings {
     pub target_language: String,
     pub translation_mode: TranslationMode,
     pub translate_toc: bool,
+    #[serde(default)]
+    chat_tool_defaults_version: u8,
     #[serde(default, rename = "base_url", skip_serializing)]
     legacy_base_url: Option<String>,
     #[serde(default, rename = "api_key", skip_serializing)]
@@ -162,6 +168,7 @@ impl Default for PluginSettings {
             target_language: TARGET_LANGUAGE_INTERFACE.into(),
             translation_mode: TranslationMode::Bilingual,
             translate_toc: true,
+            chat_tool_defaults_version: CHAT_TOOL_DEFAULTS_VERSION,
             legacy_base_url: None,
             legacy_api_key: None,
         }
@@ -225,6 +232,12 @@ impl PluginSettings {
 
     pub fn normalize(&mut self) {
         self.migrate_legacy();
+        if self.chat_tool_defaults_version < CHAT_TOOL_DEFAULTS_VERSION {
+            if self.chat_max_tool_steps == 5 {
+                self.chat_max_tool_steps = DEFAULT_CHAT_MAX_TOOL_STEPS;
+            }
+            self.chat_tool_defaults_version = CHAT_TOOL_DEFAULTS_VERSION;
+        }
         if self.providers.is_empty() {
             self.providers.push(AiProvider::default());
         }
@@ -560,6 +573,16 @@ mod tests {
 
         assert_eq!(settings.chat_max_tool_steps, CHAT_TOOL_STEPS_MIN);
         assert_eq!(settings.chat_history_turns, CHAT_HISTORY_TURNS_MAX);
+    }
+
+    #[test]
+    fn legacy_default_tool_limit_migrates_to_web_parity() {
+        let mut settings: PluginSettings =
+            serde_json::from_str(r#"{ "chat_max_tool_steps": 5 }"#).unwrap();
+
+        settings.normalize();
+
+        assert_eq!(settings.chat_max_tool_steps, 24);
     }
 
     #[test]

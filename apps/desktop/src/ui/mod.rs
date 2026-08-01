@@ -1,14 +1,21 @@
 mod svg_loader;
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
+use egui::emath::GuiRounding;
 use egui::{
-    Align2, Color32, ColorImage, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
+    Align2, Color32, ColorImage, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Rect,
     Response, Sense, Stroke, TextStyle, Ui, Vec2, WidgetInfo, WidgetType,
 };
 use lucide_icons::Icon;
 
-use crate::preferences::AppTheme;
+use crate::preferences::{
+    AppTheme, DEFAULT_INTERFACE_FONT_SIZE, InterfaceTypography, SYSTEM_INTERFACE_FONT,
+};
+
+const EGUI_BASE_FONT_SIZE: f32 = 13.0;
+static INTERFACE_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(DEFAULT_INTERFACE_FONT_SIZE.to_bits());
 
 /// Theme-dependent color set. Chrome reads colors through `palette()` so a
 /// saved theme switch recolors the whole app without threading state through
@@ -163,40 +170,15 @@ pub(crate) fn palette() -> Palette {
     }
 }
 
-pub(crate) fn configure(ctx: &egui::Context) {
+pub(crate) fn configure(ctx: &egui::Context, interface_typography: &InterfaceTypography) {
     egui_extras::install_image_loaders(ctx);
     svg_loader::install(ctx);
     // Application state is mutated while building a frame. A single pass keeps
     // keyboard and pointer actions exactly-once; the retained reader layout
     // performs its own explicit invalidation when geometry changes.
     ctx.options_mut(|options| options.max_passes = 1.try_into().expect("one is non-zero"));
-    // egui's one-pixel transparent feather produces a dark halo around rounded
-    // fills with the current wgpu composition path. Disable that fringe and keep
-    // rounded geometry snapped so control edges stay crisp at Windows scale factors.
-    ctx.tessellation_options_mut(|options| {
-        options.feathering = false;
-        options.round_rects_to_pixels = true;
-    });
-    let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert(
-        "reader-cjk".into(),
-        FontData::from_static(crate::fonts::cjk_font_bytes()).into(),
-    );
-    fonts.font_data.insert(
-        "lucide".into(),
-        FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES).into(),
-    );
-    fonts
-        .families
-        .insert(FontFamily::Name("lucide".into()), vec!["lucide".into()]);
-    for family in [FontFamily::Proportional, FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .insert(0, "reader-cjk".into());
-    }
-    ctx.set_fonts(fonts);
+    configure_tessellation(ctx);
+    apply_interface_typography(ctx, interface_typography);
 
     apply_visuals(ctx, &Palette::light());
     ctx.all_styles_mut(|style| {
@@ -227,6 +209,143 @@ pub(crate) fn configure(ctx: &egui::Context) {
     });
 }
 
+fn configure_tessellation(ctx: &egui::Context) {
+    // Snap rectangular geometry to pixels, but retain a one-pixel antialiasing
+    // fringe for curved corners. Disabling feathering makes small-radius controls
+    // visibly stair-step at 100% Windows DPI.
+    ctx.tessellation_options_mut(|options| {
+        options.feathering = true;
+        options.feathering_size_in_pixels = 1.0;
+        options.round_rects_to_pixels = true;
+    });
+}
+
+pub(crate) fn apply_interface_typography(
+    ctx: &egui::Context,
+    interface_typography: &InterfaceTypography,
+) {
+    let mut interface_typography = interface_typography.clone();
+    interface_typography.normalize();
+    INTERFACE_FONT_SIZE_BITS.store(interface_typography.font_size.to_bits(), Ordering::Relaxed);
+
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "reader-cjk".into(),
+        FontData::from_static(crate::fonts::cjk_font_bytes()).into(),
+    );
+    fonts.font_data.insert(
+        "lucide".into(),
+        FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES).into(),
+    );
+    fonts
+        .families
+        .insert(FontFamily::Name("lucide".into()), vec!["lucide".into()]);
+
+    let mut database = fontdb::Database::new();
+    database.load_system_fonts();
+    let requested_families = if interface_typography.font_family == SYSTEM_INTERFACE_FONT {
+        system_ui_font_candidates()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        std::iter::once(interface_typography.font_family.clone())
+            .chain(system_ui_font_candidates().iter().map(ToString::to_string))
+            .collect()
+    };
+    let mut interface_fonts = Vec::new();
+    for family in requested_families {
+        if interface_fonts.iter().any(|loaded| loaded == &family) {
+            continue;
+        }
+        if let Some(key) = load_system_font(&database, &family, &mut fonts) {
+            interface_fonts.push(key);
+        }
+    }
+    let proportional_fallbacks = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    interface_fonts.extend(proportional_fallbacks);
+    interface_fonts.push("reader-cjk".into());
+    interface_fonts.push("lucide".into());
+    interface_fonts.dedup();
+    fonts
+        .families
+        .insert(FontFamily::Proportional, interface_fonts);
+
+    let monospace_fonts = fonts.families.entry(FontFamily::Monospace).or_default();
+    monospace_fonts.push("reader-cjk".into());
+    monospace_fonts.push("lucide".into());
+    ctx.set_fonts(fonts);
+
+    ctx.all_styles_mut(|style| {
+        style.text_styles = egui::style::default_text_styles();
+        for font_id in style.text_styles.values_mut() {
+            font_id.size = scaled_font_size(font_id.size);
+        }
+    });
+    ctx.request_repaint();
+}
+
+pub(crate) fn scaled_font_size(nominal_size: f32) -> f32 {
+    let configured = f32::from_bits(INTERFACE_FONT_SIZE_BITS.load(Ordering::Relaxed));
+    nominal_size * configured / EGUI_BASE_FONT_SIZE
+}
+
+pub(crate) fn available_interface_font_families() -> Vec<String> {
+    let mut database = fontdb::Database::new();
+    database.load_system_fonts();
+    let mut families = database
+        .faces()
+        .flat_map(|face| face.families.iter().map(|(family, _)| family.clone()))
+        .filter(|family| !family.trim().is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    families.retain(|family| family != SYSTEM_INTERFACE_FONT);
+    families.insert(0, SYSTEM_INTERFACE_FONT.into());
+    families
+}
+
+fn load_system_font(
+    database: &fontdb::Database,
+    family: &str,
+    fonts: &mut FontDefinitions,
+) -> Option<String> {
+    let families = [fontdb::Family::Name(family)];
+    let id = database.query(&fontdb::Query {
+        families: &families,
+        weight: fontdb::Weight::NORMAL,
+        stretch: fontdb::Stretch::Normal,
+        style: fontdb::Style::Normal,
+    })?;
+    let key = format!("system-ui-{family}");
+    let data = database.with_face_data(id, |bytes, index| {
+        let mut data = FontData::from_owned(bytes.to_vec());
+        data.index = index;
+        data
+    })?;
+    fonts.font_data.insert(key.clone(), data.into());
+    Some(key)
+}
+
+#[cfg(target_os = "windows")]
+const fn system_ui_font_candidates() -> &'static [&'static str] {
+    &["Segoe UI", "Microsoft YaHei UI"]
+}
+
+#[cfg(target_os = "macos")]
+const fn system_ui_font_candidates() -> &'static [&'static str] {
+    &[".AppleSystemUIFont", "PingFang SC", "Helvetica Neue"]
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const fn system_ui_font_candidates() -> &'static [&'static str] {
+    &["Noto Sans", "Noto Sans CJK SC", "DejaVu Sans"]
+}
+
 // Rebuild egui visuals from a palette. Startup applies the light palette;
 // a saved theme change re-applies the matching palette and repaints.
 pub(crate) fn apply_visuals(ctx: &egui::Context, palette: &Palette) {
@@ -251,15 +370,20 @@ pub(crate) fn apply_visuals(ctx: &egui::Context, palette: &Palette) {
     visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
     visuals.widgets.active.bg_fill = palette.active_fill;
     visuals.widgets.active.weak_bg_fill = palette.active_weak_fill;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.5, palette.accent);
+    // Interaction outlines are painted inside the widget rectangle. Keep them
+    // exactly one logical pixel so 100% Windows DPI never rasterizes a half-pixel
+    // edge into the dark, fuzzy fringe visible around open selectors.
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, palette.accent);
     visuals.widgets.active.corner_radius = CornerRadius::same(6);
     visuals.widgets.open.bg_fill = palette.open_fill;
     visuals.widgets.open.weak_bg_fill = palette.open_fill;
-    visuals.widgets.open.bg_stroke = Stroke::new(1.5, palette.accent);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0, palette.accent);
     visuals.widgets.open.corner_radius = CornerRadius::same(6);
     visuals.text_cursor.stroke = Stroke::new(1.5, palette.accent);
     visuals.selection.bg_fill = palette.selection_fill;
-    visuals.selection.stroke = Stroke::new(1.0, palette.text);
+    // TextEdit focus rings reuse `selection.stroke`; using the text color here
+    // creates an unintended black outline next to otherwise themed controls.
+    visuals.selection.stroke = Stroke::new(1.0, palette.accent);
     ctx.set_visuals(visuals);
 }
 
@@ -322,7 +446,7 @@ pub(crate) fn toggle_icon_button(
         );
         let label_galley = painter.layout_no_wrap(
             state_label.to_owned(),
-            FontId::proportional(11.0),
+            FontId::proportional(scaled_font_size(11.0)),
             foreground,
         );
         let gap = 4.0;
@@ -367,7 +491,7 @@ fn painted_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -> Response {
 
     if ui.is_rect_visible(rect) {
         if fill != Color32::TRANSPARENT {
-            ui.painter().rect_filled(rect, 6.0, fill);
+            paint_compact_rounded_background(ui, rect, 6.0, fill);
         }
         ui.painter().text(
             rect.center(),
@@ -379,6 +503,41 @@ fn painted_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -> Response {
     }
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), &label));
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Keep the antialiasing fringe of a compact rounded control inside its
+/// allocated rectangle. `epaint` feathers half of the configured width on
+/// either side of the path, so the path is inset by that same half-width after
+/// the outer bounds have been snapped to physical pixels.
+fn paint_compact_rounded_background(ui: &Ui, rect: Rect, radius: f32, fill: Color32) {
+    let pixels_per_point = ui.ctx().pixels_per_point();
+    let feathering_in_pixels = ui.ctx().tessellation_options(|options| {
+        if options.feathering {
+            options.feathering_size_in_pixels
+        } else {
+            0.0
+        }
+    });
+    let (paint_rect, paint_radius) =
+        contained_feather_geometry(rect, radius, pixels_per_point, feathering_in_pixels);
+
+    // The geometry is already aligned deliberately. Letting the tessellator
+    // round it again would discard the half-pixel feather inset.
+    ui.painter().add(
+        egui::epaint::RectShape::filled(paint_rect, paint_radius, fill).with_round_to_pixels(false),
+    );
+}
+
+fn contained_feather_geometry(
+    rect: Rect,
+    radius: f32,
+    pixels_per_point: f32,
+    feathering_in_pixels: f32,
+) -> (Rect, f32) {
+    let pixels_per_point = pixels_per_point.max(f32::EPSILON);
+    let aligned_rect = rect.round_to_pixels(pixels_per_point);
+    let inset = 0.5 * feathering_in_pixels.max(0.0) / pixels_per_point;
+    (aligned_rect.shrink(inset), (radius - inset).max(0.0))
 }
 
 /// Full-width navigation/menu row with left-aligned icon and label.
@@ -460,4 +619,62 @@ pub(crate) fn decode_color_image(bytes: &[u8]) -> Result<ColorImage, image::Imag
     let image = image::load_from_memory(bytes)?.to_rgba8();
     let size = [image.width() as usize, image.height() as usize];
     Ok(ColorImage::from_rgba_unmultiplied(size, image.as_raw()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_open_and_focus_outlines_are_crisp_theme_strokes() {
+        for palette in [Palette::light(), Palette::dark(), Palette::glass()] {
+            let ctx = egui::Context::default();
+            apply_visuals(&ctx, &palette);
+            let style = ctx.style_of(ctx.theme());
+            let visuals = &style.visuals;
+
+            for stroke in [
+                visuals.widgets.active.bg_stroke,
+                visuals.widgets.open.bg_stroke,
+                visuals.selection.stroke,
+            ] {
+                assert!((stroke.width - 1.0).abs() < f32::EPSILON);
+                assert_eq!(stroke.color, palette.accent);
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_controls_keep_pixel_snapping_and_antialiasing() {
+        let ctx = egui::Context::default();
+        configure_tessellation(&ctx);
+        ctx.tessellation_options(|options| {
+            assert!(options.feathering);
+            assert!((options.feathering_size_in_pixels - 1.0).abs() < f32::EPSILON);
+            assert!(options.round_rects_to_pixels);
+        });
+    }
+
+    #[test]
+    fn compact_rounding_contains_the_feathering_fringe() {
+        let rect = Rect::from_min_max(egui::pos2(0.2, 0.4), egui::pos2(32.1, 32.2));
+        let pixels_per_point = 1.25;
+        let feathering_in_pixels = 1.0;
+        let aligned_rect = rect.round_to_pixels(pixels_per_point);
+        let inset = 0.5 * feathering_in_pixels / pixels_per_point;
+
+        let (paint_rect, paint_radius) =
+            contained_feather_geometry(rect, 6.0, pixels_per_point, feathering_in_pixels);
+
+        let restored_outer_rect = paint_rect.expand(inset);
+        for (actual, expected) in [
+            (restored_outer_rect.min.x, aligned_rect.min.x),
+            (restored_outer_rect.min.y, aligned_rect.min.y),
+            (restored_outer_rect.max.x, aligned_rect.max.x),
+            (restored_outer_rect.max.y, aligned_rect.max.y),
+            (paint_radius + inset, 6.0),
+        ] {
+            assert!((actual - expected).abs() < f32::EPSILON);
+        }
+    }
 }

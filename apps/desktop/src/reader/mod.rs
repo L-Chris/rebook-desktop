@@ -13,8 +13,8 @@ use crate::async_task::{TaskResult, TaskSlot};
 use crate::highlights::{HighlightStore, StoredHighlight};
 use crate::library::LibraryBook;
 use crate::plugins::{
-    BlockTranslation, BookSearchResult, ChatResponse, ChatTurn, PluginSettings, RewriteBookSource,
-    TranslationBlockInput, TranslationBookSource, TranslationMode,
+    BlockTranslation, BookSearchResult, ChatReadingContext, ChatResponse, ChatTurn, PluginSettings,
+    RewriteBookSource, TranslationBlockInput, TranslationBookSource, TranslationMode,
 };
 use crate::preferences::{self, AppLanguage, AppTheme, ReaderPreferences};
 use crate::sync::{SyncSettings, SyncStore};
@@ -317,10 +317,14 @@ struct SearchUiState {
 #[derive(Clone)]
 struct ChatTask {
     source: Arc<dyn BookSource>,
+    rewrite_source: Arc<RewriteBookSource>,
+    book_id: String,
+    selection: Option<crate::plugins::ChatSelection>,
+    annotations: Vec<StoredHighlight>,
     settings: PluginSettings,
     history: Vec<ChatTurn>,
     question: String,
-    current_section: usize,
+    current: ChatReadingContext,
     response_language: String,
 }
 
@@ -346,6 +350,7 @@ struct ChatUiState {
     reference_options_location: Option<(usize, usize, usize)>,
     reference_options: Vec<ChatReference>,
     messages: Vec<ChatTurn>,
+    pending_annotation_actions: Vec<crate::plugins::ChatAnnotationAction>,
     streaming: Option<ChatStreamingState>,
     error: Option<String>,
     error_timer: TransientMessageTimer,

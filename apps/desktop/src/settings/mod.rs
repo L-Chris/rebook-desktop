@@ -2,7 +2,7 @@ use peniko::Blob;
 use rebook_layout::{LayoutEngine, ReaderTypography, SpreadMode};
 
 use crate::plugins::PluginSettings;
-use crate::preferences::{self, AppLanguage, AppTheme, ReaderPreferences};
+use crate::preferences::{self, AppLanguage, AppTheme, InterfaceTypography, ReaderPreferences};
 use crate::sync::SyncSettings;
 
 mod egui_view;
@@ -12,6 +12,7 @@ pub(crate) use egui_view::settings_overlay;
 #[derive(Clone)]
 pub(crate) struct AppliedSettings {
     pub(crate) spread: SpreadMode,
+    pub(crate) interface_typography: InterfaceTypography,
     pub(crate) typography: ReaderTypography,
     pub(crate) plugin_settings: PluginSettings,
     pub(crate) language: AppLanguage,
@@ -23,6 +24,7 @@ pub(crate) struct AppliedSettings {
 pub(crate) struct SettingsFeature {
     settings_tab: SettingsTab,
     draft_spread: SpreadMode,
+    draft_interface_typography: InterfaceTypography,
     draft_typography: ReaderTypography,
     draft_plugin_settings: PluginSettings,
     draft_language: AppLanguage,
@@ -30,6 +32,7 @@ pub(crate) struct SettingsFeature {
     draft_sync_settings: SyncSettings,
     draft_sync_password: String,
     available_font_families: Vec<String>,
+    available_interface_font_families: Vec<String>,
     applied: AppliedSettings,
     revision: u64,
     error: Option<String>,
@@ -56,8 +59,10 @@ impl SettingsFeature {
         });
         let available_font_families =
             LayoutEngine::with_fonts(reader_fonts.iter().cloned()).available_font_families();
+        let available_interface_font_families = crate::ui::available_interface_font_families();
         let applied = AppliedSettings {
             spread: preferences.spread,
+            interface_typography: preferences.interface_typography,
             typography: preferences.typography,
             plugin_settings,
             language: preferences.language,
@@ -68,6 +73,7 @@ impl SettingsFeature {
         Self {
             settings_tab: SettingsTab::Reading,
             draft_spread: applied.spread,
+            draft_interface_typography: applied.interface_typography.clone(),
             draft_typography: applied.typography.clone(),
             draft_plugin_settings: applied.plugin_settings.clone(),
             draft_language: applied.language,
@@ -75,6 +81,7 @@ impl SettingsFeature {
             draft_sync_settings: applied.sync_settings.clone(),
             draft_sync_password: applied.sync_password.clone(),
             available_font_families,
+            available_interface_font_families,
             applied,
             revision: 0,
             error: None,
@@ -85,6 +92,8 @@ impl SettingsFeature {
     pub(crate) fn open(&mut self) {
         self.settings_tab = SettingsTab::Reading;
         self.draft_spread = self.applied.spread;
+        self.draft_interface_typography
+            .clone_from(&self.applied.interface_typography);
         self.draft_typography.clone_from(&self.applied.typography);
         self.draft_plugin_settings
             .clone_from(&self.applied.plugin_settings);
@@ -115,10 +124,19 @@ impl SettingsFeature {
         plugin_settings.normalize();
         let mut typography = self.draft_typography.clone();
         typography.normalize();
+        let mut interface_typography = self.draft_interface_typography.clone();
+        interface_typography.normalize();
         let mut sync_settings = self.draft_sync_settings.clone();
         sync_settings.normalize();
         let language = self.draft_language;
         let theme = self.draft_theme;
+        let reader_preferences = ReaderPreferences {
+            interface_typography: interface_typography.clone(),
+            typography: typography.clone(),
+            language,
+            theme,
+            spread: self.draft_spread,
+        };
         if sync_settings.enabled
             && let Err(error) = sync_settings.validate()
         {
@@ -129,11 +147,8 @@ impl SettingsFeature {
             return;
         }
         if let Err(error) = persist_settings(
-            self.draft_spread,
-            &typography,
+            &reader_preferences,
             &plugin_settings,
-            language,
-            theme,
             &sync_settings,
             &self.draft_sync_password,
         ) {
@@ -147,6 +162,7 @@ impl SettingsFeature {
         };
         self.applied = AppliedSettings {
             spread: self.draft_spread,
+            interface_typography,
             typography,
             plugin_settings,
             language,
@@ -167,27 +183,19 @@ impl SettingsFeature {
 }
 
 fn persist_settings(
-    spread: SpreadMode,
-    typography: &ReaderTypography,
+    reader_preferences: &ReaderPreferences,
     plugin_settings: &PluginSettings,
-    language: AppLanguage,
-    theme: AppTheme,
     sync_settings: &SyncSettings,
     sync_password: &str,
 ) -> Result<(), String> {
+    let language = reader_preferences.language;
     plugin_settings.save_default().map_err(|error| {
         format!(
             "{}: {error}",
             language.text("保存 AI 设置失败", "Failed to save AI settings")
         )
     })?;
-    preferences::save_reader_preferences(&ReaderPreferences {
-        typography: typography.clone(),
-        language,
-        theme,
-        spread,
-    })
-    .map_err(|error| {
+    preferences::save_reader_preferences(reader_preferences).map_err(|error| {
         format!(
             "{}: {error}",
             language.text("保存阅读设置失败", "Failed to save reader settings")

@@ -443,7 +443,7 @@ impl ShelfFeature {
                 ui.label(icon(Icon::BookOpen).size(23.0).color(palette().accent));
                 ui.label(
                     RichText::new(self.language.text("书架", "Library"))
-                        .size(22.0)
+                        .size(crate::ui::scaled_font_size(22.0))
                         .strong()
                         .color(palette().text),
                 );
@@ -452,7 +452,7 @@ impl ShelfFeature {
                         AppLanguage::SimplifiedChinese => format!("{book_count} 本"),
                         AppLanguage::English => format!("{book_count} books"),
                     })
-                    .size(12.0)
+                    .size(crate::ui::scaled_font_size(12.0))
                     .color(palette().muted),
                 );
                 ui.add_space(22.0);
@@ -498,7 +498,7 @@ impl ShelfFeature {
                         } else {
                             self.language.text("没有匹配的书籍", "No matching books")
                         })
-                        .size(16.0)
+                        .size(crate::ui::scaled_font_size(16.0))
                         .strong()
                         .color(palette().text),
                     );
@@ -508,7 +508,7 @@ impl ShelfFeature {
                                 "导入 EPUB、MOBI、PDF 等文件开始阅读",
                                 "Import EPUB, MOBI, PDF, and other books to begin",
                             ))
-                            .size(12.0)
+                            .size(crate::ui::scaled_font_size(12.0))
                             .color(palette().muted),
                         );
                     }
@@ -581,7 +581,7 @@ impl ShelfFeature {
         );
         let title = painter.layout_job(two_line_card_text_job(
             book.title.clone(),
-            egui::FontId::proportional(14.0),
+            egui::FontId::proportional(crate::ui::scaled_font_size(14.0)),
             palette().text,
             title_rect.width(),
         ));
@@ -597,7 +597,7 @@ impl ShelfFeature {
             );
             let author = painter.layout_job(two_line_card_text_job(
                 authors,
-                egui::FontId::proportional(12.0),
+                egui::FontId::proportional(crate::ui::scaled_font_size(12.0)),
                 palette().muted,
                 author_rect.width(),
             ));
@@ -751,8 +751,12 @@ fn shelf_toast(ctx: &egui::Context, id: &'static str, message: &str, kind: Shelf
                         ui.spacing_mut().item_spacing.x = 10.0;
                         ui.label(icon(icon_kind).size(18.0).color(foreground));
                         ui.add(
-                            egui::Label::new(RichText::new(message).size(13.0).color(foreground))
-                                .wrap(),
+                            egui::Label::new(
+                                RichText::new(message)
+                                    .size(crate::ui::scaled_font_size(13.0))
+                                    .color(foreground),
+                            )
+                            .wrap(),
                         );
                     });
                 });
@@ -805,7 +809,7 @@ fn shelf_import_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let painter = ui.painter();
     painter.rect_filled(rect, 8.0, fill);
     let icon_font = egui::FontId::new(15.0, egui::FontFamily::Name("lucide".into()));
-    let text_font = egui::FontId::proportional(13.0);
+    let text_font = egui::FontId::proportional(crate::ui::scaled_font_size(13.0));
     let icon_galley =
         painter.layout_no_wrap(Icon::Plus.unicode().into(), icon_font, Color32::WHITE);
     let text_galley = painter.layout_no_wrap(label.into(), text_font, Color32::WHITE);

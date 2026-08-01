@@ -66,6 +66,10 @@ jobs:
           "TORTO_VERSION=$($package.version)" >> $env:GITHUB_ENV
           "version=$($package.version)" >> $env:GITHUB_OUTPUT
 
+      - name: Validate release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        run: python scripts/validate_release_notes.py "${{ github.ref_name }}"
+
       - name: Run tests
         run: cargo test --locked --workspace
 
@@ -108,4 +112,5 @@ jobs:
         with:
           files: dist/*.msi
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+          append_body: false

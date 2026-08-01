@@ -1,14 +1,14 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use rebook_publication::{Block, BookSource, Inline, SourceAnchor, SourceRange};
+use rebook_publication::{Block, BookSource, Inline, RenditionLayout, SourceRange};
 use rebook_reader::ReaderVisibleTextFragment;
 
 use crate::platform::UserEvent;
 use crate::plugins::{
-    BookSearchResult, ChatCommand, ChatCommandResolution, ChatResponse, ChatRole, ChatTurn,
-    TranslationBlockInput, chat_with_book, resolve_chat_command, search_book, section_title,
-    translate_blocks,
+    BookSearchResult, ChatAnnotationAction, ChatCommand, ChatCommandResolution, ChatReadingContext,
+    ChatResponse, ChatRole, ChatSelection, ChatTurn, TranslationBlockInput, chat_citation_link,
+    chat_with_book, resolve_chat_command, search_book, section_title, translate_blocks,
 };
 
 use super::chat_autocomplete::{
@@ -64,10 +64,14 @@ impl DesktopReader {
                 let payload = request.payload;
                 let result = chat_with_book(
                     payload.source,
+                    payload.rewrite_source,
+                    payload.book_id,
+                    payload.selection,
+                    payload.annotations,
                     payload.settings,
                     payload.history,
                     payload.question,
-                    payload.current_section,
+                    payload.current,
                     payload.response_language,
                     move |content| {
                         let _ = stream_proxy.send_event(UserEvent::ReaderChatStream(
@@ -342,7 +346,7 @@ impl DesktopReader {
             } else {
                 book_title
             },
-            link: "rebook://book".into(),
+            link: "link:/book".into(),
             excerpt: None,
         }];
 
@@ -359,7 +363,7 @@ impl DesktopReader {
                 } else {
                     format!("当前章节 · {}", section_index + 1)
                 },
-                link: format!("rebook://j/{section_index}"),
+                link: chat_citation_link(section_index, None),
                 excerpt: None,
             });
         }
@@ -445,26 +449,24 @@ impl DesktopReader {
 
     pub(super) fn open_chat_citation(&mut self, locator: &str) {
         let Some(citation) = parse_chat_citation(locator) else {
+            self.chat.error = Some(
+                self.language
+                    .text("引用链接无效", "Invalid citation link")
+                    .into(),
+            );
             return;
         };
         let target_range = citation.node.as_deref().and_then(|node| {
             source_range_for_node(self.source.as_ref(), citation.section_index, node)
         });
-        let result = if let Some(node) = citation.node {
-            if let Some(section) = self.source.book().sections.get(citation.section_index) {
-                self.reader.go_to_source(&SourceAnchor {
-                    spine: section.id.clone(),
-                    node,
-                    text_offset: 0,
-                })
-            } else {
-                self.reader.go_to_section(citation.section_index)
-            }
+        let result = if let Some(range) = &target_range {
+            self.reader.go_to_source(&range.start)
         } else {
             self.reader.go_to_section(citation.section_index)
         };
         match result {
             Ok(result) => {
+                self.focused_mark = target_range.map(|range| FocusedMark::assistant(vec![range]));
                 self.apply_snapshot(
                     result.snapshot,
                     SnapshotEffects {
@@ -472,7 +474,6 @@ impl DesktopReader {
                         ..SnapshotEffects::navigation()
                     },
                 );
-                self.focused_mark = target_range.map(|range| FocusedMark::assistant(vec![range]));
             }
             Err(error) => {
                 self.chat.error = Some(format!(
@@ -510,12 +511,20 @@ impl DesktopReader {
         let history_turns = history.len();
         let question_chars = question.chars().count();
         let question_lines = question.lines().count();
+        let current = self.chat_reading_context();
         let id = self.chat.task.begin(ChatTask {
             source: Arc::clone(&self.source),
+            rewrite_source: Arc::clone(&self.rewrite_source),
+            book_id: self.book_id.clone(),
+            selection: self.selection.as_ref().map(|selection| ChatSelection {
+                text: selection.text.clone(),
+                ranges: selection.ranges.clone(),
+            }),
+            annotations: self.highlights.clone(),
             settings: self.plugin_settings.clone(),
             history,
             question,
-            current_section: self.snapshot.location.section_index,
+            current,
             response_language: self.language.translation_target().into(),
         });
         self.chat.streaming = Some(ChatStreamingState {
@@ -533,6 +542,71 @@ impl DesktopReader {
         );
     }
 
+    fn chat_reading_context(&self) -> ChatReadingContext {
+        let location = self.snapshot.location;
+        let active_toc = self
+            .snapshot
+            .active_toc_id
+            .as_deref()
+            .and_then(|id| self.reader.toc_items().iter().find(|item| item.id == id));
+        let toc_label = active_toc.map(|item| item.label.clone());
+        let toc_href = active_toc
+            .and_then(|item| item.target.as_ref())
+            .map(ToString::to_string);
+        let book = self.source.book();
+        let fixed_page = book.metadata.layout == RenditionLayout::PrePaginated;
+        let spine = book.sections.get(location.section_index);
+        let current_title = if fixed_page {
+            toc_label
+                .clone()
+                .unwrap_or_else(|| format!("第 {} 页", location.section_index + 1))
+        } else {
+            section_title(self.source.as_ref(), location.section_index, &[])
+        };
+        let to_f64 = |value: usize| f64::from(u32::try_from(value).unwrap_or(u32::MAX));
+        let page_fraction = if location.page_count <= 1 {
+            0.0
+        } else {
+            to_f64(location.page_index) / to_f64(location.page_count - 1)
+        };
+        let section_fraction = ((to_f64(location.segment_index) + page_fraction)
+            / to_f64(location.segment_count.max(1)))
+        .clamp(0.0, 1.0);
+        ChatReadingContext {
+            unit_index: location.section_index,
+            unit_id: spine.map(|item| item.id.as_str().to_owned()),
+            unit_kind: if fixed_page { "page" } else { "section" }.into(),
+            unit_title: Some(current_title.clone()),
+            section_index: location.section_index,
+            section_id: if fixed_page {
+                None
+            } else {
+                spine.map(|item| item.id.as_str().to_owned())
+            },
+            section_title: if fixed_page {
+                None
+            } else {
+                Some(current_title)
+            },
+            toc_label,
+            toc_href,
+            section_fraction,
+            total_fraction: self.snapshot.total_progression,
+            segment_index: location.segment_index,
+            segment_count: location.segment_count,
+            page_index: if fixed_page {
+                location.section_index
+            } else {
+                location.page_index
+            },
+            page_count: if fixed_page {
+                book.sections.len()
+            } else {
+                location.page_count
+            },
+        }
+    }
+
     pub(crate) fn complete_chat(&mut self, message: ChatTaskMessage) {
         if self.chat.task.complete(message.id).is_none() {
             crate::diagnostics::log(
@@ -545,20 +619,7 @@ impl DesktopReader {
         match message.result {
             Ok(response) => {
                 log_completed_chat(message.id, &response);
-                if !response.rewrites.is_empty() {
-                    let transaction = match self.rewrite_source.apply_rewrites(&response.rewrites) {
-                        Ok(transaction) => transaction,
-                        Err(error) => {
-                            self.chat.error = Some(format!(
-                                "{}: {error}",
-                                self.language.text(
-                                    "应用正文改写失败",
-                                    "Failed to apply the content rewrite"
-                                )
-                            ));
-                            return;
-                        }
-                    };
+                if !response.rewrite_transactions.is_empty() {
                     match self.reader.refresh_source() {
                         Ok(snapshot) => {
                             self.apply_snapshot(
@@ -570,7 +631,14 @@ impl DesktopReader {
                             );
                         }
                         Err(error) => {
-                            let rollback_error = self.rewrite_source.rollback(transaction).err();
+                            let rollback_error = response
+                                .rewrite_transactions
+                                .clone()
+                                .into_iter()
+                                .rev()
+                                .find_map(|transaction| {
+                                    self.rewrite_source.rollback(transaction).err()
+                                });
                             self.chat.error = Some(match (self.language, rollback_error) {
                                 (
                                     crate::preferences::AppLanguage::SimplifiedChinese,
@@ -602,6 +670,9 @@ impl DesktopReader {
                     content: response.content,
                     display_content: None,
                 });
+                if !response.annotation_actions.is_empty() {
+                    self.chat.pending_annotation_actions = response.annotation_actions;
+                }
                 self.chat.error = None;
             }
             Err(error) => {
@@ -637,8 +708,47 @@ impl DesktopReader {
     pub(super) fn clear_chat(&mut self) {
         if !self.chat.task.is_pending() {
             self.chat.messages.clear();
+            self.chat.pending_annotation_actions.clear();
             self.chat.error = None;
         }
+    }
+
+    pub(super) fn confirm_chat_annotation_actions(&mut self) {
+        let actions = std::mem::take(&mut self.chat.pending_annotation_actions);
+        let mut error = None;
+        for action in actions {
+            let result = match action {
+                ChatAnnotationAction::Create(annotation) => {
+                    self.highlight_store.insert(&annotation).map(|()| true)
+                }
+                ChatAnnotationAction::Update(annotation) => {
+                    self.highlight_store.update(&annotation)
+                }
+                ChatAnnotationAction::Delete { annotation_id } => {
+                    self.highlight_store.remove(&annotation_id)
+                }
+            };
+            if let Err(action_error) = result {
+                error = Some(action_error.to_string());
+                break;
+            }
+        }
+        self.highlights = self.highlight_store.for_book(&self.book_id);
+        self.selected_highlight_id = None;
+        self.bump_scene_revision();
+        self.chat.error = error.map(|error| {
+            format!(
+                "{}: {error}",
+                self.language.text(
+                    "应用 AI 批注操作失败",
+                    "Failed to apply AI annotation actions"
+                )
+            )
+        });
+    }
+
+    pub(super) fn cancel_chat_annotation_actions(&mut self) {
+        self.chat.pending_annotation_actions.clear();
     }
 
     pub(super) fn toggle_translation(&mut self) {
@@ -873,7 +983,7 @@ fn paragraph_reference(
         } else {
             format!("段落 {paragraph_index} · {section_title}")
         },
-        link: format!("rebook://j/{section_index}/{node}"),
+        link: chat_citation_link(section_index, Some(node)),
         excerpt: Some(excerpt),
     }
 }
@@ -894,6 +1004,7 @@ fn log_completed_chat(id: u64, response: &ChatResponse) {
             crate::diagnostics::Field::Usize("svg_previews", summary.svg_previews),
             crate::diagnostics::Field::Usize("mermaid_previews", summary.mermaid_previews),
             crate::diagnostics::Field::Usize("formulas", summary.formulas),
+            crate::diagnostics::Field::Usize("citations", summary.citations),
         ],
     );
 }
@@ -925,7 +1036,7 @@ fn selection_reference(
         } else {
             format!("选中段落 · {title}")
         },
-        link: format!("rebook://j/{section_index}/{}", range.start.node),
+        link: chat_citation_link(section_index, Some(&range.start.node)),
         excerpt: paragraph
             .filter(|text| !text.trim().is_empty())
             .map(|text| clip_chat_reference_text(&text, 500)),

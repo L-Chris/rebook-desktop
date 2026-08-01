@@ -36,7 +36,7 @@ const TOOLBAR_HEIGHT: f32 = 48.0;
 const TOOLBAR_CONTROL_SIZE: f32 = 32.0;
 const TOOLBAR_TITLE_SIZE: f32 = 15.0;
 const WHEEL_PAGE_THRESHOLD: f32 = 18.0;
-const WHEEL_TURN_COOLDOWN: Duration = Duration::from_millis(180);
+const WHEEL_TURN_COOLDOWN: Duration = Duration::from_millis(120);
 
 #[derive(Clone, Copy)]
 struct AssistantComposerKeys {
@@ -453,7 +453,7 @@ impl DesktopReader {
                         ui.label(
                             RichText::new(&self.display_metadata.title)
                                 .color(palette().text)
-                                .size(TOOLBAR_TITLE_SIZE),
+                                .size(crate::ui::scaled_font_size(TOOLBAR_TITLE_SIZE)),
                         );
                         ui.scope_builder(
                             egui::UiBuilder::new()
@@ -625,7 +625,7 @@ impl DesktopReader {
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
                     self.format.label(),
-                    egui::FontId::proportional(10.0),
+                    egui::FontId::proportional(crate::ui::scaled_font_size(10.0)),
                     palette().accent,
                 );
             }
@@ -642,7 +642,11 @@ impl DesktopReader {
                     .on_hover_text(&self.display_metadata.title);
                     let authors = self.display_metadata.authors.join(" / ");
                     if !authors.is_empty() {
-                        ui.label(RichText::new(authors).size(12.0).color(palette().muted));
+                        ui.label(
+                            RichText::new(authors)
+                                .size(crate::ui::scaled_font_size(12.0))
+                                .color(palette().muted),
+                        );
                     }
                 },
             );
@@ -776,7 +780,7 @@ impl DesktopReader {
                                 [quote_width, row_height],
                                 egui::Button::selectable(
                                     selected,
-                                    RichText::new(&label).size(12.0),
+                                    RichText::new(&label).size(crate::ui::scaled_font_size(12.0)),
                                 )
                                 .truncate(),
                             )
@@ -831,7 +835,7 @@ impl DesktopReader {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(&self.search.status)
-                    .size(12.0)
+                    .size(crate::ui::scaled_font_size(12.0))
                     .color(palette().muted),
             );
         }
@@ -839,7 +843,7 @@ impl DesktopReader {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for result in results {
                 if ui
-                    .button(RichText::new(&result.excerpt).size(12.0))
+                    .button(RichText::new(&result.excerpt).size(crate::ui::scaled_font_size(12.0)))
                     .clicked()
                 {
                     self.go_to_search_result(&result);
@@ -856,14 +860,24 @@ impl DesktopReader {
             u16::try_from(self.chat.references.len().div_ceil(2)).unwrap_or(u16::MAX);
         let reference_height = f32::from(reference_rows) * 28.0;
         let error_height = if self.chat.error.is_some() { 54.0 } else { 0.0 };
+        let confirmation_height = if self.chat.pending_annotation_actions.is_empty() {
+            0.0
+        } else {
+            78.0 + 18.0
+                * f32::from(
+                    u16::try_from(self.chat.pending_annotation_actions.len().min(3)).unwrap_or(3),
+                )
+        };
         let conversation_height = (ui.available_height()
             - ASSISTANT_COMPOSER_RESERVED_HEIGHT
             - ASSISTANT_BOTTOM_PADDING
             - reference_height
-            - error_height)
+            - error_height
+            - confirmation_height)
             .max(96.0);
         self.assistant_conversation(ui, conversation_height, busy);
         self.assistant_error(ui);
+        self.assistant_annotation_confirmation(ui);
         self.assistant_composer(ui);
     }
 
@@ -876,7 +890,7 @@ impl DesktopReader {
                 ui.label(icon(Icon::MessageCircle).color(palette().muted));
                 ui.label(
                     RichText::new(self.language.text("AI 对话", "AI chat"))
-                        .size(14.0)
+                        .size(crate::ui::scaled_font_size(14.0))
                         .strong()
                         .color(palette().text),
                 );
@@ -943,7 +957,7 @@ impl DesktopReader {
                                     "可以总结章节、解释选中的段落，\n或搜索书中的概念。",
                                     "Summarize sections, explain a selection,\nor find concepts in the book.",
                                 ))
-                                .size(12.0)
+                                .size(crate::ui::scaled_font_size(12.0))
                                 .color(palette().muted),
                             );
                         },
@@ -1000,8 +1014,77 @@ impl DesktopReader {
                 .corner_radius(8)
                 .inner_margin(9)
                 .show(ui, |ui| {
-                    ui.label(RichText::new(error).size(12.0).color(palette().error_text));
+                    ui.label(
+                        RichText::new(error)
+                            .size(crate::ui::scaled_font_size(12.0))
+                            .color(palette().error_text),
+                    );
                 });
+        }
+    }
+
+    fn assistant_annotation_confirmation(&mut self, ui: &mut egui::Ui) {
+        let count = self.chat.pending_annotation_actions.len();
+        if count == 0 {
+            return;
+        }
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Frame::new()
+            .fill(palette().surface)
+            .stroke(egui::Stroke::new(1.0, palette().border))
+            .corner_radius(8)
+            .inner_margin(9)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(match self.language {
+                        crate::preferences::AppLanguage::SimplifiedChinese => {
+                            format!("AI 请求执行 {count} 项批注操作")
+                        }
+                        crate::preferences::AppLanguage::English => {
+                            format!("AI requested {count} annotation action(s)")
+                        }
+                    })
+                    .size(crate::ui::scaled_font_size(12.0))
+                    .color(palette().text),
+                );
+                for action in self.chat.pending_annotation_actions.iter().take(3) {
+                    let detail = match action {
+                        crate::plugins::ChatAnnotationAction::Create(annotation) => format!(
+                            "{}: {}",
+                            self.language.text("新增", "Create"),
+                            clipped_annotation_action_text(&annotation.quote)
+                        ),
+                        crate::plugins::ChatAnnotationAction::Update(annotation) => format!(
+                            "{}: {}",
+                            self.language.text("修改", "Update"),
+                            clipped_annotation_action_text(
+                                annotation.note.as_deref().unwrap_or("（清空批注）")
+                            )
+                        ),
+                        crate::plugins::ChatAnnotationAction::Delete { annotation_id } => {
+                            format!(
+                                "{}: {}",
+                                self.language.text("删除", "Delete"),
+                                clipped_annotation_action_text(annotation_id)
+                            )
+                        }
+                    };
+                    ui.label(
+                        RichText::new(detail)
+                            .size(crate::ui::scaled_font_size(11.0))
+                            .color(palette().muted),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    confirm = ui.button(self.language.text("确认", "Confirm")).clicked();
+                    cancel = ui.button(self.language.text("取消", "Cancel")).clicked();
+                });
+            });
+        if confirm {
+            self.confirm_chat_annotation_actions();
+        } else if cancel {
+            self.cancel_chat_annotation_actions();
         }
     }
 
@@ -1557,10 +1640,14 @@ fn chat_reference_chips(
             let label = format!("{kind} · {}  ×", reference.label);
             if ui
                 .add(
-                    egui::Button::new(RichText::new(label).size(10.5).color(palette().accent))
-                        .fill(palette().accent_soft)
-                        .stroke(egui::Stroke::new(1.0, palette().border))
-                        .corner_radius(10),
+                    egui::Button::new(
+                        RichText::new(label)
+                            .size(crate::ui::scaled_font_size(10.5))
+                            .color(palette().accent),
+                    )
+                    .fill(palette().accent_soft)
+                    .stroke(egui::Stroke::new(1.0, palette().border))
+                    .corner_radius(10),
                 )
                 .on_hover_text(&reference.description)
                 .clicked()
@@ -1729,12 +1816,12 @@ fn annotation_editor(
     ui.horizontal(|ui| {
         ui.label(
             icon(Icon::MessageSquarePlus)
-                .size(16.0)
+                .size(crate::ui::scaled_font_size(16.0))
                 .color(palette().accent),
         );
         ui.label(
             RichText::new(language.text("添加批注", "Add annotation"))
-                .size(13.0)
+                .size(crate::ui::scaled_font_size(13.0))
                 .strong()
                 .color(palette().text),
         );
@@ -1814,11 +1901,13 @@ fn annotation_action_button(
     primary: bool,
     enabled: bool,
 ) -> egui::Response {
-    let text = RichText::new(label).size(12.0).color(if primary {
-        Color32::WHITE
-    } else {
-        palette().text
-    });
+    let text = RichText::new(label)
+        .size(crate::ui::scaled_font_size(12.0))
+        .color(if primary {
+            Color32::WHITE
+        } else {
+            palette().text
+        });
     ui.add_enabled(
         enabled,
         egui::Button::new(text)
@@ -1835,6 +1924,14 @@ fn annotation_action_button(
             .corner_radius(6)
             .min_size(Vec2::new(68.0, 30.0)),
     )
+}
+
+fn clipped_annotation_action_text(value: &str) -> String {
+    let mut clipped = value.chars().take(48).collect::<String>();
+    if value.chars().count() > 48 {
+        clipped.push('…');
+    }
+    clipped
 }
 
 fn chat_message_card(
@@ -1873,7 +1970,7 @@ fn chat_message_card(
                 } else {
                     "Torto AI"
                 })
-                .size(10.5)
+                .size(crate::ui::scaled_font_size(10.5))
                 .strong()
                 .color(if is_user {
                     palette().accent
@@ -1884,9 +1981,13 @@ fn chat_message_card(
             ui.add_space(3.0);
             if is_user {
                 ui.add(
-                    egui::Label::new(RichText::new(content).size(12.5).color(palette().text))
-                        .wrap()
-                        .selectable(true),
+                    egui::Label::new(
+                        RichText::new(content)
+                            .size(crate::ui::scaled_font_size(12.5))
+                            .color(palette().text),
+                    )
+                    .wrap()
+                    .selectable(true),
                 );
             } else {
                 clicked_citation = markdown.show(ui, content, language, message_ordinal, streaming);
@@ -1914,7 +2015,7 @@ mod reference_suggestion_label_tests {
             kind,
             label: label.into(),
             description: description.into(),
-            link: "rebook://test".into(),
+            link: "link:/test".into(),
             excerpt: None,
         }
     }

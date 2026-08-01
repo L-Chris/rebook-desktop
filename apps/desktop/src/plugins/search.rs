@@ -1,5 +1,6 @@
 use rebook_publication::{
-    Block, BookSource, Inline, SourceAnchor, SourceRange, TextBlock, TextBlockKind, TocEntry,
+    Block, BookSource, Inline, RenditionLayout, SourceAnchor, SourceRange, TextBlock,
+    TextBlockKind, TocEntry,
 };
 use regex::RegexBuilder;
 
@@ -11,6 +12,7 @@ pub struct BookSearchResult {
     pub section_title: String,
     pub excerpt: String,
     pub matched_text: String,
+    pub block_kind: String,
     pub range: SourceRange,
 }
 
@@ -18,6 +20,27 @@ pub fn search_book(
     source: &dyn BookSource,
     query: &str,
     max_results: usize,
+) -> Result<Vec<BookSearchResult>, String> {
+    search_sections(source, query, max_results, 0..source.book().sections.len())
+}
+
+pub(crate) fn search_section(
+    source: &dyn BookSource,
+    query: &str,
+    section_index: usize,
+    max_results: usize,
+) -> Result<Vec<BookSearchResult>, String> {
+    if section_index >= source.book().sections.len() {
+        return Err(format!("章节索引超出范围：{section_index}"));
+    }
+    search_sections(source, query, max_results, section_index..=section_index)
+}
+
+fn search_sections(
+    source: &dyn BookSource,
+    query: &str,
+    max_results: usize,
+    sections: impl IntoIterator<Item = usize>,
 ) -> Result<Vec<BookSearchResult>, String> {
     let query = query.trim();
     if query.is_empty() || max_results == 0 {
@@ -28,28 +51,31 @@ pub fn search_book(
         .unicode(true)
         .build()
         .map_err(|error| format!("搜索表达式无效：{error}"))?;
-    let book = source.book();
     let mut results = Vec::new();
 
-    for section_index in 0..book.sections.len() {
+    for section_index in sections {
         let section = source
             .parse_section(section_index)
             .map_err(|error| format!("解析第 {} 节失败：{error}", section_index + 1))?;
         let section_title = section_title(source, section_index, &section.blocks);
         for block in &section.blocks {
-            let (text, source_range) = match block {
+            let (text, source_range, block_kind) = match block {
                 Block::Text(block) => {
                     let Some(source_range) = &block.source else {
                         continue;
                     };
-                    (text_block_text(block), source_range)
+                    (
+                        text_block_text(block),
+                        source_range,
+                        text_block_kind(block).to_owned(),
+                    )
                 }
                 Block::Image(image) => {
                     let (Some(layer), Some(source_range)) = (&image.text_layer, &image.source)
                     else {
                         continue;
                     };
-                    (layer.text.clone(), source_range)
+                    (layer.text.clone(), source_range, "image-text".into())
                 }
                 Block::Separator | Block::PageBreak => continue,
             };
@@ -60,6 +86,7 @@ pub fn search_book(
                     section_title: section_title.clone(),
                     excerpt: excerpt(&text, found.start(), found.end(), DEFAULT_CONTEXT_CHARS),
                     matched_text: found.as_str().to_owned(),
+                    block_kind: block_kind.clone(),
                     range,
                 });
                 if results.len() >= max_results {
@@ -71,26 +98,14 @@ pub fn search_book(
     Ok(results)
 }
 
-pub(crate) fn section_text(
-    source: &dyn BookSource,
-    section_index: usize,
-) -> Result<String, String> {
-    let section = source
-        .parse_section(section_index)
-        .map_err(|error| format!("解析第 {} 节失败：{error}", section_index + 1))?;
-    Ok(section
-        .blocks
-        .iter()
-        .filter_map(|block| match block {
-            Block::Text(block) => Some(text_block_text(block)),
-            Block::Image(image) if image.text_layer.is_some() => {
-                image.text_layer.as_ref().map(|layer| layer.text.clone())
-            }
-            Block::Image(image) if !image.alt.trim().is_empty() => Some(image.alt.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n"))
+pub(crate) fn text_block_kind(block: &TextBlock) -> &'static str {
+    match block.kind {
+        TextBlockKind::Paragraph => "paragraph",
+        TextBlockKind::Heading(_) => "heading",
+        TextBlockKind::Blockquote => "blockquote",
+        TextBlockKind::Preformatted => "preformatted",
+        TextBlockKind::ListItem { .. } => "list-item",
+    }
 }
 
 pub(crate) fn text_block_text(block: &TextBlock) -> String {
@@ -109,6 +124,12 @@ pub(crate) fn section_title(
     section_index: usize,
     blocks: &[Block],
 ) -> String {
+    let book = source.book();
+    if book.metadata.layout == RenditionLayout::PrePaginated {
+        let href = &book.sections[section_index].href;
+        return toc_label_for_href(&book.table_of_contents, href)
+            .unwrap_or_else(|| format!("第 {} 页", section_index + 1));
+    }
     if let Some(title) = blocks.iter().find_map(|block| match block {
         Block::Text(block) if matches!(block.kind, TextBlockKind::Heading(_)) => {
             let text = text_block_text(block);
@@ -118,7 +139,6 @@ pub(crate) fn section_title(
     }) {
         return title;
     }
-    let book = source.book();
     let href = &book.sections[section_index].href;
     toc_label_for_href(&book.table_of_contents, href)
         .unwrap_or_else(|| format!("第 {} 节", section_index + 1))
@@ -272,6 +292,7 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].matched_text, "Systems");
+        assert_eq!(results[0].block_kind, "paragraph");
         assert_eq!(results[0].range.start.text_offset, 4);
         assert_eq!(results[0].range.end.text_offset, 11);
         assert_eq!(results[1].range.start.text_offset, 34);
@@ -341,6 +362,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].matched_text, "PDF");
+        assert_eq!(results[0].block_kind, "image-text");
         assert_eq!(results[0].range.start.text_offset, 5);
         assert_eq!(results[0].range.end.text_offset, 8);
     }

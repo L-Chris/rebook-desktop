@@ -13,7 +13,7 @@ pub struct BlockRewrite {
     pub text: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RewriteTransaction {
     previous: Vec<(RewriteKey, Option<String>)>,
 }
@@ -69,6 +69,54 @@ impl RewriteBookSource {
             }
         }
         Ok(())
+    }
+
+    pub fn list_rewrites(&self, section_index: Option<usize>) -> Result<Vec<BlockRewrite>, String> {
+        let store = self
+            .rewrites
+            .read()
+            .map_err(|_| "正文改写状态已损坏".to_owned())?;
+        let mut rewrites = store
+            .iter()
+            .filter(|(key, _)| section_index.is_none_or(|index| key.section_index == index))
+            .map(|(key, text)| BlockRewrite {
+                section_index: key.section_index,
+                block_id: key.block_id.clone(),
+                text: text.clone(),
+            })
+            .collect::<Vec<_>>();
+        rewrites.sort_by(|left, right| {
+            (left.section_index, &left.block_id).cmp(&(right.section_index, &right.block_id))
+        });
+        Ok(rewrites)
+    }
+
+    pub fn clear_rewrites(
+        &self,
+        section_index: Option<usize>,
+    ) -> Result<(RewriteTransaction, Vec<BlockRewrite>), String> {
+        let mut store = self
+            .rewrites
+            .write()
+            .map_err(|_| "正文改写状态已损坏".to_owned())?;
+        let keys = store
+            .keys()
+            .filter(|key| section_index.is_none_or(|index| key.section_index == index))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut previous = Vec::with_capacity(keys.len());
+        let mut cleared = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(text) = store.remove(&key) {
+                cleared.push(BlockRewrite {
+                    section_index: key.section_index,
+                    block_id: key.block_id.clone(),
+                    text: text.clone(),
+                });
+                previous.push((key, Some(text)));
+            }
+        }
+        Ok((RewriteTransaction { previous }, cleared))
     }
 }
 
@@ -260,5 +308,25 @@ mod tests {
             panic!("expected text block");
         };
         assert_eq!(block.source.as_ref().unwrap().end.text_offset, 8);
+    }
+
+    #[test]
+    fn lists_clears_and_restores_rewrites_transactionally() {
+        let source = RewriteBookSource::new(source());
+        source
+            .apply_rewrites(&[BlockRewrite {
+                section_index: 0,
+                block_id: "paragraph-1".into(),
+                text: "rewritten".into(),
+            }])
+            .unwrap();
+
+        assert_eq!(source.list_rewrites(None).unwrap().len(), 1);
+        let (transaction, cleared) = source.clear_rewrites(Some(0)).unwrap();
+        assert_eq!(cleared.len(), 1);
+        assert!(source.list_rewrites(None).unwrap().is_empty());
+
+        source.rollback(transaction).unwrap();
+        assert_eq!(source.list_rewrites(Some(0)).unwrap()[0].text, "rewritten");
     }
 }

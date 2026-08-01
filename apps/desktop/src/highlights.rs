@@ -42,6 +42,7 @@ impl StoredHighlight {
 pub(crate) trait HighlightRepository: Send + Sync {
     fn highlights_for_book(&self, book_id: &str) -> HighlightResult<Vec<StoredHighlight>>;
     fn insert_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<()>;
+    fn update_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<bool>;
     fn remove_highlight(&self, id: &str) -> HighlightResult<bool>;
 }
 
@@ -67,6 +68,10 @@ impl HighlightStore {
 
     pub fn insert(&mut self, highlight: &StoredHighlight) -> HighlightResult<()> {
         self.repository.insert_highlight(highlight)
+    }
+
+    pub fn update(&mut self, highlight: &StoredHighlight) -> HighlightResult<bool> {
+        self.repository.update_highlight(highlight)
     }
 
     pub fn remove(&mut self, id: &str) -> HighlightResult<bool> {
@@ -111,6 +116,15 @@ mod tests {
         fn insert_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<()> {
             self.highlights.lock().unwrap().push(highlight.clone());
             Ok(())
+        }
+
+        fn update_highlight(&self, highlight: &StoredHighlight) -> HighlightResult<bool> {
+            let mut highlights = self.highlights.lock().unwrap();
+            let Some(existing) = highlights.iter_mut().find(|item| item.id == highlight.id) else {
+                return Ok(false);
+            };
+            *existing = highlight.clone();
+            Ok(true)
         }
 
         fn remove_highlight(&self, id: &str) -> HighlightResult<bool> {
@@ -171,5 +185,22 @@ mod tests {
             new_store(&repository).for_book("book-a")[0].note.as_deref(),
             Some("my note")
         );
+    }
+
+    #[test]
+    fn annotation_note_can_be_updated() {
+        let repository = MemoryRepository::default();
+        let mut store = new_store(&repository);
+        let mut highlight = StoredHighlight::with_note(
+            "book-a".into(),
+            Vec::new(),
+            "quote".into(),
+            Some("old".into()),
+        );
+        store.insert(&highlight).unwrap();
+        highlight.note = Some("new".into());
+
+        assert!(store.update(&highlight).unwrap());
+        assert_eq!(store.for_book("book-a")[0].note.as_deref(), Some("new"));
     }
 }

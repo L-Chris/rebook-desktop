@@ -6,7 +6,7 @@ use vello::Scene;
 
 use crate::library::LocalLibrary;
 use crate::platform::UserEvent;
-use crate::preferences::AppTheme;
+use crate::preferences::{AppTheme, InterfaceTypography};
 use crate::reader::{
     ChatStreamMessage, ChatTaskMessage, SearchTaskMessage, TocTranslationTaskMessage,
     TranslationTaskMessage,
@@ -159,6 +159,7 @@ impl DesktopApp {
             return;
         }
         let applied = self.settings.applied().clone();
+        crate::ui::apply_interface_typography(ctx, &applied.interface_typography);
         if applied.theme != crate::ui::theme() {
             crate::ui::set_theme(applied.theme);
             crate::ui::apply_visuals(ctx, &crate::ui::palette());
@@ -173,5 +174,9 @@ impl DesktopApp {
 
     pub(crate) fn theme(&self) -> AppTheme {
         self.settings.applied().theme
+    }
+
+    pub(crate) fn interface_typography(&self) -> &InterfaceTypography {
+        &self.settings.applied().interface_typography
     }
 }

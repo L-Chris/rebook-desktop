@@ -116,7 +116,7 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
 fn settings_sidebar(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     ui.heading(
         RichText::new(state.draft_language.text("设置", "Settings"))
-            .size(19.0)
+            .size(crate::ui::scaled_font_size(19.0))
             .color(palette().text),
     );
     ui.add_space(18.0);
@@ -163,7 +163,11 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 SettingsTab::Translation => state.draft_language.text("翻译", "Translation"),
                 SettingsTab::Cloud => state.draft_language.text("云盘同步", "Cloud sync"),
             };
-            ui.heading(RichText::new(title).size(18.0).color(palette().text));
+            ui.heading(
+                RichText::new(title)
+                    .size(crate::ui::scaled_font_size(18.0))
+                    .color(palette().text),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, Icon::X)
                     .on_hover_text(state.draft_language.text("关闭", "Close"))
@@ -318,9 +322,71 @@ fn reading_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
 
 fn font_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     let language = state.draft_language;
-    let typography = &mut state.draft_typography;
-    let font_families = &state.available_font_families;
+    interface_font_settings(
+        ui,
+        language,
+        &mut state.draft_interface_typography,
+        &state.available_interface_font_families,
+    );
+    ui.add_space(12.0);
+    reader_font_settings(
+        ui,
+        language,
+        &mut state.draft_typography,
+        &state.available_font_families,
+    );
+}
+
+fn interface_font_settings(
+    ui: &mut egui::Ui,
+    language: AppLanguage,
+    interface_typography: &mut crate::preferences::InterfaceTypography,
+    interface_font_families: &[String],
+) {
     settings_card(ui, |ui| {
+        ui.label(
+            RichText::new(language.text("界面与 AI 对话", "Interface and AI chat"))
+                .strong()
+                .color(palette().text),
+        );
+        ui.add_space(12.0);
+        egui::Grid::new("interface-font-settings-grid")
+            .num_columns(2)
+            .spacing([24.0, 16.0])
+            .show(ui, |ui| {
+                font_family_row(
+                    ui,
+                    language.text("界面字体", "Interface font"),
+                    "settings-interface-font",
+                    &mut interface_typography.font_family,
+                    interface_font_families,
+                );
+                settings_slider_row(
+                    ui,
+                    language.text("界面字号", "Interface font size"),
+                    &mut interface_typography.font_size,
+                    10.0,
+                    24.0,
+                    1.0,
+                    " px",
+                );
+            });
+    });
+}
+
+fn reader_font_settings(
+    ui: &mut egui::Ui,
+    language: AppLanguage,
+    typography: &mut rebook_layout::ReaderTypography,
+    font_families: &[String],
+) {
+    settings_card(ui, |ui| {
+        ui.label(
+            RichText::new(language.text("阅读正文", "Reading content"))
+                .strong()
+                .color(palette().text),
+        );
+        ui.add_space(12.0);
         egui::Grid::new("font-settings-grid")
             .num_columns(2)
             .spacing([24.0, 16.0])
@@ -786,7 +852,11 @@ fn target_language_label(value: &str, language: AppLanguage) -> String {
 }
 
 fn field_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).size(12.0).color(palette().muted));
+    ui.label(
+        RichText::new(text)
+            .size(crate::ui::scaled_font_size(12.0))
+            .color(palette().muted),
+    );
 }
 
 fn settings_row_label(ui: &mut egui::Ui, text: &str) {

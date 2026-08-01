@@ -13,11 +13,19 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use crate::preferences::AppLanguage;
 use crate::ui::{icon_button, palette};
 
-const MARKDOWN_FONT_SIZE: f32 = 12.5;
+const MARKDOWN_FONT_SIZE: f32 = 13.0;
 const MARKDOWN_HEADING_FONT_SIZE: f32 = 16.0;
 const PREVIEW_GAP: f32 = 8.0;
 const ASSET_REPAINT_INTERVAL: Duration = Duration::from_millis(50);
 const ASSET_RENDER_TIMEOUT: Duration = Duration::from_secs(8);
+
+fn markdown_font_size() -> f32 {
+    crate::ui::scaled_font_size(MARKDOWN_FONT_SIZE)
+}
+
+fn markdown_heading_font_size() -> f32 {
+    crate::ui::scaled_font_size(MARKDOWN_HEADING_FONT_SIZE)
+}
 
 pub(super) struct ChatMarkdownState {
     markdown_cache: CommonMarkCache,
@@ -90,32 +98,42 @@ impl ChatMarkdownState {
             return None;
         }
         let normalized = normalize_math_delimiters(markdown);
-        let markdown = normalized.as_ref();
+        let iconized = citation_icon_markdown(normalized.as_ref());
+        let markdown = iconized.as_ref();
         let layout_blocks = split_markdown_layout_blocks(markdown);
-        let citation_locators = citation_locators(markdown);
-        for locator in &citation_locators {
+        let all_citation_locators = citation_locators(markdown);
+        for locator in &all_citation_locators {
             self.markdown_cache.add_link_hook(locator);
         }
         let formula_assets = Arc::new(self.prepare_markdown_math(markdown));
         let cache = &mut self.markdown_cache;
+        let mut clicked = None;
         for (index, block) in layout_blocks.iter().enumerate() {
-            match block {
+            let block_clicked = match block {
                 MarkdownLayoutBlock::Markdown(source) => {
                     show_commonmark_fragment(ui, cache, source, &formula_assets);
+                    clicked_citation(cache, &all_citation_locators)
                 }
                 MarkdownLayoutBlock::Heading { level, source } => {
-                    show_markdown_heading(ui, *level, source, index > 0);
+                    if citation_locators(source).is_empty() {
+                        show_markdown_heading(ui, *level, source, index > 0);
+                        None
+                    } else {
+                        if index > 0 {
+                            ui.add_space(6.0);
+                        }
+                        let heading = format!("{} {source}", "#".repeat(*level));
+                        show_commonmark_fragment(ui, cache, &heading, &formula_assets);
+                        clicked_citation(cache, &all_citation_locators)
+                    }
                 }
                 MarkdownLayoutBlock::Table(table) => {
-                    show_markdown_table(ui, table);
+                    show_markdown_table(ui, table, cache, &formula_assets, &all_citation_locators)
                 }
-            }
+            };
+            clicked = clicked.or(block_clicked);
         }
-        let clicked = citation_locators
-            .iter()
-            .find(|locator| self.markdown_cache.get_link_hook(locator) == Some(true))
-            .cloned();
-        for locator in citation_locators {
+        for locator in all_citation_locators {
             self.markdown_cache.remove_link_hook(&locator);
         }
         clicked
@@ -144,7 +162,7 @@ impl ChatMarkdownState {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(kind.label())
-                            .size(11.0)
+                            .size(crate::ui::scaled_font_size(11.0))
                             .strong()
                             .color(palette().muted),
                     );
@@ -345,7 +363,7 @@ fn show_commonmark_fragment(
             paint_svg(ui, html.as_bytes(), "inline-svg", false);
         } else {
             ui.add(
-                egui::Label::new(RichText::new(html).monospace().size(MARKDOWN_FONT_SIZE))
+                egui::Label::new(RichText::new(html).monospace().size(markdown_font_size()))
                     .wrap()
                     .selectable(true),
             );
@@ -355,15 +373,15 @@ fn show_commonmark_fragment(
         ui.style_mut().interaction.selectable_labels = true;
         ui.style_mut().text_styles.insert(
             TextStyle::Body,
-            FontId::new(MARKDOWN_FONT_SIZE, FontFamily::Proportional),
+            FontId::new(markdown_font_size(), FontFamily::Proportional),
         );
         ui.style_mut().text_styles.insert(
             TextStyle::Heading,
-            FontId::new(MARKDOWN_HEADING_FONT_SIZE, FontFamily::Proportional),
+            FontId::new(markdown_heading_font_size(), FontFamily::Proportional),
         );
         ui.style_mut().text_styles.insert(
             TextStyle::Monospace,
-            FontId::new(12.0, FontFamily::Monospace),
+            FontId::new(crate::ui::scaled_font_size(12.0), FontFamily::Monospace),
         );
         egui_commonmark_backend::misc::set_strong_background_color(ui, palette().accent_soft);
         CommonMarkViewer::new()
@@ -379,9 +397,9 @@ fn show_markdown_heading(ui: &mut egui::Ui, level: usize, source: &str, add_top_
         ui.add_space(6.0);
     }
     let size = match level {
-        1 => MARKDOWN_HEADING_FONT_SIZE,
-        2 => 13.75,
-        _ => MARKDOWN_FONT_SIZE,
+        1 => markdown_heading_font_size(),
+        2 => crate::ui::scaled_font_size(13.75),
+        _ => markdown_font_size(),
     };
     ui.add(
         egui::Label::new(
@@ -396,11 +414,18 @@ fn show_markdown_heading(ui: &mut egui::Ui, level: usize, source: &str, add_top_
     ui.add_space(3.0);
 }
 
-fn show_markdown_table(ui: &mut egui::Ui, table: &MarkdownTable) {
+fn show_markdown_table(
+    ui: &mut egui::Ui,
+    table: &MarkdownTable,
+    cache: &mut CommonMarkCache,
+    formula_assets: &Arc<HashMap<AssetKey, AssetStatus>>,
+    all_citation_locators: &[String],
+) -> Option<String> {
     let column_count = table.rows.iter().map(Vec::len).max().unwrap_or_default();
     if column_count == 0 {
-        return;
+        return None;
     }
+    let mut clicked = None;
     let display_column_count = u16::try_from(column_count).unwrap_or(u16::MAX);
     let cell_width = (ui.available_width() / f32::from(display_column_count)).max(44.0);
     ui.add_space(3.0);
@@ -433,13 +458,20 @@ fn show_markdown_table(ui: &mut egui::Ui, table: &MarkdownTable) {
                             let content_width = (cell_width - 14.0).max(28.0);
                             ui.set_min_width(content_width);
                             ui.set_max_width(content_width);
-                            let mut text = RichText::new(text)
-                                .size(MARKDOWN_FONT_SIZE)
-                                .color(palette().text);
-                            if row_index == 0 {
-                                text = text.strong();
+                            if citation_locators(&text).is_empty() {
+                                let mut text = RichText::new(text)
+                                    .size(markdown_font_size())
+                                    .color(palette().text);
+                                if row_index == 0 {
+                                    text = text.strong();
+                                }
+                                ui.add(egui::Label::new(text).wrap().selectable(true));
+                            } else {
+                                show_commonmark_fragment(ui, cache, &text, formula_assets);
+                                clicked = clicked
+                                    .take()
+                                    .or_else(|| clicked_citation(cache, all_citation_locators));
                             }
-                            ui.add(egui::Label::new(text).wrap().selectable(true));
                         });
                 }
                 ui.end_row();
@@ -447,6 +479,7 @@ fn show_markdown_table(ui: &mut egui::Ui, table: &MarkdownTable) {
         });
     });
     ui.add_space(6.0);
+    clicked
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -619,7 +652,7 @@ fn paint_asset(
             if inline {
                 ui.label(
                     RichText::new("…")
-                        .size(MARKDOWN_FONT_SIZE)
+                        .size(markdown_font_size())
                         .color(palette().muted),
                 );
             } else {
@@ -627,7 +660,7 @@ fn paint_asset(
                     ui.spinner();
                     ui.label(
                         RichText::new("Rendering…")
-                            .size(11.5)
+                            .size(crate::ui::scaled_font_size(11.5))
                             .color(palette().muted),
                     );
                 });
@@ -707,9 +740,13 @@ fn preview_error(ui: &mut egui::Ui, error: &str) {
         .inner_margin(6)
         .show(ui, |ui| {
             ui.add(
-                egui::Label::new(RichText::new(error).size(11.5).color(palette().error_text))
-                    .wrap()
-                    .selectable(true),
+                egui::Label::new(
+                    RichText::new(error)
+                        .size(crate::ui::scaled_font_size(11.5))
+                        .color(palette().error_text),
+                )
+                .wrap()
+                .selectable(true),
             );
         });
 }
@@ -724,7 +761,7 @@ fn show_source_code(ui: &mut egui::Ui, source: &str) {
                 egui::Label::new(
                     RichText::new(source)
                         .monospace()
-                        .size(11.5)
+                        .size(crate::ui::scaled_font_size(11.5))
                         .color(palette().text),
                 )
                 .wrap()
@@ -1133,6 +1170,7 @@ pub(super) struct MarkdownDiagnosticSummary {
     pub(super) svg_previews: usize,
     pub(super) mermaid_previews: usize,
     pub(super) formulas: usize,
+    pub(super) citations: usize,
 }
 
 pub(super) fn diagnostic_summary(source: &str) -> MarkdownDiagnosticSummary {
@@ -1143,6 +1181,7 @@ pub(super) fn diagnostic_summary(source: &str) -> MarkdownDiagnosticSummary {
             .chars()
             .filter(|character| is_emoji_like(*character))
             .count(),
+        citations: citation_locators(source).len(),
         ..MarkdownDiagnosticSummary::default()
     };
     for block in &blocks {
@@ -1347,12 +1386,53 @@ fn citation_locators(markdown: &str) -> Vec<String> {
     for event in Parser::new_ext(markdown, markdown_options()) {
         if let Event::Start(Tag::Link { dest_url, .. }) = event {
             let locator = dest_url.as_ref();
-            if locator.starts_with("rebook://j/") && !locators.iter().any(|item| item == locator) {
+            if locator.starts_with("link:/j/") && !locators.iter().any(|item| item == locator) {
                 locators.push(locator.to_owned());
             }
         }
     }
     locators
+}
+
+fn clicked_citation(cache: &CommonMarkCache, locators: &[String]) -> Option<String> {
+    locators
+        .iter()
+        .find(|locator| cache.get_link_hook(locator) == Some(true))
+        .cloned()
+}
+
+fn citation_icon_markdown(markdown: &str) -> Cow<'_, str> {
+    let replacements = Parser::new_ext(markdown, markdown_options())
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            Event::Start(Tag::Link { dest_url, .. })
+                if dest_url.as_ref().starts_with("link:/j/") =>
+            {
+                Some((range, dest_url.to_string()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if replacements.is_empty() {
+        return Cow::Borrowed(markdown);
+    }
+
+    let mut output = String::with_capacity(markdown.len());
+    let mut cursor = 0;
+    for (range, locator) in replacements {
+        if range.start < cursor {
+            continue;
+        }
+        output.push_str(&markdown[cursor..range.start]);
+        output.push('[');
+        output.push(Icon::ExternalLink.unicode());
+        output.push_str("](<");
+        output.push_str(&locator);
+        output.push_str(">)");
+        cursor = range.end;
+    }
+    output.push_str(&markdown[cursor..]);
+    Cow::Owned(output)
 }
 
 fn stable_hash<T: Hash + ?Sized>(value: &T) -> u64 {
@@ -1568,10 +1648,43 @@ flowchart LR
     fn extracts_only_internal_reader_citations_from_markdown_links() {
         assert_eq!(
             citation_locators(
-                "See [source](rebook://j/2/paragraph-3) and [web](https://example.com)."
+                "See [source](link:/j/2/paragraph-3) and [web](https://example.com)."
             ),
-            vec!["rebook://j/2/paragraph-3"]
+            vec!["link:/j/2/paragraph-3"]
         );
+    }
+
+    #[test]
+    fn internal_citation_labels_are_replaced_with_external_link_icons() {
+        let source =
+            "结论[中文引用](link:/j/2/chapter%2Fparagraph-3)，另见[网页](https://example.com)。";
+        let iconized = citation_icon_markdown(source);
+
+        assert!(!iconized.contains("中文引用"));
+        assert!(iconized.contains(Icon::ExternalLink.unicode()));
+        assert!(iconized.contains("[网页](https://example.com)"));
+        assert_eq!(
+            citation_locators(iconized.as_ref()),
+            vec!["link:/j/2/chapter%2Fparagraph-3"]
+        );
+    }
+
+    #[test]
+    fn an_earlier_fragment_click_survives_later_link_hook_resets() {
+        let first = "link:/j/1/first".to_owned();
+        let second = "link:/j/2/second".to_owned();
+        let locators = vec![first.clone(), second.clone()];
+        let mut cache = CommonMarkCache::default();
+        cache.add_link_hook(first.clone());
+        cache.add_link_hook(second.clone());
+        cache.link_hooks_mut().insert(first.clone(), true);
+
+        let mut clicked = clicked_citation(&cache, &locators);
+        cache.link_hooks_mut().insert(first.clone(), false);
+        cache.link_hooks_mut().insert(second, false);
+        clicked = clicked.or_else(|| clicked_citation(&cache, &locators));
+
+        assert_eq!(clicked, Some(first));
     }
 
     #[test]
@@ -1656,6 +1769,7 @@ flowchart LR
         assert_eq!(summary.svg_previews, 0);
         assert_eq!(summary.mermaid_previews, 0);
         assert_eq!(summary.formulas, 0);
+        assert_eq!(summary.citations, 0);
     }
 
     #[test]
@@ -1666,5 +1780,13 @@ flowchart LR
         assert_eq!(summary.svg_previews, 1);
         assert_eq!(summary.mermaid_previews, 1);
         assert_eq!(summary.formulas, 1);
+        assert_eq!(summary.citations, 0);
+    }
+
+    #[test]
+    fn diagnostic_summary_counts_unique_internal_citations() {
+        let source = "[one](link:/j/1/p-1) [again](link:/j/1/p-1) [two](link:/j/2)";
+
+        assert_eq!(diagnostic_summary(source).citations, 2);
     }
 }

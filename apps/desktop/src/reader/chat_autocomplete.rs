@@ -1,3 +1,5 @@
+use percent_encoding::percent_decode_str;
+
 const MAX_REFERENCE_SUGGESTIONS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,12 +33,15 @@ pub(super) struct ChatCitation {
 }
 
 pub(super) fn parse_chat_citation(locator: &str) -> Option<ChatCitation> {
-    let remainder = locator.strip_prefix("rebook://j/")?;
+    let remainder = locator.strip_prefix("link:/j/")?;
     let (section, node) = remainder
         .split_once('/')
         .map_or((remainder, None), |(section, node)| (section, Some(node)));
     let section_index = section.parse().ok()?;
-    let node = node.filter(|node| !node.is_empty()).map(ToOwned::to_owned);
+    let node = node
+        .filter(|node| !node.is_empty())
+        .and_then(|node| percent_decode_str(node).decode_utf8().ok())
+        .map(std::borrow::Cow::into_owned);
     Some(ChatCitation {
         section_index,
         node,
@@ -183,8 +188,10 @@ pub(super) fn build_chat_prompt_with_references(
                     if english { "Location" } else { "位置" },
                     reference.description
                 ),
-                format!("link: {}", reference.link),
             ];
+            if reference.kind != ChatReferenceKind::Book {
+                lines.push(format!("link: {}", reference.link));
+            }
             if let Some(excerpt) = &reference.excerpt {
                 lines.push(format!(
                     "{}: {excerpt}",
@@ -193,9 +200,9 @@ pub(super) fn build_chat_prompt_with_references(
             }
             if reference.kind == ChatReferenceKind::Book {
                 lines.push(if english {
-                    "Use searchBook and getContent as needed to inspect the full book.".into()
+                    "Use searchBook and getContent as needed to inspect the full book, and cite the link:/j/... links returned by those tools.".into()
                 } else {
-                    "请根据问题使用 searchBook 和 getContent 检索全文。".into()
+                    "请根据问题使用 searchBook 和 getContent 检索全文，并引用工具返回的 link:/j/... 链接。".into()
                 });
             }
             lines.join("\n")
@@ -205,9 +212,9 @@ pub(super) fn build_chat_prompt_with_references(
     format!(
         "{base}\n\n{}\n\n{reference_text}",
         if english {
-            "The user referenced the following book content. Use it as the primary context and cite its link when relevant:"
+            "The user referenced the following book content. Use it as the primary context. Every claim based on a chapter or paragraph reference must cite its supplied link:"
         } else {
-            "用户在输入框中引用了以下书籍内容。请优先以这些内容为上下文，并在相关时引用其位置："
+            "用户在输入框中引用了以下书籍内容。请优先以这些内容为上下文；凡依据章节或段落引用作出的陈述，都必须引用其提供的链接："
         }
     )
 }
@@ -321,24 +328,43 @@ mod tests {
         assert!(prompt.contains("概括主旨"));
         assert!(prompt.contains("searchBook"));
         assert!(prompt.contains("getContent"));
-        assert!(prompt.contains("link: book"));
+        assert!(prompt.contains("link:/j/..."));
+        assert!(!prompt.contains("link: book"));
         assert!(!prompt.contains("locator:"));
+    }
+
+    #[test]
+    fn chapter_reference_supplies_a_required_citation_link() {
+        let mut chapter = reference("section", ChatReferenceKind::Section, "第七章", "当前章节");
+        chapter.link = "link:/j/6".into();
+
+        let prompt = build_chat_prompt_with_references("概括本章", &[chapter], false);
+
+        assert!(prompt.contains("都必须引用其提供的链接"));
+        assert!(prompt.contains("link: link:/j/6"));
     }
 
     #[test]
     fn citation_locator_keeps_the_section_and_full_node_id() {
         assert_eq!(
-            parse_chat_citation("rebook://j/3/chapter/paragraph-2"),
+            parse_chat_citation("link:/j/3/chapter/paragraph-2"),
             Some(ChatCitation {
                 section_index: 3,
                 node: Some("chapter/paragraph-2".into()),
             })
         );
         assert_eq!(
-            parse_chat_citation("rebook://j/4"),
+            parse_chat_citation("link:/j/4"),
             Some(ChatCitation {
                 section_index: 4,
                 node: None,
+            })
+        );
+        assert_eq!(
+            parse_chat_citation("link:/j/5/chapter%2F%E6%AE%B5%E8%90%BD%20%232"),
+            Some(ChatCitation {
+                section_index: 5,
+                node: Some("chapter/段落 #2".into()),
             })
         );
         assert_eq!(parse_chat_citation("https://example.com"), None);
