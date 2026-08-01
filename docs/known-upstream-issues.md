@@ -61,6 +61,34 @@ epaint 的羽化由全局 tessellation 选项控制，当前不能针对单个 s
 4. 在 Windows 100%、125%、150%、175% 和 200% DPI 下检查 hover、选中和透明状态，确认既无角线也无圆角锯齿。
 5. 全部通过后删除局部几何兼容代码，并删除本条记录。
 
+## egui：`ScrollArea::show_rows` 在列表底部抖动
+
+- 影响版本：`egui 0.35.0`
+- 上游状态：截至 2026-08-01 仍为 Open
+- 上游问题：[emilk/egui#1787](https://github.com/emilk/egui/issues/1787)；程序化定位限制另见 [emilk/egui#3268](https://github.com/emilk/egui/issues/3268)
+- 本地位置：`apps/desktop/src/reader/egui_view.rs` 中的 `stable_virtual_row_range` 和 `DesktopReader::toc`
+- 回归测试：`virtual_toc_range_does_not_backfill_rows_at_the_bottom_boundary`
+
+### 表现
+
+目录滚动到底部后点击目录项，列表可能在相邻帧间上下抖动一次。长目录更容易观察到，但问题与目录层级和条目数量本身无关。
+
+### 原因
+
+`ScrollArea::show_rows` 会根据视口计算首尾可见行；当末行超过总行数时，它会把尾行截断，并向前移动首行以维持原范围长度。视口底边在行边界附近发生微小变化时，首行会在两个值之间来回切换，进而改变子 UI 的布局范围并产生抖动。这与上游 #1787 的复现一致。
+
+### 当前规避方案
+
+目录保留 `ScrollArea::show_viewport`，但使用本地固定行高虚拟化：尾行只截断到总行数，不再向前补行，因此相同首行在底部边界两侧保持稳定。只有可见行会被创建和绘制。活动目录项不在视口内时，使用合成的目标矩形调用 `scroll_to_rect`，继续沿用 egui 的滚动定位与动画。
+
+### 升级检查
+
+1. 确认 #1787 已关闭，并找到修复进入的 egui 版本。
+2. 升级依赖后尝试把目录恢复为原生 `show_rows`，保留正常的活动项定位。
+3. 运行 `cargo test -p rebook-desktop virtual_toc_range_does_not_backfill_rows_at_the_bottom_boundary`。
+4. 使用两千项以上的真实目录，在底部连续点击当前项、相邻项和远端项，确认底部不抖动且远端定位动画正常。
+5. 全部通过后删除本地虚拟化兼容代码，并删除本条记录。
+
 ## egui：合法布局触发控件 ID/矩形变化误报
 
 - 影响版本：`egui 0.35.0`

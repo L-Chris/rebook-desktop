@@ -1,5 +1,6 @@
 //! Safe, pull-based EPUB publication parser.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Read};
 use std::sync::Arc;
@@ -1066,10 +1067,12 @@ fn sanitize_and_validate_xml(
     href: &PublicationUrl,
     max_depth: usize,
 ) -> Result<String, EpubError> {
+    let xml = escape_invalid_xml_ampersands(xml);
+    let xml = xml.as_ref();
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
     let mut depth = 0_usize;
-    let mut plain_html_doctype = None;
+    let mut doctype_range = None;
     loop {
         match reader.read_event() {
             Ok(Event::Start(_)) => {
@@ -1081,28 +1084,36 @@ fn sanitize_and_validate_xml(
                 }
             }
             Ok(Event::End(_)) => depth = depth.saturating_sub(1),
-            Ok(Event::DocType(doctype))
-                if href.path().to_ascii_lowercase().ends_with(".xhtml")
-                    && doctype.trim_ascii().eq_ignore_ascii_case(b"html") =>
-            {
+            Ok(Event::DocType(doctype)) => {
+                // EPUB 2 content commonly declares the public XHTML or NCX DTD.
+                // quick-xml does not load that external resource, and we remove the
+                // declaration before handing the document to roxmltree. Internal
+                // subsets remain forbidden because they can define custom entities.
+                let doctype_bytes: &[u8] = doctype.as_ref();
+                if doctype_bytes.contains(&b'[') {
+                    return Err(EpubError::InvalidXml {
+                        resource: href.to_string(),
+                        message: "DOCTYPE internal subsets and entity declarations are disabled for untrusted EPUB XML"
+                            .into(),
+                    });
+                }
+                if doctype_range.is_some() {
+                    return Err(EpubError::InvalidXml {
+                        resource: href.to_string(),
+                        message: "multiple DOCTYPE declarations are not allowed".into(),
+                    });
+                }
                 let end = usize::try_from(reader.buffer_position()).unwrap_or(xml.len());
                 let Some(start) = xml[..end].to_ascii_lowercase().rfind("<!doctype") else {
                     return Err(EpubError::InvalidXml {
                         resource: href.to_string(),
-                        message: "failed to locate validated XHTML DOCTYPE".into(),
+                        message: "failed to locate validated DOCTYPE".into(),
                     });
                 };
-                plain_html_doctype = Some(start..end);
-            }
-            Ok(Event::DocType(_)) => {
-                return Err(EpubError::InvalidXml {
-                    resource: href.to_string(),
-                    message: "DOCTYPE is disabled for untrusted EPUB XML except plain XHTML <!DOCTYPE html>"
-                        .into(),
-                });
+                doctype_range = Some(start..end);
             }
             Ok(Event::Eof) => {
-                let Some(range) = plain_html_doctype else {
+                let Some(range) = doctype_range else {
                     return Ok(xml.to_owned());
                 };
                 let mut sanitized = String::with_capacity(xml.len() - range.len());
@@ -1119,6 +1130,62 @@ fn sanitize_and_validate_xml(
             }
         }
     }
+}
+
+fn escape_invalid_xml_ampersands(xml: &str) -> Cow<'_, str> {
+    let mut sanitized = None::<String>;
+    let mut copied_until = 0;
+
+    for (index, _) in xml.match_indices('&') {
+        if is_well_formed_xml_reference(&xml.as_bytes()[index + 1..]) {
+            continue;
+        }
+
+        let output = sanitized.get_or_insert_with(|| String::with_capacity(xml.len() + 4));
+        output.push_str(&xml[copied_until..index]);
+        output.push_str("&amp;");
+        copied_until = index + 1;
+    }
+
+    match sanitized {
+        Some(mut sanitized) => {
+            sanitized.push_str(&xml[copied_until..]);
+            Cow::Owned(sanitized)
+        }
+        None => Cow::Borrowed(xml),
+    }
+}
+
+fn is_well_formed_xml_reference(tail: &[u8]) -> bool {
+    let Some(&first) = tail.first() else {
+        return false;
+    };
+
+    if first == b'#' {
+        let (digits, valid_digit): (&[u8], fn(&u8) -> bool) = match tail.get(1) {
+            Some(b'x') => (&tail[2..], u8::is_ascii_hexdigit),
+            _ => (&tail[1..], u8::is_ascii_digit),
+        };
+        let digit_count = digits.iter().take_while(|byte| valid_digit(byte)).count();
+        return digit_count > 0 && digits.get(digit_count) == Some(&b';');
+    }
+
+    if !is_xml_name_start(first) {
+        return false;
+    }
+    let name_length = tail
+        .iter()
+        .take_while(|&&byte| is_xml_name_character(byte))
+        .count();
+    tail.get(name_length) == Some(&b';')
+}
+
+fn is_xml_name_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || matches!(byte, b'_' | b':')
+}
+
+fn is_xml_name_character(byte: u8) -> bool {
+    is_xml_name_start(byte) || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
 }
 
 fn decode_xml(bytes: &[u8], href: &PublicationUrl) -> Result<String, EpubError> {
@@ -1500,18 +1567,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_doctype_before_tree_parsing() {
+    fn rejects_doctype_internal_subset_before_tree_parsing() {
         let mut entries = minimal_entries();
         entries[1] = (
             "META-INF/container.xml",
-            br#"<?xml version="1.0"?><!DOCTYPE container><container><rootfiles><rootfile full-path="OPS/package.opf"/></rootfiles></container>"#,
+            br#"<?xml version="1.0"?><!DOCTYPE container [<!ENTITY injected "unsafe">]><container><rootfiles><rootfile full-path="OPS/package.opf"/></rootfiles></container>"#,
             CompressionMethod::Deflated,
         );
         let error = EpubPublication::open_bytes(zip_entries(&entries))
-            .expect_err("untrusted DOCTYPE must fail");
+            .expect_err("DOCTYPE internal subset must fail");
 
         assert!(matches!(error, EpubError::InvalidXml { .. }));
-        assert!(error.to_string().contains("DOCTYPE is disabled"));
+        assert!(error.to_string().contains("internal subsets"));
     }
 
     #[test]
@@ -1533,18 +1600,49 @@ mod tests {
     }
 
     #[test]
-    fn rejects_xhtml_doctype_with_external_identifier() {
+    fn allows_xhtml_doctype_with_external_identifier_without_loading_it() {
         let mut entries = minimal_entries();
         entries[3] = (
             "OPS/nav.xhtml",
-            br#"<?xml version="1.0"?><!DOCTYPE html SYSTEM "https://example.com/xhtml.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><body/></html>"#,
+            r#"<?xml version="1.0"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd"><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="Text/chapter.xhtml#start">第一章</a></li></ol></nav></body></html>"#.as_bytes(),
             CompressionMethod::Deflated,
         );
-        let error = EpubPublication::open_bytes(zip_entries(&entries))
-            .expect_err("external XHTML DOCTYPE must fail");
+        let publication = EpubPublication::open_bytes(zip_entries(&entries))
+            .expect("external XHTML DOCTYPE must be stripped without being loaded");
 
-        assert!(matches!(error, EpubError::InvalidXml { .. }));
-        assert!(error.to_string().contains("DOCTYPE is disabled"));
+        assert_eq!(publication.book().table_of_contents[0].label, "第一章");
+    }
+
+    #[test]
+    fn allows_epub2_ncx_public_doctype_without_loading_it() {
+        let mut entries = epub2_entries();
+        entries[3] = (
+            "OPS/toc.ncx",
+            r#"<?xml version="1.0"?><!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd"><ncx><navMap><navPoint><navLabel><text>第一章</text></navLabel><content src="Text/chapter.xhtml#start"/></navPoint></navMap></ncx>"#.as_bytes(),
+            CompressionMethod::Deflated,
+        );
+
+        let publication = EpubPublication::open_bytes(zip_entries(&entries))
+            .expect("EPUB 2 NCX public DOCTYPE must be stripped without being loaded");
+
+        assert_eq!(publication.book().table_of_contents[0].label, "第一章");
+    }
+
+    #[test]
+    fn escapes_bare_ampersands_in_xhtml_text() {
+        let mut entries = minimal_entries();
+        entries[5] = (
+            "OPS/Text/chapter.xhtml",
+            br"<html><body><p>symbols: *&@, valid: &amp;, numeric: &#38;</p></body></html>",
+            CompressionMethod::Deflated,
+        );
+
+        let publication = EpubPublication::open_bytes(zip_entries(&entries))
+            .expect("publication with recoverable XHTML must open");
+
+        publication
+            .parse_section(0)
+            .expect("bare ampersands in XHTML text must be escaped");
     }
 
     fn minimal_epub() -> Vec<u8> {

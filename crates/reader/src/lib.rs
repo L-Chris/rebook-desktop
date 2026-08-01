@@ -14,7 +14,7 @@ use rebook_publication::{
     Block, Book, BookSource, Inline, LocatorV1, PublicationError, PublicationUrl, Section,
     SourceAnchor, SourceRange, TextBlock, TextRun, TocEntry,
 };
-use rebook_renderer::{DisplayListCompiler, PageDisplayList, PageTextHit};
+use rebook_renderer::{DisplayListCompiler, PageDisplayList, PageImageHit, PageTextHit};
 use thiserror::Error;
 
 const PREFETCH_DISTANCE: usize = 2;
@@ -53,6 +53,8 @@ pub struct ReaderTextHit {
     position: ReaderPosition,
     region_index: usize,
     byte_index: usize,
+    cluster_start: usize,
+    cluster_end: usize,
 }
 
 /// Page-coordinate rectangle used to paint a native selection and anchor its
@@ -72,6 +74,14 @@ pub struct ReaderSelection {
     pub ranges: Vec<SourceRange>,
     pub text: String,
     pub rects: Vec<ReaderSelectionRect>,
+}
+
+/// Original image pixels resolved from a point in the visible reader spread.
+#[derive(Clone)]
+pub struct ReaderImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Arc<[u8]>,
 }
 
 /// One source-backed text fragment retained on a logical page in the current
@@ -396,6 +406,46 @@ impl Drop for PrefetchWorker {
     }
 }
 
+struct TocIndex {
+    items_by_section: Vec<Vec<usize>>,
+    preceding_section_by_section: Vec<Option<usize>>,
+}
+
+impl TocIndex {
+    fn new(
+        items: &[TocViewItem],
+        section_indices_by_path: &HashMap<String, usize>,
+        section_count: usize,
+    ) -> Self {
+        let mut items_by_section = vec![Vec::new(); section_count];
+        for (item_index, item) in items.iter().enumerate() {
+            let Some(section_index) = item
+                .target
+                .as_ref()
+                .and_then(|target| section_indices_by_path.get(target.path()))
+                .copied()
+            else {
+                continue;
+            };
+            items_by_section[section_index].push(item_index);
+        }
+
+        let mut preceding_section_by_section = Vec::with_capacity(section_count);
+        let mut preceding_section = None;
+        for (section_index, section_items) in items_by_section.iter().enumerate() {
+            preceding_section_by_section.push(preceding_section);
+            if !section_items.is_empty() {
+                preceding_section = Some(section_index);
+            }
+        }
+
+        Self {
+            items_by_section,
+            preceding_section_by_section,
+        }
+    }
+}
+
 /// Single-owner reader orchestration. The parser and renderer communicate only
 /// through the publication and layout IR crates.
 pub struct ReaderSession {
@@ -407,6 +457,8 @@ pub struct ReaderSession {
     viewport: LayoutViewport,
     style: ReaderStyle,
     toc_items: Arc<[TocViewItem]>,
+    toc_index: TocIndex,
+    section_indices_by_path: HashMap<String, usize>,
     cache_capacity: usize,
     cache: HashMap<SegmentKey, Arc<CachedSegment>>,
     lru: VecDeque<SegmentKey>,
@@ -439,7 +491,18 @@ impl ReaderSession {
         if source.book().sections.is_empty() {
             return Err(ReaderError::EmptyBook);
         }
-        let toc_items = flatten_toc(&source.book().table_of_contents).into();
+        let toc_items: Arc<[TocViewItem]> = flatten_toc(&source.book().table_of_contents).into();
+        let mut section_indices_by_path = HashMap::with_capacity(source.book().sections.len());
+        for (index, section) in source.book().sections.iter().enumerate() {
+            section_indices_by_path
+                .entry(section.href.path().to_owned())
+                .or_insert(index);
+        }
+        let toc_index = TocIndex::new(
+            &toc_items,
+            &section_indices_by_path,
+            source.book().sections.len(),
+        );
         let repository = Arc::new(SectionRepository::new(Arc::clone(&source)));
         let prefetch_worker = PrefetchWorker::spawn(
             Arc::clone(&source),
@@ -455,6 +518,8 @@ impl ReaderSession {
             viewport,
             style,
             toc_items,
+            toc_index,
+            section_indices_by_path,
             cache_capacity: DEFAULT_SEGMENT_CACHE_CAPACITY,
             cache: HashMap::new(),
             lru: VecDeque::new(),
@@ -507,6 +572,11 @@ impl ReaderSession {
         let location = self.location();
         let active_toc = active_toc_item_for_location(
             &self.toc_items,
+            &self.toc_index.items_by_section[location.section_index],
+            self.toc_index.preceding_section_by_section[location.section_index]
+                .map_or(&[], |section_index| {
+                    self.toc_index.items_by_section[section_index].as_slice()
+                }),
             location.section_index,
             location.segment_index,
             location.page_index,
@@ -745,6 +815,20 @@ impl ReaderSession {
             .map(|hit| reader_text_hit(*position, hit)))
     }
 
+    /// Resolves the top-most raster image under a visible spread coordinate.
+    pub fn image_at_current_spread(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<ReaderImage>, ReaderError> {
+        Ok(self
+            .current_spread_pages()?
+            .iter()
+            .rev()
+            .find_map(|(_, page, offset_x)| page.image_at(x - *offset_x, y))
+            .map(reader_image))
+    }
+
     /// Builds a source-backed selection between two pointer hits. Native
     /// selections are intentionally bounded to the currently visible spread;
     /// the returned per-block ranges remain stable after repagination.
@@ -768,11 +852,26 @@ impl ReaderSession {
         };
         let anchor_order = (anchor_page, anchor.region_index, anchor.byte_index);
         let focus_order = (focus_page, focus.region_index, focus.byte_index);
-        let (start, end, start_page, end_page) = if anchor_order <= focus_order {
-            (anchor, focus, anchor_page, focus_page)
-        } else {
-            (focus, anchor, focus_page, anchor_page)
-        };
+        let (start, end, start_page, end_page, start_byte, end_byte) =
+            if anchor_order <= focus_order {
+                (
+                    anchor,
+                    focus,
+                    anchor_page,
+                    focus_page,
+                    anchor.cluster_start,
+                    focus.byte_index,
+                )
+            } else {
+                (
+                    focus,
+                    anchor,
+                    focus_page,
+                    anchor_page,
+                    focus.byte_index,
+                    anchor.cluster_end,
+                )
+            };
 
         let mut ranges = Vec::new();
         let mut quote = String::new();
@@ -795,12 +894,12 @@ impl ReaderSession {
                     continue;
                 };
                 let byte_start = if page_index == start_page && region_index == start.region_index {
-                    start.byte_index
+                    start_byte
                 } else {
                     visible.start
                 };
                 let byte_end = if page_index == end_page && region_index == end.region_index {
-                    end.byte_index
+                    end_byte
                 } else {
                     visible.end
                 };
@@ -892,12 +991,7 @@ impl ReaderSession {
 
     /// Resolves a publication URL to its containing spine section.
     pub fn section_index_for_href(&self, href: &PublicationUrl) -> Option<usize> {
-        let resource = href.resource_url();
-        self.source
-            .book()
-            .sections
-            .iter()
-            .position(|section| section.href.resource_url() == resource)
+        self.section_indices_by_path.get(href.path()).copied()
     }
 
     /// Resolves a publication URL to the layout segment and page containing its
@@ -1974,6 +2068,16 @@ fn reader_text_hit(position: ReaderPosition, hit: PageTextHit) -> ReaderTextHit 
         position,
         region_index: hit.region_index,
         byte_index: hit.byte_index,
+        cluster_start: hit.cluster_start,
+        cluster_end: hit.cluster_end,
+    }
+}
+
+fn reader_image(hit: PageImageHit) -> ReaderImage {
+    ReaderImage {
+        width: hit.width,
+        height: hit.height,
+        pixels: hit.pixels,
     }
 }
 
@@ -2037,17 +2141,38 @@ fn flatten_toc(entries: &[TocEntry]) -> Vec<TocViewItem> {
     items
 }
 
-fn active_toc_item_for_location(
-    items: &[TocViewItem],
+fn active_toc_item_for_location<'a>(
+    items: &'a [TocViewItem],
+    current_section_items: &[usize],
+    preceding_section_items: &[usize],
     current_section: usize,
     current_segment: usize,
     current_page: usize,
     mut resolve: impl FnMut(&PublicationUrl) -> Option<ReaderPosition>,
-) -> Option<&TocViewItem> {
+) -> Option<&'a TocViewItem> {
     let mut first_in_current_section = None;
     let mut best = None;
 
-    for (order, item) in items.iter().enumerate() {
+    for &order in preceding_section_items {
+        let Some(item) = items.get(order) else {
+            continue;
+        };
+        let Some(position) = item.target.as_ref().and_then(&mut resolve) else {
+            continue;
+        };
+        if position.section_index >= current_section {
+            continue;
+        }
+        let key = (position.segment_index, position.page_index, order);
+        if best.is_none_or(|(best_key, _)| key > best_key) {
+            best = Some((key, item));
+        }
+    }
+
+    for &order in current_section_items {
+        let Some(item) = items.get(order) else {
+            continue;
+        };
         let Some(position) = item.target.as_ref().and_then(&mut resolve) else {
             continue;
         };
@@ -2056,16 +2181,16 @@ fn active_toc_item_for_location(
             segment_index,
             page_index,
         } = position;
-        if section_index == current_section && first_in_current_section.is_none() {
-            first_in_current_section = Some(item);
-        }
-        if section_index > current_section
-            || (section_index == current_section
-                && (segment_index, page_index) > (current_segment, current_page))
-        {
+        if section_index != current_section {
             continue;
         }
-        let key = (section_index, segment_index, page_index, order);
+        if first_in_current_section.is_none() {
+            first_in_current_section = Some(item);
+        }
+        if (segment_index, page_index) > (current_segment, current_page) {
+            continue;
+        }
+        let key = (segment_index, page_index, order);
         if best.is_none_or(|(best_key, _)| key > best_key) {
             best = Some((key, item));
         }
@@ -2323,7 +2448,7 @@ mod tests {
         let secondary_right = secondary_bounds.x1 + f64::from(secondary_offset);
 
         assert!((primary_right - secondary_left).abs() < f64::EPSILON);
-        assert!(((primary_left + secondary_right) / 2.0 - 600.0).abs() < f64::EPSILON);
+        assert!((f64::midpoint(primary_left, secondary_right) - 600.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2354,7 +2479,7 @@ mod tests {
 
     #[test]
     fn native_selection_round_trips_to_source_ranges_and_geometry() {
-        let source = CountingSource::new(&["selectable native reader text".into()]);
+        let source = CountingSource::new(&["选择文字行为".into()]);
         let mut reader =
             ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
         let selected_source = SourceRange {
@@ -2366,15 +2491,35 @@ mod tests {
             end: SourceAnchor {
                 spine: SpineItemId::new("section-0").unwrap(),
                 node: "paragraph-0".into(),
-                text_offset: 10,
+                text_offset: 4,
             },
         };
         let rect = reader
             .current_page()
             .source_rects(std::slice::from_ref(&selected_source))[0];
+        let first_character = SourceRange {
+            start: selected_source.start.clone(),
+            end: SourceAnchor {
+                text_offset: 1,
+                ..selected_source.start.clone()
+            },
+        };
+        let last_character = SourceRange {
+            start: SourceAnchor {
+                text_offset: 3,
+                ..selected_source.start.clone()
+            },
+            end: selected_source.end.clone(),
+        };
+        let first_rect = reader
+            .current_page()
+            .source_rects(std::slice::from_ref(&first_character))[0];
+        let last_rect = reader
+            .current_page()
+            .source_rects(std::slice::from_ref(&last_character))[0];
         let y = logical_coordinate(rect.center().y);
         let anchor = reader
-            .hit_test_current_spread(logical_coordinate(rect.x0) + 0.1, y, true)
+            .hit_test_current_spread(logical_coordinate(first_rect.x1) - 0.1, y, true)
             .unwrap()
             .unwrap();
         let focus = reader
@@ -2383,7 +2528,7 @@ mod tests {
             .unwrap();
         let selection = reader.selection_between(&anchor, &focus).unwrap().unwrap();
 
-        assert!(!selection.text.trim().is_empty());
+        assert_eq!(selection.text, "选择文字");
         assert!(!selection.ranges.is_empty());
         assert!(!selection.rects.is_empty());
         assert!(
@@ -2395,13 +2540,29 @@ mod tests {
                 )
                 .unwrap()
         );
+
+        let reverse_anchor = reader
+            .hit_test_current_spread(logical_coordinate(last_rect.x0) + 0.1, y, true)
+            .unwrap()
+            .unwrap();
+        let reverse_focus = reader
+            .hit_test_current_spread(logical_coordinate(rect.x0) + 0.1, y, true)
+            .unwrap()
+            .unwrap();
+        let reverse_selection = reader
+            .selection_between(&reverse_anchor, &reverse_focus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reverse_selection.text, "选择文字");
     }
 
     #[test]
     fn visible_text_fragments_follow_the_current_page() {
         let source = CountingSource::new(&["visible page text ".repeat(1_200)]);
-        let mut style = ReaderStyle::default();
-        style.spread = SpreadMode::Single;
+        let style = ReaderStyle {
+            spread: SpreadMode::Single,
+            ..ReaderStyle::default()
+        };
         let mut reader = ReaderSession::open(source, viewport(600, 400), style).unwrap();
 
         let first = reader.current_visible_text_fragments().unwrap();
@@ -3232,23 +3393,69 @@ mod tests {
         };
 
         assert_eq!(
-            active_toc_item_for_location(&items, 1, 0, 1, resolve)
+            active_toc_item_for_location(&items, &[1, 2], &[0], 1, 0, 1, resolve)
                 .unwrap()
                 .id,
             "previous"
         );
         assert_eq!(
-            active_toc_item_for_location(&items, 1, 1, 2, resolve)
+            active_toc_item_for_location(&items, &[1, 2], &[0], 1, 1, 2, resolve)
                 .unwrap()
                 .id,
             "chapter"
         );
         assert_eq!(
-            active_toc_item_for_location(&items, 1, 2, 0, resolve)
+            active_toc_item_for_location(&items, &[1, 2], &[0], 1, 2, 0, resolve)
                 .unwrap()
                 .id,
             "subsection"
         );
+    }
+
+    #[test]
+    fn large_toc_snapshot_resolves_only_neighboring_sections() {
+        let item_count = 2_034;
+        let items = (0..item_count)
+            .map(|index| TocViewItem {
+                id: index.to_string(),
+                label: format!("Chapter {index}"),
+                target: Some(PublicationUrl::parse(&format!("section-{index}.xhtml")).unwrap()),
+                depth: 0,
+                ancestors: Vec::new(),
+                has_children: false,
+            })
+            .collect::<Vec<_>>();
+        let section_indices = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item.target.as_ref().unwrap().path().to_owned(), index))
+            .collect::<HashMap<_, _>>();
+        let index = TocIndex::new(&items, &section_indices, item_count);
+        let current_section = 1_500;
+        let preceding_section = index.preceding_section_by_section[current_section].unwrap();
+        let resolve_count = AtomicUsize::new(0);
+
+        let active = active_toc_item_for_location(
+            &items,
+            &index.items_by_section[current_section],
+            &index.items_by_section[preceding_section],
+            current_section,
+            0,
+            0,
+            |target| {
+                resolve_count.fetch_add(1, Ordering::Relaxed);
+                let section_index = section_indices.get(target.path()).copied()?;
+                Some(ReaderPosition {
+                    section_index,
+                    segment_index: 0,
+                    page_index: 0,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(active.id, current_section.to_string());
+        assert_eq!(resolve_count.load(Ordering::Relaxed), 2);
     }
 
     #[test]

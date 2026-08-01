@@ -34,8 +34,14 @@ const ASSISTANT_INPUT_HEIGHT: f32 = 32.0;
 const TOOLBAR_HEIGHT: f32 = 48.0;
 const TOOLBAR_CONTROL_SIZE: f32 = 32.0;
 const TOOLBAR_TITLE_SIZE: f32 = 15.0;
+const TOC_ROW_HEIGHT: f32 = 36.0;
+const TOC_SCROLL_ID_SALT: &str = "reader-toc-scroll";
 const WHEEL_PAGE_THRESHOLD: f32 = 18.0;
 const WHEEL_TURN_COOLDOWN: Duration = Duration::from_millis(120);
+const IMAGE_PREVIEW_MARGIN: f32 = 48.0;
+const IMAGE_PREVIEW_MIN_ZOOM: f32 = 0.25;
+const IMAGE_PREVIEW_MAX_ZOOM: f32 = 8.0;
+const IMAGE_PREVIEW_WHEEL_SPEED: f32 = 0.0025;
 
 #[derive(Clone, Copy)]
 struct AssistantComposerKeys {
@@ -154,6 +160,7 @@ impl DesktopReader {
         let ctx = root_ui.ctx().clone();
         let now = Instant::now();
         self.advance_frame(now);
+        self.copy_shortcut(&ctx);
         self.keyboard_shortcuts(&ctx, interaction_blocked);
         if self.ui.needs_motion_tick() || self.pending_page_turn.is_some() {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -192,8 +199,10 @@ impl DesktopReader {
                     response
                 };
                 page_rect = response.rect;
-                self.pointer_interaction(&response);
-                self.wheel_interaction(&response, interaction_blocked);
+                if self.image_preview.is_none() {
+                    self.pointer_interaction(&response);
+                    self.wheel_interaction(&response, interaction_blocked);
+                }
                 self.resize_canvas(f64::from(page_rect.width()), f64::from(page_rect.height()));
 
                 let progress = unit_f32(self.progress());
@@ -221,6 +230,7 @@ impl DesktopReader {
         );
         self.menu(&ctx);
         self.selection_actions(&ctx, page_rect);
+        self.image_preview_overlay(&ctx);
         self.feedback(&ctx);
 
         ReaderFramePlan {
@@ -334,7 +344,11 @@ impl DesktopReader {
             self.open_search();
             return;
         }
-        if interaction_blocked || ctx.egui_wants_keyboard_input() || self.ui.overlay_visible() {
+        if interaction_blocked
+            || ctx.egui_wants_keyboard_input()
+            || self.ui.overlay_visible()
+            || self.image_preview.is_some()
+        {
             return;
         }
         let previous = ctx.input(|input| {
@@ -357,6 +371,7 @@ impl DesktopReader {
         if interaction_blocked
             || !response.hovered()
             || self.ui.overlay_visible()
+            || self.image_preview.is_some()
             || self.selection.is_some()
             || self.pending_page_turn.is_some()
         {
@@ -653,101 +668,153 @@ impl DesktopReader {
         ui.add_space(10.0);
     }
 
-    fn toc(&mut self, ui: &mut egui::Ui) {
-        let rows = self
-            .reader
+    fn visible_toc_row_indices(&self) -> Vec<usize> {
+        self.reader
             .toc_items()
             .iter()
+            .enumerate()
             .filter(|row| {
-                row.ancestors
+                row.1
+                    .ancestors
                     .iter()
                     .all(|ancestor| self.ui.expanded_toc.contains(ancestor))
             })
-            .cloned()
-            .collect::<Vec<_>>();
-        let active = self.snapshot.active_toc_id.clone();
-        let (should_auto_scroll, mut did_auto_scroll) =
-            (active != self.ui.last_auto_scrolled_toc, false);
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let content_width = (ui.available_width() - 12.0).max(1.0);
-                ui.set_width(content_width);
-                for row in rows {
-                    let selected = active.as_ref() == Some(&row.id);
-                    let display_label =
-                        if self.translation.enabled && self.plugin_settings.translate_toc {
-                            self.translation
-                                .toc_labels
-                                .get(&row.id)
-                                .unwrap_or(&row.label)
-                        } else {
-                            &row.label
-                        };
-                    let (row_rect, row_response) = ui
-                        .allocate_exact_size(Vec2::new(content_width, 36.0), egui::Sense::click());
-                    let mut row_response =
-                        row_response.on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if selected && should_auto_scroll {
-                        ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
-                        did_auto_scroll = true;
-                    }
-                    let row_fill = if selected {
-                        palette().accent_soft
-                    } else if row_response.hovered() {
-                        ui.visuals().widgets.hovered.weak_bg_fill
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-                    if row_fill != Color32::TRANSPARENT {
-                        ui.painter().rect_filled(row_rect, 6.0, row_fill);
-                    }
-                    let depth = u16::try_from(row.depth).unwrap_or(u16::MAX);
-                    let toggle_rect = Rect::from_min_size(
-                        Pos2::new(
-                            row_rect.left() + 2.0 + f32::from(depth) * 12.0,
-                            row_rect.top() + 5.0,
-                        ),
-                        Vec2::splat(26.0),
-                    );
-                    let toggle = if row.has_children {
-                        let expanded = self.ui.expanded_toc.contains(&row.id);
-                        toc_toggle_button(
-                            ui,
-                            toggle_rect.center(),
-                            &row.id,
-                            expanded,
-                            selected,
-                            self.language.text("折叠", "Collapse"),
-                            self.language.text("展开", "Expand"),
-                        )
-                    } else {
-                        false
-                    };
-                    let label_rect = toc_label_rect(row_rect, toggle_rect);
-                    if paint_toc_label(ui, label_rect, display_label, selected) {
-                        row_response = row_response.on_hover_text(display_label);
-                    }
-                    row_response.widget_info(|| {
-                        egui::WidgetInfo::labeled(
-                            egui::WidgetType::Button,
-                            ui.is_enabled(),
-                            display_label,
-                        )
-                    });
-                    let navigate = row_response.clicked() && !toggle;
+            .map(|(index, _)| index)
+            .collect()
+    }
 
-                    if toggle {
-                        self.toggle_toc(&row.id);
-                    }
-                    if navigate && let Some(target) = row.target {
-                        self.go_to(&target);
-                    }
-                }
+    fn paint_visible_toc_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        visible_rows: std::ops::Range<usize>,
+        row_indices: &[usize],
+        active: Option<&String>,
+    ) -> Option<usize> {
+        let mut navigated_row = None;
+        let content_width = (ui.available_width() - 12.0).max(1.0);
+        ui.set_width(content_width);
+        for visible_index in visible_rows {
+            let row = self.reader.toc_items()[row_indices[visible_index]].clone();
+            let selected = active == Some(&row.id);
+            let display_label = if self.translation.enabled && self.plugin_settings.translate_toc {
+                self.translation
+                    .toc_labels
+                    .get(&row.id)
+                    .unwrap_or(&row.label)
+            } else {
+                &row.label
+            };
+            let (row_rect, row_response) = ui.allocate_exact_size(
+                Vec2::new(content_width, TOC_ROW_HEIGHT),
+                egui::Sense::click(),
+            );
+            let mut row_response = row_response.on_hover_cursor(egui::CursorIcon::PointingHand);
+            let row_fill = if selected {
+                palette().accent_soft
+            } else if row_response.hovered() {
+                ui.visuals().widgets.hovered.weak_bg_fill
+            } else {
+                Color32::TRANSPARENT
+            };
+            if row_fill != Color32::TRANSPARENT {
+                ui.painter().rect_filled(row_rect, 6.0, row_fill);
+            }
+            let depth = u16::try_from(row.depth).unwrap_or(u16::MAX);
+            let toggle_rect = Rect::from_min_size(
+                Pos2::new(
+                    row_rect.left() + 2.0 + f32::from(depth) * 12.0,
+                    row_rect.top() + 5.0,
+                ),
+                Vec2::splat(26.0),
+            );
+            let toggle = if row.has_children {
+                let expanded = self.ui.expanded_toc.contains(&row.id);
+                toc_toggle_button(
+                    ui,
+                    toggle_rect.center(),
+                    &row.id,
+                    expanded,
+                    selected,
+                    self.language.text("折叠", "Collapse"),
+                    self.language.text("展开", "Expand"),
+                )
+            } else {
+                false
+            };
+            let label_rect = toc_label_rect(row_rect, toggle_rect);
+            if paint_toc_label(ui, label_rect, display_label, selected) {
+                row_response = row_response.on_hover_text(display_label);
+            }
+            row_response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), display_label)
             });
-        if active.is_none() || did_auto_scroll {
-            self.ui.last_auto_scrolled_toc = active;
+            let navigate = row_response.clicked() && !toggle;
+
+            if toggle {
+                self.toggle_toc(&row.id);
+            }
+            if navigate && let Some(target) = row.target {
+                self.go_to(&target);
+                navigated_row = Some(visible_index);
+            }
         }
+        navigated_row
+    }
+
+    fn toc(&mut self, ui: &mut egui::Ui) {
+        let row_indices = self.visible_toc_row_indices();
+        let active = self.snapshot.active_toc_id.clone();
+        let should_auto_scroll = active != self.ui.last_auto_scrolled_toc;
+        let active_row = active.as_ref().and_then(|active| {
+            row_indices.iter().position(|&index| {
+                self.reader.toc_items().get(index).map(|row| &row.id) == Some(active)
+            })
+        });
+        let item_spacing = ui.spacing().item_spacing.y;
+        let row_stride = TOC_ROW_HEIGHT + item_spacing;
+        let content_height = toc_content_height(row_indices.len(), item_spacing);
+        let scroll_area = egui::ScrollArea::vertical()
+            .id_salt(TOC_SCROLL_ID_SALT)
+            .auto_shrink([false, false]);
+        let mut preserve_bottom_after_navigation = false;
+        scroll_area.show_viewport(ui, |ui, viewport| {
+            ui.set_height(content_height);
+
+            if should_auto_scroll && let Some(active_row) = active_row {
+                let row_top = ui.max_rect().top() + toc_row_top(active_row, item_spacing);
+                let row_rect = Rect::from_min_size(
+                    Pos2::new(ui.max_rect().left(), row_top),
+                    Vec2::new(ui.max_rect().width(), TOC_ROW_HEIGHT),
+                );
+                ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+            }
+
+            let visible_rows = stable_virtual_row_range(viewport, row_stride, row_indices.len());
+            let y_min = ui.max_rect().top() + toc_row_top(visible_rows.start, item_spacing);
+            let y_max = ui.max_rect().top() + toc_row_top(visible_rows.end, item_spacing);
+            let visible_rect = Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(visible_rect), |ui| {
+                ui.skip_ahead_auto_ids(visible_rows.start);
+                let navigated_row =
+                    self.paint_visible_toc_rows(ui, visible_rows, &row_indices, active.as_ref());
+                preserve_bottom_after_navigation = navigated_row.is_some_and(|row_index| {
+                    toc_navigation_keeps_bottom_offset(
+                        viewport,
+                        content_height,
+                        row_index,
+                        item_spacing,
+                    )
+                });
+            });
+        });
+        update_toc_scroll_marker(
+            &mut self.ui.last_auto_scrolled_toc,
+            preserve_bottom_after_navigation,
+            self.snapshot.active_toc_id.as_deref(),
+            active,
+            should_auto_scroll,
+            active_row.is_some(),
+        );
     }
 
     fn highlights(&mut self, ui: &mut egui::Ui) {
@@ -1439,7 +1506,161 @@ impl DesktopReader {
             self.finish_text_selection(x, y, true);
         }
         if response.clicked() {
+            if self.try_open_image_preview(&response.ctx, x, y) {
+                return;
+            }
             self.finish_text_selection(x, y, false);
+        }
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "decoded image dimensions are GPU-bounded and egui geometry uses f32"
+    )]
+    fn try_open_image_preview(&mut self, ctx: &egui::Context, x: f32, y: f32) -> bool {
+        if self.format == rebook_formats::BookFormat::Pdf {
+            return false;
+        }
+        let image = match self.reader.image_at_current_spread(x, y) {
+            Ok(Some(image)) => image,
+            Ok(None) => return false,
+            Err(error) => {
+                self.error = Some(format!("打开图片预览失败：{error}"));
+                return false;
+            }
+        };
+        let (Ok(width), Ok(height)) = (usize::try_from(image.width), usize::try_from(image.height))
+        else {
+            self.error = Some("图片尺寸超出预览范围".into());
+            return false;
+        };
+        let Some(byte_len) = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            self.error = Some("图片尺寸超出预览范围".into());
+            return false;
+        };
+        if width == 0 || height == 0 || image.pixels.len() < byte_len {
+            self.error = Some("图片数据不完整，无法预览".into());
+            return false;
+        }
+
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([width, height], &image.pixels[..byte_len]);
+        let texture = ctx.load_texture(
+            format!("reader-image-preview-{}", self.scene_revision),
+            color_image.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        self.cancel_text_selection();
+        self.image_preview = Some(super::ImagePreview {
+            texture,
+            image: color_image,
+            source_size: Vec2::new(image.width as f32, image.height as f32),
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+        });
+        ctx.request_repaint();
+        true
+    }
+
+    fn copy_shortcut(&mut self, ctx: &egui::Context) {
+        let copy_image = self.image_preview.is_some();
+        let selection_text =
+            if !copy_image && self.selection_toolbar_visible && !ctx.text_edit_focused() {
+                self.selection
+                    .as_ref()
+                    .map(|selection| selection.text.clone())
+                    .filter(|text| !text.is_empty())
+            } else {
+                None
+            };
+        if !copy_image && selection_text.is_none() {
+            return;
+        }
+        if !ctx.input_mut(consume_copy_shortcut) {
+            return;
+        }
+
+        if copy_image {
+            if let Some(image) = self
+                .image_preview
+                .as_ref()
+                .map(|preview| preview.image.clone())
+            {
+                ctx.copy_image(image);
+                self.show_copy_notice(ctx, true);
+            }
+        } else if let Some(text) = selection_text {
+            ctx.copy_text(text);
+            self.show_copy_notice(ctx, false);
+        }
+    }
+
+    fn show_copy_notice(&mut self, ctx: &egui::Context, image: bool) {
+        let message = if image {
+            self.language
+                .text("图片已复制到剪贴板", "Image copied to clipboard")
+        } else {
+            self.language.text("已复制到剪贴板", "Copied to clipboard")
+        };
+        self.notice_timer
+            .show(&mut self.notice, message.into(), Instant::now());
+        ctx.request_repaint_after(super::NOTICE_AUTO_DISMISS_DELAY);
+    }
+
+    fn image_preview_overlay(&mut self, ctx: &egui::Context) {
+        let mut close = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let Some(preview) = self.image_preview.as_mut() else {
+            return;
+        };
+        let screen = ctx.content_rect();
+        let available = Vec2::new(
+            (screen.width() - IMAGE_PREVIEW_MARGIN * 2.0).max(1.0),
+            (screen.height() - IMAGE_PREVIEW_MARGIN * 2.0).max(1.0),
+        );
+        let fit_scale = (available.x / preview.source_size.x)
+            .min(available.y / preview.source_size.y)
+            .min(1.0);
+
+        let wheel_delta = ctx.input(preview_wheel_delta);
+        if wheel_delta != 0.0 {
+            let old_zoom = preview.zoom;
+            preview.zoom = zoom_from_wheel(preview.zoom, wheel_delta);
+            let ratio = preview.zoom / old_zoom;
+            let pointer = ctx
+                .input(|input| input.pointer.hover_pos())
+                .unwrap_or_else(|| screen.center());
+            let current_center = screen.center() + preview.pan;
+            preview.pan -= (pointer - current_center) * (ratio - 1.0);
+            ctx.request_repaint();
+        }
+
+        let display_size = preview.source_size * fit_scale * preview.zoom;
+        preview.pan = clamp_preview_pan(preview.pan, display_size, available);
+        let image_rect = Rect::from_center_size(screen.center() + preview.pan, display_size);
+        let texture_id = preview.texture.id();
+        let zoom_percent = preview.zoom * 100.0;
+        let interaction =
+            show_image_preview_area(ctx, screen, image_rect, texture_id, zoom_percent);
+        close |= interaction.close;
+
+        if interaction.reset {
+            preview.zoom = 1.0;
+            preview.pan = Vec2::ZERO;
+            ctx.request_repaint();
+        } else if interaction.drag_delta != Vec2::ZERO {
+            preview.pan = clamp_preview_pan(
+                preview.pan + interaction.drag_delta,
+                display_size,
+                available,
+            );
+            ctx.request_repaint();
+        }
+        if close {
+            self.image_preview = None;
+            ctx.request_repaint();
         }
     }
 
@@ -1561,6 +1782,65 @@ fn toc_label_rect(row: Rect, toggle: Rect) -> Rect {
         Pos2::new(left, row.top()),
         Pos2::new(row.right() - 8.0, row.bottom()),
     )
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn toc_row_top(row_index: usize, item_spacing: f32) -> f32 {
+    row_index as f32 * (TOC_ROW_HEIGHT + item_spacing)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn toc_content_height(row_count: usize, item_spacing: f32) -> f32 {
+    if row_count == 0 {
+        0.0
+    } else {
+        row_count as f32 * (TOC_ROW_HEIGHT + item_spacing) - item_spacing
+    }
+}
+
+fn centered_toc_scroll_offset(row_index: usize, item_spacing: f32, viewport_height: f32) -> f32 {
+    toc_row_top(row_index, item_spacing) - (viewport_height - TOC_ROW_HEIGHT).max(0.0) * 0.5
+}
+
+fn toc_navigation_keeps_bottom_offset(
+    viewport: Rect,
+    content_height: f32,
+    row_index: usize,
+    item_spacing: f32,
+) -> bool {
+    let maximum_offset = (content_height - viewport.height()).max(0.0);
+    viewport.max.y + 1.0 >= content_height
+        && centered_toc_scroll_offset(row_index, item_spacing, viewport.height()) + 1.0
+            >= maximum_offset
+}
+
+fn update_toc_scroll_marker(
+    marker: &mut Option<String>,
+    preserve_bottom_after_navigation: bool,
+    current_active: Option<&str>,
+    rendered_active: Option<String>,
+    should_auto_scroll: bool,
+    active_row_found: bool,
+) {
+    if preserve_bottom_after_navigation {
+        *marker = current_active.map(str::to_owned);
+    } else if rendered_active.is_none() || (should_auto_scroll && active_row_found) {
+        *marker = rendered_active;
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn stable_virtual_row_range(
+    viewport: Rect,
+    row_stride: f32,
+    total_rows: usize,
+) -> std::ops::Range<usize> {
+    let min_row = ((viewport.min.y.max(0.0) / row_stride).floor() as usize).min(total_rows);
+    let max_row = ((viewport.max.y.max(0.0) / row_stride).ceil() as usize)
+        .saturating_add(1)
+        .min(total_rows)
+        .max(min_row);
+    min_row..max_row
 }
 
 fn toc_toggle_button(
@@ -2027,6 +2307,128 @@ fn chat_message_card(
     clicked_citation
 }
 
+fn preview_wheel_delta(input: &egui::InputState) -> f32 {
+    input
+        .raw
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::MouseWheel { unit, delta, .. } => Some(
+                delta.y
+                    * match unit {
+                        egui::MouseWheelUnit::Point => 1.0,
+                        egui::MouseWheelUnit::Line => 40.0,
+                        egui::MouseWheelUnit::Page => 240.0,
+                    },
+            ),
+            _ => None,
+        })
+        .sum()
+}
+
+fn consume_copy_shortcut(input: &mut egui::InputState) -> bool {
+    consume_copy_event(&mut input.events)
+        || input.consume_key(egui::Modifiers::COMMAND, egui::Key::C)
+}
+
+fn consume_copy_event(events: &mut Vec<egui::Event>) -> bool {
+    let Some(index) = events
+        .iter()
+        .position(|event| matches!(event, egui::Event::Copy))
+    else {
+        return false;
+    };
+    events.remove(index);
+    true
+}
+
+struct ImagePreviewInteraction {
+    close: bool,
+    reset: bool,
+    drag_delta: Vec2,
+}
+
+fn show_image_preview_area(
+    ctx: &egui::Context,
+    screen: Rect,
+    image_rect: Rect,
+    texture_id: TextureId,
+    zoom_percent: f32,
+) -> ImagePreviewInteraction {
+    let mut interaction = ImagePreviewInteraction {
+        close: false,
+        reset: false,
+        drag_delta: Vec2::ZERO,
+    };
+    egui::Area::new("reader-image-preview".into())
+        .order(egui::Order::Tooltip)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            // The backdrop only owns clicks used to close the preview. Registering it for
+            // dragging as well competes with the image's drag response on the same layer.
+            let (backdrop_rect, backdrop) =
+                ui.allocate_exact_size(screen.size(), egui::Sense::click());
+            ui.painter()
+                .rect_filled(backdrop_rect, 0.0, Color32::from_black_alpha(190));
+            ui.painter().image(
+                texture_id,
+                image_rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            ui.painter().rect_stroke(
+                image_rect,
+                2.0,
+                egui::Stroke::new(1.0, Color32::from_white_alpha(48)),
+                egui::StrokeKind::Inside,
+            );
+
+            let image_response = ui
+                .interact(
+                    image_rect,
+                    ui.id().with("preview-image"),
+                    egui::Sense::click_and_drag(),
+                )
+                .on_hover_cursor(egui::CursorIcon::Grab);
+            if image_response.dragged() {
+                interaction.drag_delta = ctx.input(|input| input.pointer.delta());
+            }
+            interaction.reset = image_response.double_clicked();
+
+            ui.painter().text(
+                Pos2::new(screen.center().x.round(), (screen.bottom() - 24.0).round()),
+                egui::Align2::CENTER_BOTTOM,
+                format!("{zoom_percent:.0}%"),
+                egui::FontId::monospace(crate::ui::scaled_font_size(12.0)),
+                Color32::WHITE,
+            );
+            if backdrop.clicked()
+                && backdrop
+                    .interact_pointer_pos()
+                    .is_some_and(|position| !image_rect.contains(position))
+            {
+                interaction.close = true;
+            }
+        });
+    interaction
+}
+
+fn zoom_from_wheel(zoom: f32, wheel_delta: f32) -> f32 {
+    (zoom * (wheel_delta * IMAGE_PREVIEW_WHEEL_SPEED).exp())
+        .clamp(IMAGE_PREVIEW_MIN_ZOOM, IMAGE_PREVIEW_MAX_ZOOM)
+}
+
+fn clamp_preview_pan(pan: Vec2, display_size: Vec2, available: Vec2) -> Vec2 {
+    let limit = Vec2::new(
+        (display_size.x - available.x).abs() / 2.0,
+        (display_size.y - available.y).abs() / 2.0,
+    );
+    Vec2::new(
+        pan.x.clamp(-limit.x, limit.x),
+        pan.y.clamp(-limit.y, limit.y),
+    )
+}
+
 fn color32(color: rebook_publication::Rgba) -> Color32 {
     Color32::from_rgba_unmultiplied(color.red, color.green, color.blue, color.alpha)
 }
@@ -2112,6 +2514,82 @@ mod reference_suggestion_label_tests {
     }
 
     #[test]
+    fn toc_click_at_bottom_suppresses_only_the_next_reposition() {
+        let mut marker = Some("old".into());
+
+        update_toc_scroll_marker(
+            &mut marker,
+            true,
+            Some("clicked"),
+            Some("old".into()),
+            false,
+            true,
+        );
+
+        assert_eq!(marker.as_deref(), Some("clicked"));
+    }
+
+    #[test]
+    fn toc_click_away_from_bottom_keeps_normal_animated_repositioning() {
+        let mut marker = Some("old".into());
+
+        update_toc_scroll_marker(
+            &mut marker,
+            false,
+            Some("clicked"),
+            Some("old".into()),
+            false,
+            true,
+        );
+
+        assert_eq!(marker.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn only_bottom_pinned_rows_suppress_repositioning_at_the_end() {
+        let item_spacing = 4.0;
+        let row_count = 2_034;
+        let viewport_height = 400.0;
+        let content_height = toc_content_height(row_count, item_spacing);
+        let viewport = Rect::from_min_max(
+            Pos2::new(0.0, content_height - viewport_height),
+            Pos2::new(240.0, content_height),
+        );
+
+        assert!(toc_navigation_keeps_bottom_offset(
+            viewport,
+            content_height,
+            row_count - 1,
+            item_spacing,
+        ));
+        assert!(!toc_navigation_keeps_bottom_offset(
+            viewport,
+            content_height,
+            row_count - 10,
+            item_spacing,
+        ));
+    }
+
+    #[test]
+    fn virtual_toc_range_does_not_backfill_rows_at_the_bottom_boundary() {
+        let row_stride = 40.0;
+        let total_rows = 2_034;
+        let viewport_before_boundary =
+            Rect::from_min_max(Pos2::new(0.0, 80_940.0), Pos2::new(240.0, 81_319.9));
+        let viewport_after_boundary =
+            Rect::from_min_max(Pos2::new(0.0, 80_940.0), Pos2::new(240.0, 81_320.1));
+
+        assert_eq!(
+            stable_virtual_row_range(viewport_before_boundary, row_stride, total_rows),
+            2_023..2_034
+        );
+        assert_eq!(
+            stable_virtual_row_range(viewport_after_boundary, row_stride, total_rows),
+            2_023..2_034
+        );
+    }
+
+    #[test]
     fn stale_page_texture_keeps_its_size_and_starts_at_the_moving_canvas() {
         let page_rect = Rect::from_min_size(Pos2::new(256.0, 48.0), Vec2::new(944.0, 700.0));
         let previous_texture_size = Vec2::new(1_200.0, 700.0);
@@ -2138,5 +2616,60 @@ mod reference_suggestion_label_tests {
             constrained_panel_widths(720.0, SIDEBAR_MAX_WIDTH, ASSISTANT_MAX_WIDTH, false, true,),
             (SIDEBAR_MAX_WIDTH, 520.0)
         );
+    }
+
+    #[test]
+    fn image_preview_zoom_is_bounded_and_pan_stays_within_visible_edges() {
+        assert!(
+            (zoom_from_wheel(IMAGE_PREVIEW_MAX_ZOOM, 240.0) - IMAGE_PREVIEW_MAX_ZOOM).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (zoom_from_wheel(IMAGE_PREVIEW_MIN_ZOOM, -240.0) - IMAGE_PREVIEW_MIN_ZOOM).abs()
+                < f32::EPSILON
+        );
+        assert_eq!(
+            clamp_preview_pan(
+                Vec2::new(500.0, -500.0),
+                Vec2::new(1_200.0, 900.0),
+                Vec2::new(800.0, 700.0),
+            ),
+            Vec2::new(200.0, -100.0)
+        );
+        assert_eq!(
+            clamp_preview_pan(
+                Vec2::new(20.0, 20.0),
+                Vec2::new(400.0, 300.0),
+                Vec2::new(800.0, 700.0),
+            ),
+            Vec2::new(20.0, 20.0)
+        );
+        assert_eq!(
+            clamp_preview_pan(
+                Vec2::new(500.0, -500.0),
+                Vec2::new(400.0, 300.0),
+                Vec2::new(800.0, 700.0),
+            ),
+            Vec2::new(200.0, -200.0)
+        );
+    }
+
+    #[test]
+    fn copy_shortcut_consumes_the_high_level_egui_copy_event() {
+        let mut events = vec![
+            egui::Event::Text("keep".into()),
+            egui::Event::Copy,
+            egui::Event::Text("also keep".into()),
+        ];
+
+        assert!(consume_copy_event(&mut events));
+        assert_eq!(
+            events,
+            vec![
+                egui::Event::Text("keep".into()),
+                egui::Event::Text("also keep".into()),
+            ]
+        );
+        assert!(!consume_copy_event(&mut events));
     }
 }

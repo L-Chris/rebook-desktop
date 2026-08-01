@@ -189,12 +189,17 @@ impl DesktopReader {
         if self.ui.assistant_panel == Some(panel) && self.ui.assistant_motion.target > 0.5 {
             self.close_assistant_panel();
         } else {
-            self.ui.assistant_panel = Some(panel);
-            if self.ui.assistant_motion.animate_to(1.0) {
-                self.ui.last_motion_tick = Some(std::time::Instant::now());
-            }
+            self.open_assistant_panel(panel);
         }
         self.log_diagnostic_snapshot("assistant.toggle.after", None);
+    }
+
+    fn open_assistant_panel(&mut self, panel: AssistantPanel) {
+        self.ui.assistant_panel = Some(panel);
+        self.chat.move_cursor_to_end = true;
+        if self.ui.assistant_motion.animate_to(1.0) {
+            self.ui.last_motion_tick = Some(std::time::Instant::now());
+        }
     }
 
     pub(super) fn close_assistant_panel(&mut self) {
@@ -440,10 +445,7 @@ impl DesktopReader {
         });
         self.focused_mark = Some(FocusedMark::assistant(selection.ranges.clone()));
         self.cancel_text_selection();
-        self.ui.assistant_panel = Some(AssistantPanel::Chat);
-        if self.ui.assistant_motion.animate_to(1.0) {
-            self.ui.last_motion_tick = Some(std::time::Instant::now());
-        }
+        self.open_assistant_panel(AssistantPanel::Chat);
         self.queue_chat(prompt, display_content);
     }
 
@@ -495,10 +497,7 @@ impl DesktopReader {
                 ],
             );
             self.chat.error = Some(error);
-            self.ui.assistant_panel = Some(AssistantPanel::Chat);
-            if self.ui.assistant_motion.animate_to(1.0) {
-                self.ui.last_motion_tick = Some(std::time::Instant::now());
-            }
+            self.open_assistant_panel(AssistantPanel::Chat);
             return;
         }
         let history = self.chat.messages.clone();

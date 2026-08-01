@@ -222,6 +222,7 @@ pub(super) struct DesktopReader {
     selection_anchor: Option<ReaderTextHit>,
     selection: Option<ReaderSelection>,
     selection_toolbar_visible: bool,
+    image_preview: Option<ImagePreview>,
     annotation_note_draft: Option<AnnotationDraft>,
     selected_highlight_id: Option<String>,
     focused_mark: Option<FocusedMark>,
@@ -245,6 +246,14 @@ pub(super) struct DesktopReader {
     error: Option<String>,
     error_timer: TransientMessageTimer,
     pub(super) exit_requested: bool,
+}
+
+struct ImagePreview {
+    texture: egui::TextureHandle,
+    image: egui::ColorImage,
+    source_size: egui::Vec2,
+    zoom: f32,
+    pan: egui::Vec2,
 }
 
 struct DesktopReaderResources {
@@ -708,6 +717,7 @@ impl DesktopReader {
             selection_anchor: None,
             selection: None,
             selection_toolbar_visible: false,
+            image_preview: None,
             annotation_note_draft: None,
             selected_highlight_id: None,
             focused_mark: None,

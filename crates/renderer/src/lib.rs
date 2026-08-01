@@ -16,7 +16,11 @@ use rebook_publication::{Rgba, SourceAnchor, SourceRange};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageTextHit {
     pub region_index: usize,
+    /// Caret boundary nearest to the pointer, used to determine drag direction.
     pub byte_index: usize,
+    /// Logical byte range of the shaped cluster or fixed-page text span under the pointer.
+    pub cluster_start: usize,
+    pub cluster_end: usize,
 }
 
 /// One durable, single-block piece of a visual text selection.
@@ -25,6 +29,14 @@ pub struct PageSelectionFragment {
     pub range: SourceRange,
     pub quote: String,
     pub rects: Vec<Rect>,
+}
+
+/// Original raster content for the top-most image under a page coordinate.
+#[derive(Clone)]
+pub struct PageImageHit {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Arc<[u8]>,
 }
 
 /// Retained drawing commands for one page. No parsing, shaping, or pagination
@@ -71,6 +83,27 @@ impl PageDisplayList {
             .reduce(|bounds, next| bounds.union(next))
     }
 
+    /// Returns the top-most retained raster image under the given page coordinate.
+    pub fn image_at(&self, x: f32, y: f32) -> Option<PageImageHit> {
+        let point = kurbo::Point::new(f64::from(x), f64::from(y));
+        self.commands
+            .iter()
+            .rev()
+            .find_map(|command| match command {
+                DisplayCommand::Image(command) if command.bounds.contains(point) => {
+                    Some(PageImageHit {
+                        width: command.width,
+                        height: command.height,
+                        pixels: Arc::clone(&command.pixels),
+                    })
+                }
+                DisplayCommand::Glyphs(_)
+                | DisplayCommand::Image(_)
+                | DisplayCommand::FillRect(_)
+                | DisplayCommand::Rule(_) => None,
+            })
+    }
+
     /// Visible UTF-8 byte range for a retained text placement.
     pub fn text_region_visible_range(&self, region_index: usize) -> Option<Range<usize>> {
         self.text_regions
@@ -97,9 +130,11 @@ impl PageDisplayList {
                 .iter()
                 .enumerate()
                 .find_map(|(index, region)| {
-                    region.hit_test(x, y, true).map(|byte_index| PageTextHit {
+                    region.hit_test(x, y, true).map(|hit| PageTextHit {
                         region_index: index,
-                        byte_index,
+                        byte_index: hit.byte_index,
+                        cluster_start: hit.cluster_start,
+                        cluster_end: hit.cluster_end,
                     })
                 });
         }
@@ -112,9 +147,11 @@ impl PageDisplayList {
                     .total_cmp(&right.vertical_distance(y))
             })
             .and_then(|(index, region)| {
-                region.hit_test(x, y, false).map(|byte_index| PageTextHit {
+                region.hit_test(x, y, false).map(|hit| PageTextHit {
                     region_index: index,
-                    byte_index,
+                    byte_index: hit.byte_index,
+                    cluster_start: hit.cluster_start,
+                    cluster_end: hit.cluster_end,
                 })
             })
     }
@@ -252,6 +289,12 @@ enum TextRegion {
     Fixed(FixedTextRegion),
 }
 
+struct TextRegionHit {
+    byte_index: usize,
+    cluster_start: usize,
+    cluster_end: usize,
+}
+
 impl TextRegion {
     fn visible_byte_range(&self) -> Option<Range<usize>> {
         match self {
@@ -275,7 +318,7 @@ impl TextRegion {
         }
     }
 
-    fn hit_test(&self, x: f32, y: f32, exact: bool) -> Option<usize> {
+    fn hit_test(&self, x: f32, y: f32, exact: bool) -> Option<TextRegionHit> {
         match self {
             Self::Shaped(region) => region.hit_test(x, y, exact),
             Self::Fixed(region) => region.hit_test(x, y, exact),
@@ -352,7 +395,7 @@ impl ShapedTextRegion {
         }
     }
 
-    fn hit_test(&self, x: f32, y: f32, exact: bool) -> Option<usize> {
+    fn hit_test(&self, x: f32, y: f32, exact: bool) -> Option<TextRegionHit> {
         let (top, bottom) = self.vertical_bounds()?;
         if exact && !(top..=bottom).contains(&y) {
             return None;
@@ -363,10 +406,10 @@ impl ShapedTextRegion {
         } else {
             y.clamp(top + 0.01, bottom - 0.01) - self.origin_y
         };
-        let byte_index = if exact {
+        let (byte_index, cluster_start, cluster_end) = if exact {
             let (cluster, side) = Cluster::from_point_exact(&self.layout, local_x, local_y)?;
             let range = cluster.text_range();
-            if cluster.is_rtl() {
+            let byte_index = if cluster.is_rtl() {
                 if side == ClusterSide::Left {
                     range.end
                 } else {
@@ -376,12 +419,18 @@ impl ShapedTextRegion {
                 range.start
             } else {
                 range.end
-            }
+            };
+            (byte_index, range.start, range.end)
         } else {
-            Cursor::from_point(&self.layout, local_x, local_y).index()
+            let byte_index = Cursor::from_point(&self.layout, local_x, local_y).index();
+            (byte_index, byte_index, byte_index)
         };
         let visible = self.visible_byte_range()?;
-        Some(byte_index.clamp(visible.start, visible.end))
+        Some(TextRegionHit {
+            byte_index: byte_index.clamp(visible.start, visible.end),
+            cluster_start: cluster_start.clamp(visible.start, visible.end),
+            cluster_end: cluster_end.clamp(visible.start, visible.end),
+        })
     }
 
     fn selection_fragment(&self, byte_range: Range<usize>) -> Option<PageSelectionFragment> {
@@ -591,7 +640,7 @@ impl FixedTextRegion {
         }
     }
 
-    fn hit_test(&self, x: f32, y: f32, exact: bool) -> Option<usize> {
+    fn hit_test(&self, x: f32, y: f32, exact: bool) -> Option<TextRegionHit> {
         let point = kurbo::Point::new(f64::from(x), f64::from(y));
         let span = if exact {
             self.spans.iter().find(|span| span.rect.contains(point))?
@@ -607,10 +656,15 @@ impl FixedTextRegion {
         } else {
             point.x >= span.rect.center().x
         };
-        Some(if after_middle {
+        let byte_index = if after_middle {
             span.byte_range.end
         } else {
             span.byte_range.start
+        };
+        Some(TextRegionHit {
+            byte_index,
+            cluster_start: span.byte_range.start,
+            cluster_end: span.byte_range.end,
         })
     }
 
@@ -819,6 +873,9 @@ struct ImageCommand {
     image: ImageBrush,
     transform: Affine,
     bounds: Rect,
+    width: u32,
+    height: u32,
+    pixels: Arc<[u8]>,
 }
 
 struct FillRectCommand {
@@ -871,6 +928,9 @@ impl DisplayListCompiler {
                             f64::from(image.x + image.width),
                             f64::from(image.y + image.height),
                         ),
+                        width: image.image.width,
+                        height: image.image.height,
+                        pixels: Arc::clone(&image.image.pixels),
                     }));
                     if let Some(replacement) = &image.replacement {
                         for segment in &replacement.segments {
@@ -1334,6 +1394,11 @@ mod tests {
         let rects = list.source_rects(std::slice::from_ref(&source));
         assert_eq!(rects.len(), 1);
         let point = rects[0].center();
+        let image = list
+            .image_at(point.x as f32, point.y as f32)
+            .expect("fixed image should be hit-testable");
+        assert_eq!((image.width, image.height), (100, 100));
+        assert_eq!(image.pixels.len(), 100 * 100 * 4);
         let hit = list
             .hit_test_text(point.x as f32, point.y as f32, true)
             .expect("fixed text should be hit-testable");
