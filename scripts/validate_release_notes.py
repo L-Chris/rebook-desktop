@@ -53,7 +53,7 @@ def main() -> None:
 
     compare_pattern = re.compile(
         r"^\*\*Full Changelog\*\*: "
-        r"https://github\.com/L-Chris/rebook-desktop/compare/"
+        r"https://github\.com/L-Chris/torto/compare/"
         r"v\d+\.\d+\.\d+\.\.\."
         + re.escape(tag)
         + r"$",

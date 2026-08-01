@@ -410,15 +410,55 @@ impl ShapedTextRegion {
             Cursor::from_byte_index(&self.layout, byte_range.start, Affinity::Downstream),
             Cursor::from_byte_index(&self.layout, byte_range.end, Affinity::Upstream),
         );
+        let selected_text = selection.text_range();
         selection
             .geometry(&self.layout)
             .into_iter()
             .filter(|(_, line_index)| self.lines.contains(line_index))
-            .map(|(rect, _)| {
+            .map(|(rect, line_index)| {
+                let mut x0 = rect.x0;
+                let mut x1 = rect.x1;
+
+                // Parley 0.10 does not include the extra whitespace advance added by
+                // justified alignment in LineMetrics::advance. Its selection geometry
+                // uses that stale value for fully selected middle lines, leaving the
+                // right-hand end of those lines unpainted. Reconstruct the visual
+                // advance from the adjusted clusters until the upstream issue is fixed:
+                // https://github.com/linebender/parley/issues/396
+                if let Some(line) = self.layout.get(line_index) {
+                    let line_text = line.text_range();
+                    if selected_text.start <= line_text.start && selected_text.end >= line_text.end
+                    {
+                        let text_advance = line
+                            .runs()
+                            .map(|run| {
+                                run.visual_clusters()
+                                    .map(|cluster| cluster.advance())
+                                    .sum::<f32>()
+                            })
+                            .sum::<f32>();
+                        let inline_box_advance = line
+                            .items()
+                            .filter_map(|item| match item {
+                                PositionedLayoutItem::InlineBox(inline_box) => {
+                                    Some(inline_box.width)
+                                }
+                                PositionedLayoutItem::GlyphRun(_) => None,
+                            })
+                            .sum::<f32>();
+                        let visual_start =
+                            f64::from(line.metrics().offset + line.metrics().inline_min_coord);
+                        let visual_end =
+                            visual_start + f64::from(text_advance + inline_box_advance);
+                        x0 = x0.min(visual_start.min(visual_end));
+                        x1 = x1.max(visual_start.max(visual_end));
+                    }
+                }
+
                 Rect::new(
-                    rect.x0 + f64::from(self.origin_x),
+                    x0 + f64::from(self.origin_x),
                     rect.y0 + f64::from(self.origin_y),
-                    rect.x1 + f64::from(self.origin_x),
+                    x1 + f64::from(self.origin_x),
                     rect.y1 + f64::from(self.origin_y),
                 )
             })
@@ -1148,6 +1188,86 @@ mod tests {
         assert_eq!(fragment.quote, "ello");
         assert_eq!(fragment.range, selected_source);
         assert!(!fragment.rects.is_empty());
+    }
+
+    #[test]
+    fn selection_covers_the_visual_width_of_justified_middle_lines() {
+        let text: Arc<str> =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu".into();
+        let mut font_context = FontContext::new();
+        let mut layout_context = LayoutContext::new();
+        let mut builder =
+            layout_context.ranged_builder(&mut font_context, text.as_ref(), 1.0, false);
+        builder.push_default(StyleProperty::FontSize(18.0));
+        builder.push_default(StyleProperty::Brush(TextBrush {
+            color: Rgba::BLACK,
+            underline: false,
+        }));
+        let mut layout = builder.build(text.as_ref());
+        layout.break_all_lines(Some(150.0));
+        layout.align(Alignment::Justify, AlignmentOptions::default());
+
+        let (line_y, expected_right) = layout
+            .lines()
+            .skip(1)
+            .take(layout.len().saturating_sub(2))
+            .find_map(|line| {
+                let visual_advance = line
+                    .runs()
+                    .map(|run| {
+                        run.visual_clusters()
+                            .map(|cluster| cluster.advance())
+                            .sum::<f32>()
+                    })
+                    .sum::<f32>();
+                (visual_advance > line.metrics().advance + 1.0).then_some((
+                    line.metrics().block_min_coord,
+                    line.metrics().offset + line.metrics().inline_min_coord + visual_advance,
+                ))
+            })
+            .expect("the fixture should contain a justified middle line");
+
+        let spine = SpineItemId::new("chapter-1").unwrap();
+        let source = SourceRange {
+            start: SourceAnchor {
+                spine: spine.clone(),
+                node: "paragraph-1".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine,
+                node: "paragraph-1".into(),
+                text_offset: u64::try_from(text.chars().count()).unwrap(),
+            },
+        };
+        let line_count = layout.len();
+        let origin_x = 24.0;
+        let origin_y = 24.0;
+        let page = PageLayout {
+            viewport: LayoutViewport::new(320, 240).unwrap(),
+            background: Rgba::BLACK,
+            items: vec![PageItem::Text(TextPlacement {
+                layout: Arc::new(layout),
+                text: Arc::clone(&text),
+                source_text_start: 0,
+                lines: 0..line_count,
+                origin_x,
+                origin_y,
+                source: Some(source),
+            })],
+        };
+
+        let fragment = DisplayListCompiler
+            .compile(&page)
+            .selection_fragment(0, 0..text.len())
+            .unwrap();
+        let rect = fragment
+            .rects
+            .iter()
+            .find(|rect| (rect.y0 - f64::from(line_y + origin_y)).abs() < 0.01)
+            .expect("the justified line should have selection geometry");
+
+        assert!((rect.x1 - f64::from(expected_right + origin_x)).abs() < 0.01);
     }
 
     #[test]

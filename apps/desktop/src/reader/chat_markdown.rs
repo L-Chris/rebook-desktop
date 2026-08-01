@@ -7,17 +7,17 @@ use std::time::{Duration, Instant};
 
 use egui::{FontFamily, FontId, ImageSource, RichText, Sense, TextStyle, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use lucide_icons::Icon;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use crate::preferences::AppLanguage;
-use crate::ui::{icon_button, palette};
+use crate::ui::{Icon, icon_button, palette};
 
 const MARKDOWN_FONT_SIZE: f32 = 13.0;
 const MARKDOWN_HEADING_FONT_SIZE: f32 = 16.0;
 const PREVIEW_GAP: f32 = 8.0;
 const ASSET_REPAINT_INTERVAL: Duration = Duration::from_millis(50);
 const ASSET_RENDER_TIMEOUT: Duration = Duration::from_secs(8);
+const CITATION_ICON: &str = "↗";
 
 fn markdown_font_size() -> f32 {
     crate::ui::scaled_font_size(MARKDOWN_FONT_SIZE)
@@ -1425,7 +1425,7 @@ fn citation_icon_markdown(markdown: &str) -> Cow<'_, str> {
         }
         output.push_str(&markdown[cursor..range.start]);
         output.push('[');
-        output.push(Icon::ExternalLink.unicode());
+        output.push_str(CITATION_ICON);
         output.push_str("](<");
         output.push_str(&locator);
         output.push_str(">)");
@@ -1661,7 +1661,7 @@ flowchart LR
         let iconized = citation_icon_markdown(source);
 
         assert!(!iconized.contains("中文引用"));
-        assert!(iconized.contains(Icon::ExternalLink.unicode()));
+        assert!(iconized.contains(CITATION_ICON));
         assert!(iconized.contains("[网页](https://example.com)"));
         assert_eq!(
             citation_locators(iconized.as_ref()),

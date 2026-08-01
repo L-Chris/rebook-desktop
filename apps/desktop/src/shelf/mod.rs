@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText, TextureHandle, Vec2};
-use lucide_icons::Icon;
 use peniko::Blob;
 
 use crate::async_task::{TaskResult, TaskSlot};
@@ -16,7 +15,7 @@ use crate::sync::{
     LocalSyncBook, SyncReport, SyncSettings, SyncStore, append_sync_log, format_error_chain,
     run_sync,
 };
-use crate::ui::{decode_color_image, icon, icon_button, palette};
+use crate::ui::{Icon, decode_color_image, icon, icon_button, paint_icon, palette};
 
 const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 const TOAST_MAX_WIDTH: f32 = 400.0;
@@ -440,7 +439,7 @@ impl ShelfFeature {
             Vec2::new(ui.available_width(), 44.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(icon(Icon::BookOpen).size(23.0).color(palette().accent));
+                ui.add(icon(Icon::BookOpen).size(23.0).color(palette().accent));
                 ui.label(
                     RichText::new(self.language.text("书架", "Library"))
                         .size(crate::ui::scaled_font_size(22.0))
@@ -490,7 +489,7 @@ impl ShelfFeature {
             egui::Layout::centered_and_justified(egui::Direction::TopDown),
             |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.label(icon(Icon::BookOpen).size(30.0).color(palette().muted));
+                    ui.add(icon(Icon::BookOpen).size(30.0).color(palette().muted));
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(if no_books {
@@ -566,11 +565,10 @@ impl ShelfFeature {
                 Color32::WHITE,
             );
         } else {
-            painter.text(
-                cover_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                Icon::BookOpen.unicode(),
-                egui::FontId::new(24.0, egui::FontFamily::Name("lucide".into())),
+            paint_icon(
+                ui,
+                egui::Rect::from_center_size(cover_rect.center(), Vec2::splat(24.0)),
+                Icon::BookOpen,
                 palette().muted,
             );
         }
@@ -749,7 +747,7 @@ fn shelf_toast(ctx: &egui::Context, id: &'static str, message: &str, kind: Shelf
                     ui.set_width((width - 28.0).max(0.0));
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
-                        ui.label(icon(icon_kind).size(18.0).color(foreground));
+                        ui.add(icon(icon_kind).size(18.0).color(foreground));
                         ui.add(
                             egui::Label::new(
                                 RichText::new(message)
@@ -784,7 +782,7 @@ fn shelf_search_field(ui: &mut egui::Ui, query: &mut String, hint: &str) {
         .show(ui, |ui| {
             ui.set_width(width - 22.0);
             ui.horizontal_centered(|ui| {
-                ui.label(icon(Icon::Search).size(15.0).color(palette().muted));
+                ui.add(icon(Icon::Search).size(15.0).color(palette().muted));
                 ui.add(
                     egui::TextEdit::singleline(query)
                         .hint_text(hint)
@@ -808,17 +806,19 @@ fn shelf_import_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     };
     let painter = ui.painter();
     painter.rect_filled(rect, 8.0, fill);
-    let icon_font = egui::FontId::new(15.0, egui::FontFamily::Name("lucide".into()));
+    let icon_size = 15.0;
     let text_font = egui::FontId::proportional(crate::ui::scaled_font_size(13.0));
-    let icon_galley =
-        painter.layout_no_wrap(Icon::Plus.unicode().into(), icon_font, Color32::WHITE);
     let text_galley = painter.layout_no_wrap(label.into(), text_font, Color32::WHITE);
     let gap = 6.0;
-    let content_width = icon_galley.size().x + gap + text_galley.size().x;
+    let content_width = icon_size + gap + text_galley.size().x;
     let start_x = rect.center().x - content_width / 2.0;
-    painter.galley(
-        egui::pos2(start_x, rect.center().y - icon_galley.size().y / 2.0),
-        icon_galley,
+    paint_icon(
+        ui,
+        egui::Rect::from_min_size(
+            egui::pos2(start_x, rect.center().y - icon_size / 2.0),
+            Vec2::splat(icon_size),
+        ),
+        Icon::Plus,
         Color32::WHITE,
     );
     painter.galley(

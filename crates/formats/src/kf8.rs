@@ -20,6 +20,24 @@ pub(crate) struct Kf8Section {
     source_index: usize,
 }
 
+pub(crate) struct MobiMetadata {
+    pub title: Option<String>,
+    pub authors: Vec<String>,
+    pub languages: Vec<String>,
+    pub cover_path: Option<String>,
+}
+
+pub(crate) struct Mobi6Book {
+    pub sections: Vec<Mobi6Section>,
+    pub resources: Vec<SourceResource>,
+    pub image_sources: HashMap<usize, String>,
+}
+
+pub(crate) struct Mobi6Section {
+    pub title: String,
+    pub html: String,
+}
+
 #[derive(Clone, Copy)]
 struct Header {
     compression: u16,
@@ -72,6 +90,129 @@ pub(crate) fn parse(bytes: &[u8], format: BookFormat) -> Result<Kf8Book, FormatE
     parse_inner(bytes).map_err(|error| conversion_error(format, error))
 }
 
+pub(crate) fn metadata(bytes: &[u8], format: BookFormat) -> Result<MobiMetadata, FormatError> {
+    metadata_inner(bytes).map_err(|error| conversion_error(format, error))
+}
+
+pub(crate) fn parse_mobi6(bytes: &[u8], format: BookFormat) -> Result<Mobi6Book, FormatError> {
+    parse_mobi6_inner(bytes).map_err(|error| conversion_error(format, error))
+}
+
+fn metadata_inner(data: &[u8]) -> Result<MobiMetadata, String> {
+    let context = Context::primary(data)?;
+    let record = context.pdb.record(0)?;
+    let header_length = usize_at_u32(record, 20)?;
+    let title_offset = usize_at_u32(record, 84)?;
+    let title_length = usize_at_u32(record, 88)?;
+    let mut title = bytes(record, title_offset, title_length)
+        .ok()
+        .map(|value| decode_text(value, context.header.encoding))
+        .filter(|value| !value.trim().is_empty());
+    let mut authors = Vec::new();
+    let mut languages = Vec::new();
+    let mut cover_offset = None;
+    let mut thumbnail_offset = None;
+    if optional_u32(record, 128).unwrap_or_default() & 0x40 != 0 {
+        let exth_start = 16usize
+            .checked_add(header_length)
+            .ok_or_else(|| "EXTH offset overflow".to_owned())?;
+        for entry in parse_exth(record, exth_start)? {
+            match entry.kind {
+                100 => push_metadata_text(&mut authors, entry.data, context.header.encoding),
+                201 => cover_offset = uint_from_bytes(entry.data).ok(),
+                202 => thumbnail_offset = uint_from_bytes(entry.data).ok(),
+                503 => {
+                    let value = decode_text(entry.data, context.header.encoding);
+                    if !value.trim().is_empty() {
+                        title = Some(value);
+                    }
+                }
+                524 => push_metadata_text(&mut languages, entry.data, context.header.encoding),
+                _ => {}
+            }
+        }
+    }
+    if languages.is_empty()
+        && let Some(language) = mobi_locale(record)
+    {
+        languages.push(language.to_owned());
+    }
+    let invalid_index = INVALID_INDEX as usize;
+    let cover_path = cover_offset
+        .filter(|offset| *offset != invalid_index)
+        .or_else(|| thumbnail_offset.filter(|offset| *offset != invalid_index))
+        .and_then(|offset| resource_path(&context, offset + 1).ok().flatten());
+    Ok(MobiMetadata {
+        title: title.map(|value| decode_html_entities(value.trim())),
+        authors: authors
+            .into_iter()
+            .map(|value| decode_html_entities(value.trim()))
+            .filter(|value| !value.is_empty())
+            .collect(),
+        languages,
+        cover_path,
+    })
+}
+
+fn parse_mobi6_inner(bytes: &[u8]) -> Result<Mobi6Book, String> {
+    let context = Context::primary(bytes)?;
+    if context.header.version >= 8 || hybrid_boundary(context.pdb.record(0)?)?.is_some() {
+        return Err("MOBI container contains KF8 content".to_owned());
+    }
+    let raw = context.load_text()?;
+    let file_positions = find_numeric_attributes(&raw, b"filepos");
+    let ranges = split_mobi6_sections(&raw);
+    let mut sections = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let section_raw = raw
+            .get(range.clone())
+            .ok_or_else(|| "MOBI6 section points outside decompressed text".to_owned())?;
+        let anchors = file_positions
+            .iter()
+            .copied()
+            .filter(|position| *position >= range.start && *position < range.end)
+            .map(|position| (position - range.start, position))
+            .collect::<Vec<_>>();
+        let anchored = insert_filepos_anchors(section_raw, &anchors)?;
+        let html = decode_text(&anchored, context.header.encoding);
+        if html.trim().is_empty() {
+            continue;
+        }
+        let title = extract_document_title(&html)
+            .unwrap_or_else(|| format!("Chapter {}", sections.len() + 1));
+        sections.push(Mobi6Section { title, html });
+    }
+    if sections.is_empty() {
+        return Err("MOBI6 book has no readable content sections".to_owned());
+    }
+
+    let mut resources = Vec::new();
+    let mut image_sources = HashMap::new();
+    let start = context
+        .base
+        .checked_add(context.header.resource_start)
+        .ok_or_else(|| "MOBI resource index overflow".to_owned())?;
+    for absolute_index in start..context.pdb.len() {
+        let record = context.pdb.record(absolute_index)?;
+        let Some((extension, media_type)) = image_type(record) else {
+            continue;
+        };
+        let id = absolute_index - start + 1;
+        let path = format!("Images/kindle-{id}.{extension}");
+        image_sources.insert(id, path.clone());
+        resources.push(SourceResource {
+            path,
+            media_type: media_type.to_owned(),
+            bytes: record.to_vec(),
+        });
+    }
+    Ok(Mobi6Book {
+        sections,
+        resources,
+        image_sources,
+    })
+}
+
 fn parse_inner(bytes: &[u8]) -> Result<Kf8Book, String> {
     let context = Context::open(bytes)?;
     let raw = context.load_text()?;
@@ -122,25 +263,30 @@ fn parse_inner(bytes: &[u8]) -> Result<Kf8Book, String> {
 }
 
 impl<'a> Context<'a> {
-    fn open(bytes: &'a [u8]) -> Result<Self, String> {
+    fn primary(bytes: &'a [u8]) -> Result<Self, String> {
         let pdb = Pdb::open(bytes)?;
-        let first = Header::parse(pdb.record(0)?)?;
-        if first.version >= 8 {
-            return Ok(Self {
-                pdb,
-                base: 0,
-                header: first,
-            });
+        let header = Header::parse(pdb.record(0)?)?;
+        Ok(Self {
+            pdb,
+            base: 0,
+            header,
+        })
+    }
+
+    fn open(bytes: &'a [u8]) -> Result<Self, String> {
+        let primary = Self::primary(bytes)?;
+        if primary.header.version >= 8 {
+            return Ok(primary);
         }
 
-        let boundary = hybrid_boundary(pdb.record(0)?)?
+        let boundary = hybrid_boundary(primary.pdb.record(0)?)?
             .ok_or_else(|| "MOBI container does not contain a KF8 header".to_owned())?;
-        let header = Header::parse(pdb.record(boundary)?)?;
+        let header = Header::parse(primary.pdb.record(boundary)?)?;
         if header.version < 8 {
             return Err("hybrid boundary does not point to a KF8 header".to_owned());
         }
         Ok(Self {
-            pdb,
+            pdb: primary.pdb,
             base: boundary,
             header,
         })
@@ -251,6 +397,228 @@ impl<'a> Pdb<'a> {
     fn len(&self) -> usize {
         self.offsets.len()
     }
+}
+
+struct ExthEntry<'a> {
+    kind: u32,
+    data: &'a [u8],
+}
+
+fn parse_exth(record: &[u8], start: usize) -> Result<Vec<ExthEntry<'_>>, String> {
+    if bytes(record, start, 4)? != b"EXTH" {
+        return Err("invalid EXTH header".to_owned());
+    }
+    let length = usize_at_u32(record, start + 4)?;
+    let count = usize_at_u32(record, start + 8)?;
+    if length < 12 || count > 4_096 {
+        return Err("invalid EXTH size".to_owned());
+    }
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| "EXTH range overflow".to_owned())?;
+    bytes(record, start, length)?;
+    let mut position = start + 12;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        if position + 8 > end {
+            return Err("truncated EXTH entry".to_owned());
+        }
+        let kind = u32_at(record, position)?;
+        let entry_length = usize_at_u32(record, position + 4)?;
+        if entry_length < 8 || position + entry_length > end {
+            return Err("invalid EXTH entry length".to_owned());
+        }
+        entries.push(ExthEntry {
+            kind,
+            data: bytes(record, position + 8, entry_length - 8)?,
+        });
+        position += entry_length;
+    }
+    Ok(entries)
+}
+
+fn push_metadata_text(values: &mut Vec<String>, data: &[u8], encoding: u32) {
+    let value = decode_text(data, encoding);
+    let value = value.trim_matches(['\0', ' ', '\r', '\n', '\t']);
+    if !value.is_empty() {
+        values.push(value.to_owned());
+    }
+}
+
+fn mobi_locale(record: &[u8]) -> Option<&'static str> {
+    let region = usize::from(*record.get(94)? >> 2);
+    match *record.get(95)? {
+        1 => Some("ar"),
+        2 => Some("bg"),
+        3 => Some("ca"),
+        4 => Some(match region {
+            1 => "zh-TW",
+            2 => "zh-CN",
+            3 => "zh-HK",
+            4 => "zh-SG",
+            _ => "zh",
+        }),
+        5 => Some("cs"),
+        6 => Some("da"),
+        7 => Some("de"),
+        8 => Some("el"),
+        9 => Some(match region {
+            1 => "en-US",
+            2 => "en-GB",
+            3 => "en-AU",
+            4 => "en-CA",
+            _ => "en",
+        }),
+        10 => Some("es"),
+        11 => Some("fi"),
+        12 => Some("fr"),
+        13 => Some("he"),
+        14 => Some("hu"),
+        16 => Some("it"),
+        17 => Some("ja"),
+        18 => Some("ko"),
+        19 => Some("nl"),
+        20 => Some("no"),
+        21 => Some("pl"),
+        22 => Some("pt"),
+        24 => Some("ro"),
+        25 => Some("ru"),
+        27 => Some("sk"),
+        29 => Some("sv"),
+        30 => Some("th"),
+        31 => Some("tr"),
+        33 => Some("id"),
+        34 => Some("uk"),
+        39 => Some("lt"),
+        42 => Some("vi"),
+        57 => Some("hi"),
+        _ => None,
+    }
+}
+
+fn resource_path(context: &Context<'_>, id: usize) -> Result<Option<String>, String> {
+    let start = context
+        .base
+        .checked_add(context.header.resource_start)
+        .ok_or_else(|| "MOBI resource index overflow".to_owned())?;
+    let absolute = start
+        .checked_add(id.saturating_sub(1))
+        .ok_or_else(|| "MOBI resource index overflow".to_owned())?;
+    let record = context.pdb.record(absolute)?;
+    Ok(image_type(record).map(|(extension, _)| format!("Images/kindle-{id}.{extension}")))
+}
+
+fn find_numeric_attributes(data: &[u8], name: &[u8]) -> Vec<usize> {
+    let lower = data.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    let mut values = Vec::new();
+    let mut search = 0usize;
+    while search + name.len() <= lower.len() {
+        let Some(relative) = lower[search..]
+            .windows(name.len())
+            .position(|window| window == name)
+        else {
+            break;
+        };
+        let start = search + relative;
+        search = start + name.len();
+        if start > 0 && lower[start - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let mut position = search;
+        while lower.get(position).is_some_and(u8::is_ascii_whitespace) {
+            position += 1;
+        }
+        if lower.get(position) != Some(&b'=') {
+            continue;
+        }
+        position += 1;
+        while lower.get(position).is_some_and(u8::is_ascii_whitespace) {
+            position += 1;
+        }
+        let quote = lower
+            .get(position)
+            .copied()
+            .filter(|byte| matches!(byte, b'\'' | b'"'));
+        if quote.is_some() {
+            position += 1;
+        }
+        let value_start = position;
+        while lower.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        }
+        if position > value_start
+            && quote.is_none_or(|quote| lower.get(position) == Some(&quote))
+            && let Ok(value) = std::str::from_utf8(&lower[value_start..position])
+                .unwrap_or_default()
+                .parse()
+        {
+            values.push(value);
+        }
+    }
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn split_mobi6_sections(data: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let lower = data.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    let mut ranges = Vec::new();
+    let mut section_start = 0usize;
+    let mut position = 0usize;
+    while let Some(relative_start) = lower[position..].iter().position(|byte| *byte == b'<') {
+        let tag_start = position + relative_start;
+        let Some(relative_end) = lower[tag_start..].iter().position(|byte| *byte == b'>') else {
+            break;
+        };
+        let tag_end = tag_start + relative_end + 1;
+        let name = lower[tag_start + 1..tag_end - 1]
+            .iter()
+            .copied()
+            .skip_while(|byte| byte.is_ascii_whitespace() || *byte == b'/')
+            .take_while(|byte| !byte.is_ascii_whitespace() && *byte != b'/')
+            .collect::<Vec<_>>();
+        if matches!(name.as_slice(), b"mbp:pagebreak" | b"pagebreak") {
+            if section_start < tag_start {
+                ranges.push(section_start..tag_start);
+            }
+            section_start = tag_end;
+        }
+        position = tag_end;
+    }
+    if section_start < data.len() {
+        ranges.push(section_start..data.len());
+    }
+    if ranges.is_empty() && !data.is_empty() {
+        ranges.push(0..data.len());
+    }
+    ranges
+}
+
+fn insert_filepos_anchors(data: &[u8], anchors: &[(usize, usize)]) -> Result<Vec<u8>, String> {
+    let extra = anchors.len().saturating_mul(40);
+    let mut output = Vec::with_capacity(data.len().saturating_add(extra));
+    let mut copied = 0usize;
+    for &(offset, position) in anchors {
+        if offset > data.len() || offset < copied {
+            return Err("invalid MOBI6 file position".to_owned());
+        }
+        output.extend_from_slice(&data[copied..offset]);
+        output.extend_from_slice(format!("<a id=\"filepos{position}\"></a>").as_bytes());
+        copied = offset;
+    }
+    output.extend_from_slice(&data[copied..]);
+    Ok(output)
+}
+
+fn decode_html_entities(value: &str) -> String {
+    value
+        .replace("&nbsp;", " ")
+        .replace("&#160;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 fn hybrid_boundary(record: &[u8]) -> Result<Option<usize>, String> {
@@ -876,12 +1244,16 @@ fn load_embedded_images(
     resources: &mut Vec<SourceResource>,
     paths: &mut HashMap<ResourceKey, String>,
 ) -> Result<(), String> {
-    for absolute_index in context.header.resource_start..context.pdb.len() {
+    let resource_start = context
+        .base
+        .checked_add(context.header.resource_start)
+        .ok_or_else(|| "KF8 resource index overflow".to_owned())?;
+    for absolute_index in resource_start..context.pdb.len() {
         let record = context.pdb.record(absolute_index)?;
         let Some((extension, media_type)) = image_type(record) else {
             continue;
         };
-        let id = absolute_index - context.header.resource_start + 1;
+        let id = absolute_index - resource_start + 1;
         let path = format!("Images/kindle-{id}.{extension}");
         paths.insert(ResourceKey::Embed(id), path.clone());
         resources.push(SourceResource {

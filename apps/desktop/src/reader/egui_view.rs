@@ -2,7 +2,6 @@ use std::time::{Duration, Instant};
 
 use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, Pos2, Rect, RichText, TextureId, Vec2};
-use lucide_icons::Icon;
 use rebook_layout::reading_content_left;
 use rebook_reader::PageDirection;
 
@@ -13,8 +12,8 @@ use super::chat_markdown::ChatMarkdownState;
 use super::{AnnotationDraft, AssistantPanel, DesktopReader, ReaderOverlay, SidebarTab};
 use crate::plugins::{ChatCommand, ChatRole, chat_command_suggestions};
 use crate::ui::{
-    decode_color_image, icon, icon_button, navigation_button, navigation_text_button, palette,
-    selectable_icon_button, toggle_icon_button,
+    Icon, decode_color_image, icon, icon_button, navigation_button, navigation_text_button,
+    paint_icon, palette, selectable_icon_button, toggle_icon_button,
 };
 
 pub(super) const SIDEBAR_WIDTH: f32 = 256.0;
@@ -887,7 +886,7 @@ impl DesktopReader {
             Vec2::new(width, TOOLBAR_HEIGHT),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(icon(Icon::MessageCircle).color(palette().muted));
+                ui.add(icon(Icon::MessageCircle).color(palette().muted));
                 ui.label(
                     RichText::new(self.language.text("AI 对话", "AI chat"))
                         .size(crate::ui::scaled_font_size(14.0))
@@ -943,7 +942,7 @@ impl DesktopReader {
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
                             ui.add_space(ASSISTANT_EMPTY_TOP_PADDING);
-                            ui.label(icon(Icon::MessageCircle).size(27.0).color(palette().muted));
+                            ui.add(icon(Icon::MessageCircle).size(27.0).color(palette().muted));
                             ui.label(
                                 RichText::new(
                                     self.language
@@ -1352,6 +1351,8 @@ impl DesktopReader {
                 page_rect.top() + rect.y + rect.height + 8.0,
             )
         });
+        let selection_text = selection.text.clone();
+        let mut copy_selection = false;
         let mut create_highlight = false;
         let mut open_note = false;
         let mut save_note = false;
@@ -1373,6 +1374,9 @@ impl DesktopReader {
                         }
                     } else {
                         ui.horizontal(|ui| {
+                            copy_selection = icon_button(ui, Icon::Copy)
+                                .on_hover_text(self.language.text("复制", "Copy"))
+                                .clicked();
                             create_highlight = icon_button(ui, Icon::Highlighter)
                                 .on_hover_text(self.language.text("高亮", "Highlight"))
                                 .clicked();
@@ -1386,7 +1390,17 @@ impl DesktopReader {
                     }
                 });
             });
-        if create_highlight {
+        if copy_selection {
+            ctx.copy_text(selection_text);
+            self.notice_timer.show(
+                &mut self.notice,
+                self.language
+                    .text("已复制到剪贴板", "Copied to clipboard")
+                    .into(),
+                Instant::now(),
+            );
+            ctx.request_repaint_after(super::NOTICE_AUTO_DISMISS_DELAY);
+        } else if create_highlight {
             self.create_highlight(None);
         } else if open_note {
             self.annotation_note_draft = Some(AnnotationDraft {
@@ -1457,6 +1471,24 @@ impl DesktopReader {
                         .fill(palette().toast_error_fill)
                         .show(ui, |ui| {
                             ui.label(RichText::new(error).color(Color32::WHITE));
+                        });
+                });
+        } else if let Some(notice) = &self.notice {
+            egui::Area::new("reader-notice".into())
+                .order(egui::Order::Tooltip)
+                .anchor(egui::Align2::RIGHT_TOP, [-18.0, 62.0])
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .fill(palette().accent_soft)
+                        .stroke(egui::Stroke::new(1.0, palette().accent_border))
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(14, 11))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                ui.add(icon(Icon::CheckCircle).color(palette().accent));
+                                ui.label(RichText::new(notice).color(palette().accent));
+                            });
                         });
                 });
         }
@@ -1549,15 +1581,14 @@ fn toc_toggle_button(
         ui.painter()
             .rect_filled(rect, 6.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
-    ui.painter().text(
-        center,
-        egui::Align2::CENTER_CENTER,
+    paint_icon(
+        ui,
+        Rect::from_center_size(center, Vec2::splat(15.0)),
         if expanded {
-            Icon::ChevronDown.unicode()
+            Icon::ChevronDown
         } else {
-            Icon::ChevronRight.unicode()
+            Icon::ChevronRight
         },
-        egui::FontId::new(15.0, egui::FontFamily::Name("lucide".into())),
         if selected {
             palette().accent
         } else {
@@ -1814,7 +1845,7 @@ fn annotation_editor(
     let mut action = AnnotationEditorAction::None;
     ui.set_width(312.0);
     ui.horizontal(|ui| {
-        ui.label(
+        ui.add(
             icon(Icon::MessageSquarePlus)
                 .size(crate::ui::scaled_font_size(16.0))
                 .color(palette().accent),

@@ -240,6 +240,8 @@ pub(super) struct DesktopReader {
     page_scene_lru: VecDeque<PageSceneKey>,
     pending_page_turn: Option<PageDirection>,
     settings_requested: bool,
+    notice: Option<String>,
+    notice_timer: TransientMessageTimer,
     error: Option<String>,
     error_timer: TransientMessageTimer,
     pub(super) exit_requested: bool,
@@ -413,6 +415,12 @@ struct TransientMessageTimer {
 }
 
 impl TransientMessageTimer {
+    fn show(&mut self, current: &mut Option<String>, message: String, now: Instant) {
+        *current = Some(message);
+        self.message.clone_from(current);
+        self.dismiss_at = Some(now + NOTICE_AUTO_DISMISS_DELAY);
+    }
+
     fn advance(&mut self, current: &mut Option<String>, now: Instant) -> bool {
         if self.message.as_deref() != current.as_deref() {
             self.message.clone_from(current);
@@ -737,6 +745,8 @@ impl DesktopReader {
             page_scene_lru: VecDeque::new(),
             pending_page_turn: None,
             settings_requested: false,
+            notice: None,
+            notice_timer: TransientMessageTimer::default(),
             error,
             error_timer: TransientMessageTimer::default(),
             exit_requested: false,
@@ -916,5 +926,22 @@ mod tests {
         assert!(timer.advance(&mut message, replacement_time + NOTICE_AUTO_DISMISS_DELAY));
         assert!(message.is_none());
         assert!(timer.dismiss_at.is_none());
+    }
+
+    #[test]
+    fn repeating_a_notice_restarts_its_auto_dismiss_deadline() {
+        let now = Instant::now();
+        let mut timer = TransientMessageTimer::default();
+        let mut message = None;
+        timer.show(&mut message, "copied".into(), now);
+
+        let repeated_at = now + NOTICE_AUTO_DISMISS_DELAY / 2;
+        timer.show(&mut message, "copied".into(), repeated_at);
+
+        assert_eq!(message.as_deref(), Some("copied"));
+        assert_eq!(
+            timer.dismiss_at,
+            Some(repeated_at + NOTICE_AUTO_DISMISS_DELAY)
+        );
     }
 }

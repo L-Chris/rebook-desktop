@@ -44,7 +44,6 @@ fontdb.workspace = true
 image.workspace = true
 keyring.workspace = true
 kurbo.workspace = true
-lucide-icons.workspace = true
 mermaid-rs-renderer.workspace = true
 peniko.workspace = true
 percent-encoding.workspace = true
@@ -83,3 +82,10 @@ winresource = "0.1.31"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 window-vibrancy = "0.8.0"
+wgpu = { workspace = true, features = ["dx12", "vulkan"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+wgpu = { workspace = true, features = ["metal"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+wgpu = { workspace = true, features = ["vulkan", "gles"] }

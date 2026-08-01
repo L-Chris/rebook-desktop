@@ -18,16 +18,16 @@ EPUB container -> Reading IR -> PageLayout -> PageDisplayList -> Vello
 ```
 
 1. `publication` 定义格式和 renderer 无关的 `BookSource` 与 Reading IR：`Book/Section/Block/Inline`。
-2. `epub` 负责安全容器、metadata/spine/resource，并按章节懒解析 XHTML；容器解析与 Reading IR 解析分模块。
+2. `formats` 负责不同书籍容器、metadata/spine/resource，并按需解析内容；格式解析与 Reading IR 解析分模块。
 3. `layout` 持有 Parley 字体与布局上下文，直接从 Reading IR 产生分页后的 `PageLayout`。长段落必须可跨页，图片只解码一次；图片作者尺寸和最大尺寸在列宽/页高内解析。单页和双页 spread 使用同一分页器，双页只改变每个 surface 的列几何。
 4. `renderer` 把页面编译为 retained `PageDisplayList`，缓存 glyph/font/image/rule 命令；GPU 和 CPU 后端共享同一绘制协议。
-5. `reader` 是唯一的会话编排者。当前章节页面常驻，当前章前后各两章使用五项 LRU；持久 prefetch worker 拥有独立的 `LayoutEngine`/字体缓存，在 UI 线程外解析、分页并编译章节窗口。Reader 解析 TOC href 到 spine section，普通翻页不得触发解析、排版或 display-list 编译。
-6. `desktop` 使用 crates.io 发布版 Xilem 0.4.0/Masonry 管理窗口生命周期、输入、DPI/resize、目录侧边栏、滚动和无障碍，不持有 EPUB/DOM 逻辑。阅读页继续消费 retained `PageDisplayList`；窄桥接层把 AnyRender/Vello 0.9 命令转换为 Xilem 所用的 Vello 0.6 scene，并共享字体/图片 blob，不进行 CPU 位图回读。桌面层可缓存最近使用的 Vello Scene，但该后端缓存不能反向进入 renderer-independent Reading IR、PageLayout 或 PageDisplayList。
+5. `reader` 是唯一的会话编排者，负责导航、页面缓存、后台预取和目录定位；普通缓存翻页不得重新触发格式解析、排版或 display-list 编译。
+6. `desktop` 使用 winit、egui 和 wgpu 管理窗口生命周期、输入、界面与 GPU 合成，不持有格式解析逻辑。阅读页消费 retained `PageDisplayList`，通过 AnyRender/Vello 适配层生成正文 Scene；桌面端缓存不得反向进入 renderer-independent Reading IR、`PageLayout` 或 `PageDisplayList`。
 
 核心 crate 的依赖方向为：
 
 ```text
-desktop -> reader -> layout -> publication <- epub
+desktop -> reader -> layout -> publication <- formats
                  \-> renderer -> layout
 ```
 

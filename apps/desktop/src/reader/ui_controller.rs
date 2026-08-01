@@ -103,6 +103,7 @@ impl DesktopReader {
 
     pub(in crate::reader) fn advance_frame(&mut self, now: Instant) {
         self.advance_motion(now);
+        self.notice_timer.advance(&mut self.notice, now);
         self.error_timer.advance(&mut self.error, now);
         self.chat.error_timer.advance(&mut self.chat.error, now);
         self.retry_pending_page_turn();
@@ -110,6 +111,7 @@ impl DesktopReader {
 
     pub(in crate::reader) fn next_transient_message_deadline(&self) -> Option<Instant> {
         [
+            self.notice_timer.dismiss_at,
             self.error_timer.dismiss_at,
             self.chat.error_timer.dismiss_at,
             self.translation.dismiss_at,

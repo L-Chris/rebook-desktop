@@ -1,3 +1,5 @@
+mod http_loader;
+mod icons;
 mod svg_loader;
 
 use std::collections::BTreeSet;
@@ -8,7 +10,8 @@ use egui::{
     Align2, Color32, ColorImage, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Rect,
     Response, Sense, Stroke, TextStyle, Ui, Vec2, WidgetInfo, WidgetType,
 };
-use lucide_icons::Icon;
+
+pub(crate) use icons::{Icon, IconWidget, paint_icon};
 
 use crate::preferences::{
     AppTheme, DEFAULT_INTERFACE_FONT_SIZE, InterfaceTypography, SYSTEM_INTERFACE_FONT,
@@ -170,8 +173,13 @@ pub(crate) fn palette() -> Palette {
     }
 }
 
-pub(crate) fn configure(ctx: &egui::Context, interface_typography: &InterfaceTypography) {
+pub(crate) fn configure(
+    ctx: &egui::Context,
+    interface_typography: &InterfaceTypography,
+    runtime: &tokio::runtime::Handle,
+) {
     egui_extras::install_image_loaders(ctx);
+    http_loader::install(ctx, runtime);
     svg_loader::install(ctx);
     // Application state is mutated while building a frame. A single pass keeps
     // keyboard and pointer actions exactly-once; the retained reader layout
@@ -233,14 +241,6 @@ pub(crate) fn apply_interface_typography(
         "reader-cjk".into(),
         FontData::from_static(crate::fonts::cjk_font_bytes()).into(),
     );
-    fonts.font_data.insert(
-        "lucide".into(),
-        FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES).into(),
-    );
-    fonts
-        .families
-        .insert(FontFamily::Name("lucide".into()), vec!["lucide".into()]);
-
     let mut database = fontdb::Database::new();
     database.load_system_fonts();
     let requested_families = if interface_typography.font_family == SYSTEM_INTERFACE_FONT {
@@ -269,7 +269,6 @@ pub(crate) fn apply_interface_typography(
         .unwrap_or_default();
     interface_fonts.extend(proportional_fallbacks);
     interface_fonts.push("reader-cjk".into());
-    interface_fonts.push("lucide".into());
     interface_fonts.dedup();
     fonts
         .families
@@ -277,7 +276,6 @@ pub(crate) fn apply_interface_typography(
 
     let monospace_fonts = fonts.families.entry(FontFamily::Monospace).or_default();
     monospace_fonts.push("reader-cjk".into());
-    monospace_fonts.push("lucide".into());
     ctx.set_fonts(fonts);
 
     ctx.all_styles_mut(|style| {
@@ -387,10 +385,8 @@ pub(crate) fn apply_visuals(ctx: &egui::Context, palette: &Palette) {
     ctx.set_visuals(visuals);
 }
 
-pub(crate) fn icon(icon: Icon) -> egui::RichText {
-    egui::RichText::new(icon.unicode().to_string())
-        .family(egui::FontFamily::Name("lucide".into()))
-        .size(17.0)
+pub(crate) const fn icon(icon: Icon) -> IconWidget {
+    IconWidget::new(icon)
 }
 
 /// A compact icon action painted as one borderless rounded layer.
@@ -439,22 +435,22 @@ pub(crate) fn toggle_icon_button(
         if fill != Color32::TRANSPARENT {
             painter.rect_filled(rect, 6.0, fill);
         }
-        let icon_galley = painter.layout_no_wrap(
-            glyph.unicode().to_string(),
-            FontId::new(16.0, FontFamily::Name("lucide".into())),
-            foreground,
-        );
+        let icon_size = 16.0;
         let label_galley = painter.layout_no_wrap(
             state_label.to_owned(),
             FontId::proportional(scaled_font_size(11.0)),
             foreground,
         );
         let gap = 4.0;
-        let content_width = icon_galley.size().x + gap + label_galley.size().x;
+        let content_width = icon_size + gap + label_galley.size().x;
         let start_x = rect.center().x - content_width / 2.0;
-        painter.galley(
-            egui::pos2(start_x, rect.center().y - icon_galley.size().y / 2.0),
-            icon_galley,
+        paint_icon(
+            ui,
+            Rect::from_min_size(
+                egui::pos2(start_x, rect.center().y - icon_size / 2.0),
+                Vec2::splat(icon_size),
+            ),
+            glyph,
             foreground,
         );
         painter.galley(
@@ -487,21 +483,20 @@ fn painted_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -> Response {
     } else {
         palette.text
     };
-    let label = glyph.unicode().to_string();
+    let label = glyph.name();
 
     if ui.is_rect_visible(rect) {
         if fill != Color32::TRANSPARENT {
             paint_compact_rounded_background(ui, rect, 6.0, fill);
         }
-        ui.painter().text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            &label,
-            FontId::new(17.0, FontFamily::Name("lucide".into())),
+        paint_icon(
+            ui,
+            Rect::from_center_size(rect.center(), Vec2::splat(17.0)),
+            glyph,
             foreground,
         );
     }
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), &label));
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), label));
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -562,11 +557,13 @@ pub(crate) fn navigation_button(ui: &mut Ui, glyph: Icon, label: &str, selected:
 
     if ui.is_rect_visible(rect) {
         ui.painter().rect_filled(rect, 6.0, fill);
-        ui.painter().text(
-            egui::pos2(rect.left() + 10.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            glyph.unicode().to_string(),
-            FontId::new(17.0, FontFamily::Name("lucide".into())),
+        paint_icon(
+            ui,
+            Rect::from_min_size(
+                egui::pos2(rect.left() + 10.0, rect.center().y - 8.5),
+                Vec2::splat(17.0),
+            ),
+            glyph,
             foreground,
         );
         ui.painter().text(

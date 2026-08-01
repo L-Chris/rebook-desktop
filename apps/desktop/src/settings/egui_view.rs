@@ -1,5 +1,4 @@
 use egui::{Align2, Color32, Response, RichText, Vec2};
-use lucide_icons::Icon;
 use rebook_layout::{ReaderDefaultFont, SpreadMode};
 
 use super::{SettingsFeature, SettingsTab};
@@ -10,7 +9,7 @@ use crate::plugins::{
 };
 use crate::preferences::{AppLanguage, AppTheme};
 use crate::sync::{CloudProviderKind, SYNC_INTERVAL_OPTIONS};
-use crate::ui::{icon_button, navigation_button, palette};
+use crate::ui::{Icon, icon_button, navigation_button, palette};
 
 const SETTINGS_SELECT_WIDTH: f32 = 156.0;
 const SETTINGS_MODEL_SELECT_WIDTH: f32 = 280.0;
@@ -740,6 +739,8 @@ fn font_family_selector(
     selected: &mut String,
     font_families: &[String],
 ) {
+    let combo_box_id = ui.make_persistent_id(id_salt);
+    let was_open = egui::ComboBox::is_open(ui.ctx(), combo_box_id);
     let selected_text = selected.clone();
     egui::ComboBox::from_id_salt(id_salt)
         .width(SETTINGS_FONT_SELECT_WIDTH)
@@ -747,7 +748,11 @@ fn font_family_selector(
         .selected_text(selected_text)
         .show_ui(ui, |ui| {
             for family in font_families {
-                ui.selectable_value(selected, family.clone(), family);
+                let is_selected = *selected == *family;
+                let response = ui.selectable_value(selected, family.clone(), family);
+                if !was_open && is_selected {
+                    response.scroll_to_me(Some(egui::Align::Center));
+                }
             }
         });
 }

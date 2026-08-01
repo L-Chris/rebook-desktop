@@ -1,3 +1,5 @@
+mod catalog;
+
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -13,7 +15,6 @@ use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{RenderCache, RenderSettings};
 use kurbo::{Affine, BezPath, Point, Rect, Shape};
-use lopdf::{Document, TocType, decode_text_string};
 use rebook_publication::{
     Block, Book, BookSource, FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan, Metadata,
     PublicationError, PublicationUrl, RasterResource, RenditionLayout, Resource, Section,
@@ -21,7 +22,7 @@ use rebook_publication::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::source::{DirectBookSource, SectionContent, SourceBook, SourceSection, SourceTocEntry};
+use crate::source::{DirectBookSource, SectionContent, SourceBook, SourceSection};
 use crate::{BookFormat, FormatError, conversion_error};
 
 const COVER_PATH: &str = "Cover/thumbnail.png";
@@ -67,22 +68,17 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<PdfPublication, Form
         ));
     }
 
-    let lopdf = Document::load_mem(bytes.as_ref()).ok();
-    let title = lopdf
-        .as_ref()
-        .and_then(|document| document_info_text(document, b"Title"))
+    let catalog = catalog::read(&pdf);
+    let title = catalog
+        .title
         .filter(|title| !title.trim().is_empty())
         .unwrap_or_else(|| title_from_file_name(file_name));
-    let authors = lopdf
-        .as_ref()
-        .and_then(|document| document_info_text(document, b"Author"))
+    let authors = catalog
+        .author
         .filter(|author| !author.trim().is_empty())
         .into_iter()
         .collect();
-    let table_of_contents = lopdf
-        .as_ref()
-        .and_then(|document| document.get_toc().ok())
-        .map_or_else(Vec::new, |toc| build_outline(&toc.toc, page_count));
+    let table_of_contents = catalog.table_of_contents;
     let sections = (0..page_count)
         .map(|index| SourceSection {
             title: format!("Page {}", index + 1),
@@ -635,47 +631,6 @@ fn touch_page(lru: &mut VecDeque<usize>, page_index: usize) {
     lru.push_back(page_index);
 }
 
-fn document_info_text(document: &Document, key: &[u8]) -> Option<String> {
-    let info = document.trailer.get(b"Info").ok()?;
-    let (_, info) = document.dereference(info).ok()?;
-    let value = info.as_dict().ok()?.get(key).ok()?;
-    let (_, value) = document.dereference(value).ok()?;
-    decode_text_string(value).ok()
-}
-
-fn build_outline(items: &[TocType], page_count: usize) -> Vec<SourceTocEntry> {
-    let mut cursor = 0;
-    build_outline_level(items, page_count, &mut cursor, 0)
-}
-
-fn build_outline_level(
-    items: &[TocType],
-    page_count: usize,
-    cursor: &mut usize,
-    parent_level: usize,
-) -> Vec<SourceTocEntry> {
-    let mut entries = Vec::new();
-    while let Some(item) = items.get(*cursor) {
-        let level = item.level.max(1);
-        if level <= parent_level {
-            break;
-        }
-        *cursor += 1;
-        let children = build_outline_level(items, page_count, cursor, level);
-        let label = item.title.trim();
-        if label.is_empty() || item.page == 0 || item.page > page_count {
-            entries.extend(children);
-            continue;
-        }
-        entries.push(SourceTocEntry {
-            label: label.to_owned(),
-            href: format!("Text/section-{}.xhtml", item.page),
-            children,
-        });
-    }
-    entries
-}
-
 fn title_from_file_name(file_name: &str) -> String {
     Path::new(file_name)
         .file_stem()
@@ -757,7 +712,7 @@ mod tests {
     fn minimal_pdf() -> Vec<u8> {
         let content = b"BT /F1 12 Tf 20 80 Td (Hello PDF) Tj ET";
         let objects = [
-            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Catalog /Pages 2 0 R /Outlines 7 0 R >>".to_vec(),
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 160] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
             format!("<< /Length {} >>\nstream\n", content.len())
@@ -768,6 +723,8 @@ mod tests {
                 .collect(),
             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
             b"<< /Title (Test PDF) /Author (Rebook) >>".to_vec(),
+            b"<< /Type /Outlines /First 8 0 R /Last 8 0 R /Count 1 >>".to_vec(),
+            b"<< /Title (Page 1) /Parent 7 0 R /Dest [3 0 R /Fit] >>".to_vec(),
         ];
         let mut output = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n".to_vec();
         let mut offsets = Vec::with_capacity(objects.len());
