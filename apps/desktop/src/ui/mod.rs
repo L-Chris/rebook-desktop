@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use egui::emath::GuiRounding;
 use egui::{
-    Align2, Color32, ColorImage, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Rect,
+    Align2, Color32, ColorImage, CornerRadius, FontData, FontDefinitions, FontFamily, Rect,
     Response, Sense, Stroke, TextStyle, Ui, Vec2, WidgetInfo, WidgetType,
 };
 
@@ -401,69 +401,6 @@ pub(crate) fn icon_button(ui: &mut Ui, glyph: Icon) -> Response {
 /// instead of the high-contrast fill intended for primary actions.
 pub(crate) fn selectable_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -> Response {
     painted_icon_button(ui, glyph, selected)
-}
-
-/// Compact toolbar toggle with an explicit text state, so the inactive state is
-/// understandable without relying on color or a hover tooltip.
-pub(crate) fn toggle_icon_button(
-    ui: &mut Ui,
-    glyph: Icon,
-    selected: bool,
-    on_label: &str,
-    off_label: &str,
-) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(52.0, 32.0), Sense::click());
-    let palette = palette();
-    let fill = if selected {
-        palette.accent_soft
-    } else if response.is_pointer_button_down_on() {
-        ui.visuals().widgets.active.weak_bg_fill
-    } else if response.hovered() {
-        ui.visuals().widgets.hovered.weak_bg_fill
-    } else {
-        Color32::TRANSPARENT
-    };
-    let foreground = if selected {
-        palette.accent
-    } else {
-        palette.muted
-    };
-    let state_label = if selected { on_label } else { off_label };
-
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        if fill != Color32::TRANSPARENT {
-            painter.rect_filled(rect, 6.0, fill);
-        }
-        let icon_size = 16.0;
-        let label_galley = painter.layout_no_wrap(
-            state_label.to_owned(),
-            FontId::proportional(scaled_font_size(11.0)),
-            foreground,
-        );
-        let gap = 4.0;
-        let content_width = icon_size + gap + label_galley.size().x;
-        let start_x = rect.center().x - content_width / 2.0;
-        paint_icon(
-            ui,
-            Rect::from_min_size(
-                egui::pos2(start_x, rect.center().y - icon_size / 2.0),
-                Vec2::splat(icon_size),
-            ),
-            glyph,
-            foreground,
-        );
-        painter.galley(
-            egui::pos2(
-                start_x + content_width - label_galley.size().x,
-                rect.center().y - label_galley.size().y / 2.0,
-            ),
-            label_galley,
-            foreground,
-        );
-    }
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), state_label));
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn painted_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -> Response {

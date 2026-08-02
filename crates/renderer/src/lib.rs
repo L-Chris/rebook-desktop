@@ -44,6 +44,7 @@ pub struct PageImageHit {
 pub struct PageDisplayList {
     width: u32,
     height: u32,
+    content_bottom: Option<f32>,
     background: Color,
     commands: Vec<DisplayCommand>,
     text_regions: Vec<TextRegion>,
@@ -58,6 +59,14 @@ impl PageDisplayList {
     /// Logical height of the compiled page.
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    /// Bottom edge of the retained page content in logical page coordinates.
+    ///
+    /// Unlike the page height, this excludes unused pagination space after the
+    /// final text line or image.
+    pub fn content_bottom(&self) -> Option<f32> {
+        self.content_bottom
     }
 
     /// Number of retained commands, useful for diagnostics.
@@ -109,6 +118,42 @@ impl PageDisplayList {
         self.text_regions
             .get(region_index)
             .and_then(TextRegion::visible_byte_range)
+    }
+
+    /// Full shaped text retained for a source-backed region.
+    pub fn text_region_text(&self, region_index: usize) -> Option<&str> {
+        self.text_regions.get(region_index).map(TextRegion::text)
+    }
+
+    /// Full selectable byte range, including text outside this logical page's
+    /// visible line slice when a paragraph continues onto another page.
+    pub fn text_region_selectable_range(&self, region_index: usize) -> Option<Range<usize>> {
+        self.text_regions
+            .get(region_index)
+            .map(TextRegion::selectable_byte_range)
+    }
+
+    /// Maps a byte range in retained text to its durable authored source range.
+    pub fn text_region_source_range(
+        &self,
+        region_index: usize,
+        byte_range: Range<usize>,
+    ) -> Option<SourceRange> {
+        self.text_regions
+            .get(region_index)?
+            .source_range_for_bytes(byte_range)
+    }
+
+    /// Returns the visible byte intersection of a durable source range in one
+    /// retained text region.
+    pub fn text_region_byte_range_for_source(
+        &self,
+        region_index: usize,
+        range: &SourceRange,
+    ) -> Option<Range<usize>> {
+        self.text_regions
+            .get(region_index)?
+            .byte_range_for_source(range)
     }
 
     /// Returns the first durable source range visible on this page.
@@ -296,6 +341,20 @@ struct TextRegionHit {
 }
 
 impl TextRegion {
+    fn text(&self) -> &str {
+        match self {
+            Self::Shaped(region) => &region.text,
+            Self::Fixed(region) => &region.text,
+        }
+    }
+
+    fn selectable_byte_range(&self) -> Range<usize> {
+        match self {
+            Self::Shaped(region) => region.source_text_start..region.text.len(),
+            Self::Fixed(region) => 0..region.text.len(),
+        }
+    }
+
     fn visible_byte_range(&self) -> Option<Range<usize>> {
         match self {
             Self::Shaped(region) => region.visible_byte_range(),
@@ -308,6 +367,13 @@ impl TextRegion {
         match self {
             Self::Shaped(region) => region.source_range_for_bytes(visible),
             Self::Fixed(region) => region.source_range_for_bytes(visible),
+        }
+    }
+
+    fn source_range_for_bytes(&self, byte_range: Range<usize>) -> Option<SourceRange> {
+        match self {
+            Self::Shaped(region) => region.source_range_for_bytes(byte_range),
+            Self::Fixed(region) => region.source_range_for_bytes(byte_range),
         }
     }
 
@@ -896,6 +962,11 @@ pub struct DisplayListCompiler;
 
 impl DisplayListCompiler {
     pub fn compile(&self, page: &PageLayout) -> PageDisplayList {
+        let content_bottom = page
+            .items
+            .iter()
+            .filter_map(page_item_bottom)
+            .reduce(f32::max);
         let mut commands = Vec::new();
         let mut text_regions = Vec::new();
         for item in &page.items {
@@ -969,10 +1040,24 @@ impl DisplayListCompiler {
         PageDisplayList {
             width: page.viewport.width,
             height: page.viewport.height,
+            content_bottom,
             background: color(page.background),
             commands,
             text_regions,
         }
+    }
+}
+
+fn page_item_bottom(item: &PageItem) -> Option<f32> {
+    match item {
+        PageItem::Text(text) => text
+            .lines
+            .end
+            .checked_sub(1)
+            .and_then(|line| text.layout.get(line))
+            .map(|line| text.origin_y + line.metrics().block_max_coord),
+        PageItem::Image(image) => Some(image.y + image.height),
+        PageItem::Separator(separator) => Some(separator.y + 1.0),
     }
 }
 
@@ -1175,6 +1260,7 @@ mod tests {
         let list = DisplayListCompiler.compile(&page);
         assert_eq!(list.width(), 320);
         assert_eq!(list.height(), 240);
+        assert_eq!(list.content_bottom(), None);
         assert_eq!(list.command_count(), 0);
     }
 
@@ -1224,6 +1310,11 @@ mod tests {
             })],
         };
         let list = DisplayListCompiler.compile(&page);
+        assert!(
+            list.content_bottom()
+                .is_some_and(|bottom| bottom > 24.0 && bottom < 80.0),
+            "text content should end near its shaped line rather than the 240px page boundary"
+        );
         let selected_source = SourceRange {
             start: SourceAnchor {
                 spine: SpineItemId::new("chapter-1").unwrap(),

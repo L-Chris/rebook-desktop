@@ -1,5 +1,5 @@
 use crate::plugins::TranslationMode;
-use crate::settings::AppliedSettings;
+use crate::settings::{AppliedSettings, ReaderSettingsChange};
 use rebook_formats::BookFormat;
 
 use super::{DesktopReader, FollowUp, SnapshotEffects};
@@ -13,6 +13,20 @@ impl DesktopReader {
 
     pub(crate) fn take_settings_request(&mut self) -> bool {
         std::mem::take(&mut self.settings_requested)
+    }
+
+    pub(in crate::reader) fn request_settings_change(&mut self, change: ReaderSettingsChange) {
+        self.cancel_text_selection();
+        self.close_overlay();
+        self.settings_change_requested = Some(change);
+    }
+
+    pub(crate) fn take_settings_change_request(&mut self) -> Option<ReaderSettingsChange> {
+        self.settings_change_requested.take()
+    }
+
+    pub(crate) fn report_settings_error(&mut self, error: String) {
+        self.error = Some(error);
     }
 
     pub(crate) fn apply_global_settings(&mut self, settings: &AppliedSettings) {

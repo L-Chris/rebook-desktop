@@ -3,9 +3,10 @@ use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::{StartCause, WindowEvent};
+use winit::event::{ElementState, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::{Icon, Window, WindowId};
+use winit::keyboard::{Key, NamedKey};
+use winit::window::{Fullscreen, Icon, Window, WindowId};
 
 use super::UserEvent;
 use super::gpu::GpuState;
@@ -44,6 +45,19 @@ fn clear_color() -> wgpu::Color {
         b: f64::from(background.b()) / 255.0,
         a: 1.0,
     }
+}
+
+fn is_fullscreen_toggle(state: ElementState, repeat: bool, logical_key: &Key) -> bool {
+    state == ElementState::Pressed && !repeat && logical_key == &NamedKey::F11
+}
+
+fn toggle_fullscreen(window: &Window) {
+    let fullscreen = window
+        .fullscreen()
+        .is_none()
+        .then_some(Fullscreen::Borderless(None));
+    window.set_fullscreen(fullscreen);
+    window.request_redraw();
 }
 
 struct WindowState {
@@ -199,6 +213,11 @@ impl ApplicationHandler<UserEvent> for Application {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::KeyboardInput { event, .. }
+                if is_fullscreen_toggle(event.state, event.repeat, &event.logical_key) =>
+            {
+                toggle_fullscreen(&state.window);
+            }
             WindowEvent::Focused(focused) => {
                 let size = state.window.inner_size();
                 crate::diagnostics::log(
@@ -279,5 +298,24 @@ impl ApplicationHandler<UserEvent> for Application {
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f11_press_toggles_fullscreen_once() {
+        let f11 = Key::Named(NamedKey::F11);
+
+        assert!(is_fullscreen_toggle(ElementState::Pressed, false, &f11));
+        assert!(!is_fullscreen_toggle(ElementState::Released, false, &f11));
+        assert!(!is_fullscreen_toggle(ElementState::Pressed, true, &f11));
+        assert!(!is_fullscreen_toggle(
+            ElementState::Pressed,
+            false,
+            &Key::Named(NamedKey::F10),
+        ));
     }
 }

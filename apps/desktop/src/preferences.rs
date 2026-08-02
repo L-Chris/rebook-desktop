@@ -125,6 +125,7 @@ enum StoredSpreadMode {
     Single,
     #[default]
     Double,
+    Scroll,
 }
 
 impl From<StoredSpreadMode> for SpreadMode {
@@ -132,6 +133,7 @@ impl From<StoredSpreadMode> for SpreadMode {
         match value {
             StoredSpreadMode::Single => Self::Single,
             StoredSpreadMode::Double => Self::Double,
+            StoredSpreadMode::Scroll => Self::Scroll,
         }
     }
 }
@@ -141,6 +143,7 @@ impl From<SpreadMode> for StoredSpreadMode {
         match value {
             SpreadMode::Single => Self::Single,
             SpreadMode::Double => Self::Double,
+            SpreadMode::Scroll => Self::Scroll,
         }
     }
 }
@@ -270,6 +273,15 @@ mod tests {
         assert_eq!(stored.interface_typography, InterfaceTypography::default());
         assert!(matches!(stored.spread, StoredSpreadMode::Double));
         assert_eq!(stored.theme, AppTheme::Light);
+    }
+
+    #[test]
+    fn scroll_mode_round_trips_through_stored_preferences() {
+        let stored = StoredSpreadMode::from(SpreadMode::Scroll);
+        let json = serde_json::to_string(&stored).unwrap();
+
+        assert_eq!(json, "\"scroll\"");
+        assert_eq!(SpreadMode::from(stored), SpreadMode::Scroll);
     }
 
     #[test]

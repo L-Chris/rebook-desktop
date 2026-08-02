@@ -31,6 +31,7 @@ pub(crate) enum Icon {
     MessageSquareText,
     Minimize2,
     Minus,
+    Moon,
     PanelLeft,
     Pin,
     PinOff,
@@ -39,6 +40,7 @@ pub(crate) enum Icon {
     Send,
     Server,
     Settings,
+    Sun,
     Trash2,
     Type,
     X,
@@ -46,7 +48,7 @@ pub(crate) enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    const ALL: [Self; 31] = [
+    const ALL: [Self; 33] = [
         Self::AlertCircle,
         Self::BookOpen,
         Self::Bot,
@@ -67,6 +69,7 @@ impl Icon {
         Self::MessageSquareText,
         Self::Minimize2,
         Self::Minus,
+        Self::Moon,
         Self::PanelLeft,
         Self::Pin,
         Self::PinOff,
@@ -75,6 +78,7 @@ impl Icon {
         Self::Send,
         Self::Server,
         Self::Settings,
+        Self::Sun,
         Self::Trash2,
         Self::Type,
         Self::X,
@@ -102,6 +106,7 @@ impl Icon {
             Self::MessageSquareText => asset!("message-square-text"),
             Self::Minimize2 => asset!("minimize-2"),
             Self::Minus => asset!("minus"),
+            Self::Moon => asset!("moon"),
             Self::PanelLeft => asset!("panel-left"),
             Self::Pin => asset!("pin"),
             Self::PinOff => asset!("pin-off"),
@@ -110,6 +115,7 @@ impl Icon {
             Self::Send => asset!("send"),
             Self::Server => asset!("server"),
             Self::Settings => asset!("settings"),
+            Self::Sun => asset!("sun"),
             Self::Trash2 => asset!("trash-2"),
             Self::Type => asset!("type"),
             Self::X => asset!("x"),

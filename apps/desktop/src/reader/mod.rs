@@ -5,9 +5,12 @@ use std::time::{Duration, Instant};
 
 use peniko::{Blob, Color};
 use rebook_formats::{BookFormat, open_file as open_publication_file};
-use rebook_layout::{LayoutViewport, ReaderStyle};
+use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode};
 use rebook_publication::{BookSource, Rgba, SourceRange};
-use rebook_reader::{PageDirection, ReaderSelection, ReaderSession, ReaderSnapshot, ReaderTextHit};
+use rebook_reader::{
+    PageDirection, ReaderPosition, ReaderSectionPage, ReaderSelection, ReaderSession,
+    ReaderSnapshot, ReaderTextHit, SelectionGranularity,
+};
 
 use crate::async_task::{TaskResult, TaskSlot};
 use crate::highlights::{HighlightStore, StoredHighlight};
@@ -17,6 +20,7 @@ use crate::plugins::{
     RewriteBookSource, TranslationBlockInput, TranslationBookSource, TranslationMode,
 };
 use crate::preferences::{self, AppLanguage, AppTheme, ReaderPreferences};
+use crate::settings::ReaderSettingsChange;
 use crate::sync::{SyncSettings, SyncStore};
 
 const INITIAL_WIDTH: u32 = 1200;
@@ -28,6 +32,9 @@ const NOTICE_AUTO_DISMISS_DELAY: Duration = Duration::from_secs(3);
 const MOTION_EPSILON: f32 = 0.001;
 const SEARCH_MARK_COLOR: Color = Color::from_rgba8(250, 204, 21, 89);
 const ASSISTANT_MARK_COLOR: Color = Color::from_rgba8(245, 158, 11, 56);
+const SCROLL_PAGE_GAP: f32 = 24.0;
+const SCROLL_PREVIOUS_REGION_HEIGHT: f32 = 56.0;
+const SCROLL_NEXT_REGION_HEIGHT: f32 = 88.0;
 
 mod assistant;
 mod chat_autocomplete;
@@ -221,6 +228,7 @@ pub(super) struct DesktopReader {
     progress_store: Option<SyncStore>,
     selection_anchor: Option<ReaderTextHit>,
     selection: Option<ReaderSelection>,
+    selection_granularity: SelectionGranularity,
     selection_toolbar_visible: bool,
     image_preview: Option<ImagePreview>,
     annotation_note_draft: Option<AnnotationDraft>,
@@ -239,8 +247,12 @@ pub(super) struct DesktopReader {
     scene_revision: u64,
     page_scenes: HashMap<PageSceneKey, Arc<PageSceneLayers>>,
     page_scene_lru: VecDeque<PageSceneKey>,
+    scroll_section: Option<Arc<ScrollSectionLayout>>,
+    scroll_viewport: Option<ScrollViewportState>,
+    scroll_target_position: Option<ReaderPosition>,
     pending_page_turn: Option<PageDirection>,
     settings_requested: bool,
+    settings_change_requested: Option<ReaderSettingsChange>,
     notice: Option<String>,
     notice_timer: TransientMessageTimer,
     error: Option<String>,
@@ -254,6 +266,155 @@ struct ImagePreview {
     source_size: egui::Vec2,
     zoom: f32,
     pan: egui::Vec2,
+}
+
+struct ScrollSectionLayout {
+    section_index: usize,
+    pages: Vec<ReaderSectionPage>,
+    page_tops: Vec<f32>,
+    page_heights: Vec<f32>,
+    content_height: f32,
+    next_button_top: Option<f32>,
+}
+
+impl ScrollSectionLayout {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "logical page dimensions are GPU-bounded and egui geometry uses f32"
+    )]
+    fn new(section_index: usize, section_count: usize, pages: Vec<ReaderSectionPage>) -> Self {
+        let has_previous = section_index > 0;
+        let has_next = section_index + 1 < section_count;
+        let mut cursor = if has_previous {
+            SCROLL_PREVIOUS_REGION_HEIGHT
+        } else {
+            0.0
+        };
+        let mut page_tops = Vec::with_capacity(pages.len());
+        let mut page_heights = Vec::with_capacity(pages.len());
+        for (index, entry) in pages.iter().enumerate() {
+            let page_height = entry.page.height() as f32;
+            page_tops.push(cursor);
+            page_heights.push(page_height);
+            cursor += page_height;
+            if index + 1 < pages.len() {
+                cursor += SCROLL_PAGE_GAP;
+            }
+        }
+        let chapter_content_bottom = pages
+            .last()
+            .and_then(|entry| {
+                let bottom = entry.page.content_bottom()?;
+                page_tops
+                    .last()
+                    .map(|top| top + bottom.clamp(0.0, entry.page.height() as f32))
+            })
+            .unwrap_or(cursor);
+        let next_button_top = has_next.then_some(chapter_content_bottom + SCROLL_PAGE_GAP);
+        let content_height = next_button_top.map_or(cursor, |top| {
+            top + SCROLL_NEXT_REGION_HEIGHT - SCROLL_PAGE_GAP
+        });
+        Self {
+            section_index,
+            pages,
+            page_tops,
+            page_heights,
+            content_height,
+            next_button_top,
+        }
+    }
+
+    fn page_top(&self, position: ReaderPosition) -> Option<f32> {
+        self.pages
+            .iter()
+            .position(|entry| entry.position == position)
+            .and_then(|index| self.page_tops.get(index).copied())
+    }
+
+    fn page_at_content_y(&self, y: f32) -> Option<(usize, f32)> {
+        self.pages.iter().enumerate().find_map(|(index, _)| {
+            let top = self.page_tops[index];
+            let local_y = y - top;
+            (local_y >= 0.0 && local_y < self.page_heights[index]).then_some((index, local_y))
+        })
+    }
+
+    fn first_visible_page(&self, offset_y: f32) -> Option<ReaderPosition> {
+        self.pages
+            .iter()
+            .enumerate()
+            .find(|(index, _)| self.page_tops[*index] + self.page_heights[*index] > offset_y)
+            .map(|(_, entry)| entry.position)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScrollViewportState {
+    offset_y: f32,
+    size: egui::Vec2,
+}
+
+impl DesktopReader {
+    fn is_scroll_mode(&self) -> bool {
+        self.reader.style().spread == SpreadMode::Scroll
+    }
+
+    fn current_scroll_layout(
+        &mut self,
+    ) -> Result<Arc<ScrollSectionLayout>, rebook_reader::ReaderError> {
+        let section_index = self.snapshot.location.section_index;
+        if let Some(layout) = &self.scroll_section
+            && layout.section_index == section_index
+        {
+            return Ok(Arc::clone(layout));
+        }
+        let pages = self.reader.current_section_pages()?;
+        let layout = Arc::new(ScrollSectionLayout::new(
+            section_index,
+            self.reader.section_count(),
+            pages,
+        ));
+        self.scroll_section = Some(Arc::clone(&layout));
+        Ok(layout)
+    }
+
+    fn scroll_page_coordinates(&self, x: f32, y: f32) -> Option<(ReaderPosition, f32, f32)> {
+        let viewport = self.scroll_viewport?;
+        let layout = self.scroll_section.as_ref()?;
+        let (index, local_y) = layout.page_at_content_y(viewport.offset_y + y)?;
+        Some((layout.pages[index].position, x, local_y))
+    }
+
+    fn update_scroll_viewport(&mut self, viewport: ScrollViewportState) {
+        let changed = self.scroll_viewport.is_none_or(|previous| {
+            (previous.offset_y - viewport.offset_y).abs() > 0.1 || previous.size != viewport.size
+        });
+        self.scroll_viewport = Some(viewport);
+        if changed {
+            self.bump_scene_revision();
+        }
+
+        let visible_position = self
+            .scroll_section
+            .as_ref()
+            .and_then(|layout| layout.first_visible_page(viewport.offset_y));
+        let current = ReaderPosition {
+            section_index: self.snapshot.location.section_index,
+            segment_index: self.snapshot.location.segment_index,
+            page_index: self.snapshot.location.page_index,
+        };
+        if let Some(position) = visible_position
+            && position != current
+        {
+            match self.reader.set_visible_position(position) {
+                Ok(snapshot) => {
+                    self.install_snapshot(snapshot);
+                    self.persist_progress();
+                }
+                Err(error) => self.error = Some(format!("更新滑动阅读位置失败：{error}")),
+            }
+        }
+    }
 }
 
 struct DesktopReaderResources {
@@ -604,6 +765,19 @@ struct ReaderUiState {
 }
 
 impl ReaderUiState {
+    fn set_toolbar_hovered(&mut self, hovered: bool, now: Instant) -> bool {
+        if self.toolbar_hovered == hovered {
+            return false;
+        }
+        self.toolbar_hovered = hovered;
+        if hovered {
+            self.reveal_toolbar(now);
+        } else if self.overlay != ReaderOverlay::Menu {
+            self.schedule_toolbar_hide(now);
+        }
+        true
+    }
+
     fn is_animating(&self) -> bool {
         self.toolbar_motion.is_animating()
             || self.sidebar_motion.is_animating()
@@ -700,6 +874,12 @@ impl DesktopReader {
             .map(|error| error.to_string());
         let snapshot = reader.snapshot();
         let expanded_toc = snapshot.active_toc_path.iter().cloned().collect();
+        let scroll_target_position =
+            (reader.style().spread == SpreadMode::Scroll).then_some(ReaderPosition {
+                section_index: snapshot.location.section_index,
+                segment_index: snapshot.location.segment_index,
+                page_index: snapshot.location.page_index,
+            });
         Self {
             reader,
             source,
@@ -716,6 +896,7 @@ impl DesktopReader {
             progress_store,
             selection_anchor: None,
             selection: None,
+            selection_granularity: SelectionGranularity::Free,
             selection_toolbar_visible: false,
             image_preview: None,
             annotation_note_draft: None,
@@ -753,8 +934,12 @@ impl DesktopReader {
             scene_revision: 0,
             page_scenes: HashMap::new(),
             page_scene_lru: VecDeque::new(),
+            scroll_section: None,
+            scroll_viewport: None,
+            scroll_target_position,
             pending_page_turn: None,
             settings_requested: false,
+            settings_change_requested: None,
             notice: None,
             notice_timer: TransientMessageTimer::default(),
             error,
@@ -781,9 +966,9 @@ fn logical_dimension(value: f64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BookDisplayMetadata, HashSet, Instant, MOTION_DURATION, Motion, NOTICE_AUTO_DISMISS_DELAY,
-        ReaderOverlay, ReaderUiState, SidebarTab, TOOLBAR_HIDE_DELAY, TOOLBAR_MOTION_DURATION,
-        TransientMessageTimer, TranslationUiState, logical_dimension,
+        BookDisplayMetadata, Duration, HashSet, Instant, MOTION_DURATION, Motion,
+        NOTICE_AUTO_DISMISS_DELAY, ReaderOverlay, ReaderUiState, SidebarTab, TOOLBAR_HIDE_DELAY,
+        TOOLBAR_MOTION_DURATION, TransientMessageTimer, TranslationUiState, logical_dimension,
         resolve_book_display_metadata,
     };
 
@@ -857,6 +1042,38 @@ mod tests {
         ui.reveal_toolbar(now + TOOLBAR_HIDE_DELAY / 2);
         assert!(ui.toolbar_hide_at.is_none());
         assert!((ui.toolbar_motion.target - 1.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn stationary_pointer_does_not_keep_postponing_toolbar_hide() {
+        let now = Instant::now();
+        let mut ui = ReaderUiState {
+            sidebar_open: false,
+            sidebar_pinned: false,
+            sidebar_width: super::egui_view::SIDEBAR_WIDTH,
+            sidebar_tab: SidebarTab::Toc,
+            toolbar_hovered: false,
+            toolbar_hide_at: None,
+            overlay: ReaderOverlay::None,
+            assistant_panel: None,
+            assistant_width: super::egui_view::ASSISTANT_WIDTH,
+            toolbar_motion: Motion::settled_with_duration(0.0, TOOLBAR_MOTION_DURATION),
+            sidebar_motion: Motion::settled(0.0),
+            assistant_motion: Motion::settled(0.0),
+            menu_motion: Motion::settled(0.0),
+            last_motion_tick: None,
+            wheel_accumulator: 0.0,
+            last_wheel_turn: None,
+            expanded_toc: HashSet::new(),
+            last_auto_scrolled_toc: None,
+        };
+
+        assert!(ui.set_toolbar_hovered(true, now));
+        assert!(ui.set_toolbar_hovered(false, now + Duration::from_millis(20)));
+        let hide_at = ui.toolbar_hide_at;
+
+        assert!(!ui.set_toolbar_hovered(false, now + Duration::from_millis(200)));
+        assert_eq!(ui.toolbar_hide_at, hide_at);
     }
 
     #[test]

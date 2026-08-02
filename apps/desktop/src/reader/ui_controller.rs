@@ -14,14 +14,8 @@ impl DesktopReader {
         }
     }
 
-    pub(in crate::reader) fn set_toolbar_hovered(&mut self, hovered: bool) {
-        let now = Instant::now();
-        self.ui.toolbar_hovered = hovered;
-        if hovered {
-            self.ui.reveal_toolbar(now);
-        } else if self.ui.overlay != ReaderOverlay::Menu {
-            self.ui.schedule_toolbar_hide(now);
-        }
+    pub(in crate::reader) fn set_toolbar_hovered(&mut self, hovered: bool) -> bool {
+        self.ui.set_toolbar_hovered(hovered, Instant::now())
     }
 
     pub(in crate::reader) fn toggle_menu(&mut self) {

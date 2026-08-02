@@ -267,6 +267,17 @@ fn reading_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     {
                         state.draft_spread = SpreadMode::Double;
                     }
+                    let scroll = state.draft_spread == SpreadMode::Scroll;
+                    if choice_button(
+                        ui,
+                        state.draft_language.text("滑动", "Scroll"),
+                        scroll,
+                        72.0,
+                    )
+                    .clicked()
+                    {
+                        state.draft_spread = SpreadMode::Scroll;
+                    }
                 });
                 ui.end_row();
 

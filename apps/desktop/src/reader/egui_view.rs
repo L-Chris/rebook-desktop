@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, Pos2, Rect, RichText, TextureId, Vec2};
-use rebook_layout::reading_content_left;
-use rebook_reader::PageDirection;
+use rebook_layout::{SpreadMode, reading_content_left};
+use rebook_reader::{PageDirection, SelectionGranularity};
 
 use super::chat_autocomplete::{
     ChatReference, ChatReferenceKind, chat_reference_token, move_suggestion_index,
@@ -11,9 +11,11 @@ use super::chat_autocomplete::{
 use super::chat_markdown::ChatMarkdownState;
 use super::{AnnotationDraft, AssistantPanel, DesktopReader, ReaderOverlay, SidebarTab};
 use crate::plugins::{ChatCommand, ChatRole, chat_command_suggestions};
+use crate::preferences::AppTheme;
+use crate::settings::ReaderSettingsChange;
 use crate::ui::{
     Icon, decode_color_image, icon, icon_button, navigation_button, navigation_text_button,
-    paint_icon, palette, selectable_icon_button, toggle_icon_button,
+    paint_icon, palette, selectable_icon_button,
 };
 
 pub(super) const SIDEBAR_WIDTH: f32 = 256.0;
@@ -179,29 +181,39 @@ impl DesktopReader {
             .show(root_ui, |ui| {
                 self.toolbar(ui, background_ui);
                 let size = Vec2::new(ui.available_width(), (ui.available_height() - 3.0).max(1.0));
-                let response = if let Some(texture) = page_texture {
-                    let (rect, response) =
-                        ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-                    let painter = ui.painter().with_clip_rect(rect);
-                    painter.rect_filled(rect, 0.0, background_ui);
-                    let texture_rect = page_texture_destination(rect, texture.size);
-                    painter.image(
-                        texture.id,
-                        texture_rect,
-                        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
-                        Color32::WHITE,
+                if self.is_scroll_mode() {
+                    page_rect = self.scroll_content(
+                        ui,
+                        size,
+                        page_texture,
+                        background_ui,
+                        interaction_blocked,
                     );
-                    response
                 } else {
-                    let (rect, response) =
-                        ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-                    ui.painter().rect_filled(rect, 0.0, background_ui);
-                    response
-                };
-                page_rect = response.rect;
-                if self.image_preview.is_none() {
-                    self.pointer_interaction(&response);
-                    self.wheel_interaction(&response, interaction_blocked);
+                    let response = if let Some(texture) = page_texture {
+                        let (rect, response) =
+                            ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                        let painter = ui.painter().with_clip_rect(rect);
+                        painter.rect_filled(rect, 0.0, background_ui);
+                        let texture_rect = page_texture_destination(rect, texture.size);
+                        painter.image(
+                            texture.id,
+                            texture_rect,
+                            Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        response
+                    } else {
+                        let (rect, response) =
+                            ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                        ui.painter().rect_filled(rect, 0.0, background_ui);
+                        response
+                    };
+                    page_rect = response.rect;
+                    if self.image_preview.is_none() {
+                        self.pointer_interaction(&response);
+                        self.wheel_interaction(&response, interaction_blocked);
+                    }
                 }
                 self.resize_canvas(f64::from(page_rect.width()), f64::from(page_rect.height()));
 
@@ -243,6 +255,112 @@ impl DesktopReader {
                 background.alpha,
             ),
         }
+    }
+
+    fn scroll_content(
+        &mut self,
+        ui: &mut egui::Ui,
+        size: Vec2,
+        page_texture: Option<ReaderPageTexture>,
+        background: Color32,
+        interaction_blocked: bool,
+    ) -> Rect {
+        let layout = match self.current_scroll_layout() {
+            Ok(layout) => layout,
+            Err(error) => {
+                self.error = Some(format!("生成滑动章节失败：{error}"));
+                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                ui.painter().rect_filled(rect, 0.0, background);
+                return rect;
+            }
+        };
+        let mut scroll_area = egui::ScrollArea::vertical()
+            .id_salt("reader-section-scroll")
+            .max_height(size.y)
+            .auto_shrink([false, false]);
+        if let Some(target) = self.scroll_target_position.take()
+            && let Some(top) = layout.page_top(target)
+        {
+            let first = layout.pages.first().map(|entry| entry.position);
+            scroll_area =
+                scroll_area.vertical_scroll_offset(if first == Some(target) { 0.0 } else { top });
+        }
+
+        let mut page_rect = Rect::NOTHING;
+        let mut previous_clicked = false;
+        let mut next_clicked = false;
+        scroll_area.show_viewport(ui, |ui, viewport| {
+            ui.set_width(viewport.width());
+            ui.set_height(layout.content_height.max(viewport.height()));
+            let content_rect = ui.max_rect();
+            let visible_rect = Rect::from_min_size(
+                Pos2::new(content_rect.left(), content_rect.top() + viewport.min.y),
+                viewport.size(),
+            );
+            page_rect = visible_rect;
+            let painter = ui.painter().with_clip_rect(visible_rect);
+            painter.rect_filled(visible_rect, 0.0, background);
+            if let Some(texture) = page_texture {
+                painter.image(
+                    texture.id,
+                    page_texture_destination(visible_rect, texture.size),
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            let response = ui.interact(
+                visible_rect,
+                ui.id().with("scroll-reader-viewport"),
+                egui::Sense::click_and_drag(),
+            );
+            self.update_scroll_viewport(super::ScrollViewportState {
+                offset_y: viewport.min.y,
+                size: viewport.size(),
+            });
+            if self.image_preview.is_none() && !interaction_blocked {
+                self.pointer_interaction(&response);
+            }
+
+            if layout.section_index > 0 {
+                let left = content_rect.left()
+                    + reading_content_left(viewport.width(), &self.reader.style());
+                let rect = Rect::from_min_size(
+                    Pos2::new(left, content_rect.top() + 10.0),
+                    Vec2::new(128.0, 36.0),
+                );
+                previous_clicked = ui
+                    .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        ui.style_mut().spacing.button_padding.x = 0.0;
+                        ui.add(
+                            egui::Button::new(self.language.text("上一章", "Previous chapter"))
+                                .frame(false)
+                                .min_size(Vec2::new(0.0, rect.height())),
+                        )
+                    })
+                    .inner
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked();
+            }
+            if let Some(top) = layout.next_button_top {
+                let rect = Rect::from_center_size(
+                    Pos2::new(content_rect.center().x, content_rect.top() + top + 18.0),
+                    Vec2::new(152.0, 36.0),
+                );
+                next_clicked = ui
+                    .put(
+                        rect,
+                        egui::Button::new(self.language.text("下一章", "Next chapter")),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked();
+            }
+        });
+        if previous_clicked {
+            self.go_to_adjacent_section(PageDirection::Previous);
+        } else if next_clicked {
+            self.go_to_adjacent_section(PageDirection::Next);
+        }
+        page_rect
     }
 
     fn show_side_panels(&mut self, root_ui: &mut egui::Ui) -> (f32, f32) {
@@ -351,6 +469,16 @@ impl DesktopReader {
         {
             return;
         }
+        if self.is_scroll_mode() {
+            let previous = ctx.input(|input| input.key_pressed(egui::Key::ArrowLeft));
+            let next = ctx.input(|input| input.key_pressed(egui::Key::ArrowRight));
+            if previous {
+                self.go_to_adjacent_section(PageDirection::Previous);
+            } else if next {
+                self.go_to_adjacent_section(PageDirection::Next);
+            }
+            return;
+        }
         let previous = ctx.input(|input| {
             input.key_pressed(egui::Key::ArrowLeft) || input.key_pressed(egui::Key::PageUp)
         });
@@ -436,8 +564,15 @@ impl DesktopReader {
 
     fn toolbar(&mut self, ui: &mut egui::Ui, background: Color32) {
         let toolbar_width = ui.available_width();
+        let hover_rect = Rect::from_min_size(
+            ui.next_widget_position(),
+            Vec2::new(toolbar_width, TOOLBAR_HEIGHT),
+        );
         let content_left = reading_content_left(toolbar_width, &self.reader.style());
-        let response = egui::Frame::new()
+        let toolbar_actions_visible = self.ui.toolbar_motion.value.clamp(0.0, 1.0) > 0.02
+            || self.ui.overlay == ReaderOverlay::Menu;
+        let chapter_title = self.current_chapter_title().to_owned();
+        egui::Frame::new()
             .fill(background)
             .inner_margin(egui::Margin::symmetric(0, SIDEBAR_PADDING))
             .show(ui, |ui| {
@@ -445,30 +580,40 @@ impl DesktopReader {
                 ui.set_min_height(TOOLBAR_HEIGHT - f32::from(SIDEBAR_PADDING) * 2.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    if self.ui.sidebar_open {
-                        // Establish the same row height as the toolbar controls before
-                        // laying out the title, so its vertical center never depends on
-                        // whether the sidebar toggle is present.
-                        ui.allocate_space(Vec2::new(content_left, TOOLBAR_CONTROL_SIZE));
-                    } else {
-                        let button_left = f32::from(SIDEBAR_PADDING)
-                            .min((content_left - TOOLBAR_CONTROL_SIZE).max(0.0));
-                        ui.add_space(button_left);
-                        if icon_button(ui, Icon::PanelLeft)
-                            .on_hover_text(self.language.text("展开侧栏", "Open sidebar"))
-                            .clicked()
+                    let left_control_count = if self.ui.sidebar_open { 2.0 } else { 3.0 };
+                    let left_controls_width = TOOLBAR_CONTROL_SIZE * left_control_count;
+                    let button_left = f32::from(SIDEBAR_PADDING)
+                        .min((content_left - left_controls_width).max(0.0));
+                    ui.add_space(button_left);
+                    if toolbar_actions_visible {
+                        if !self.ui.sidebar_open
+                            && icon_button(ui, Icon::PanelLeft)
+                                .on_hover_text(self.language.text("展开侧栏", "Open sidebar"))
+                                .clicked()
                         {
                             self.set_sidebar_open(true);
                         }
-                        ui.add_space((content_left - button_left - TOOLBAR_CONTROL_SIZE).max(0.0));
+                        if icon_button(ui, Icon::Library)
+                            .on_hover_text(self.language.text("返回书架", "Back to library"))
+                            .clicked()
+                        {
+                            self.request_exit();
+                        }
+                        if selectable_icon_button(ui, Icon::Languages, self.translation.enabled)
+                            .on_hover_text(if self.translation.enabled {
+                                self.language.text("关闭翻译", "Turn translation off")
+                            } else {
+                                self.language.text("开启翻译", "Turn translation on")
+                            })
+                            .clicked()
+                        {
+                            self.toggle_translation();
+                        }
+                    } else {
+                        ui.allocate_space(Vec2::new(left_controls_width, TOOLBAR_CONTROL_SIZE));
                     }
-                    let opacity = self.ui.toolbar_motion.value.clamp(0.0, 1.0);
-                    if opacity > 0.02 || self.ui.overlay == ReaderOverlay::Menu {
-                        ui.label(
-                            RichText::new(&self.display_metadata.title)
-                                .color(palette().text)
-                                .size(crate::ui::scaled_font_size(TOOLBAR_TITLE_SIZE)),
-                        );
+                    ui.add_space((content_left - button_left - left_controls_width).max(0.0));
+                    if toolbar_actions_visible {
                         ui.scope_builder(
                             egui::UiBuilder::new()
                                 .id_salt("reader-toolbar-actions")
@@ -487,35 +632,44 @@ impl DesktopReader {
                                 {
                                     self.toggle_assistant_panel(AssistantPanel::Chat);
                                 }
-                                if toggle_icon_button(
-                                    ui,
-                                    Icon::Languages,
-                                    self.translation.enabled,
-                                    self.language.text("开", "On"),
-                                    self.language.text("关", "Off"),
-                                )
-                                .on_hover_text(if self.translation.enabled {
-                                    self.language.text("关闭翻译", "Turn translation off")
-                                } else {
-                                    self.language.text("开启翻译", "Turn translation on")
-                                })
-                                .clicked()
-                                {
-                                    self.toggle_translation();
-                                }
                             },
                         );
                     }
                 });
-            })
-            .response;
+            });
+        paint_toolbar_title(
+            ui,
+            hover_rect,
+            content_left,
+            toolbar_actions_visible,
+            &chapter_title,
+        );
         let hovered = ui.ctx().input(|input| {
             input
                 .pointer
                 .hover_pos()
-                .is_some_and(|position| response.rect.contains(position))
+                .is_some_and(|position| hover_rect.contains(position))
         });
-        self.set_toolbar_hovered(hovered);
+        if self.set_toolbar_hovered(hovered) {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
+    fn current_chapter_title(&self) -> &str {
+        let Some(active_id) = self.snapshot.active_toc_id.as_deref() else {
+            return &self.display_metadata.title;
+        };
+        if self.translation.enabled
+            && self.plugin_settings.translate_toc
+            && let Some(label) = self.translation.toc_labels.get(active_id)
+        {
+            return label;
+        }
+        self.reader
+            .toc_items()
+            .iter()
+            .find(|item| item.id == active_id)
+            .map_or(&self.display_metadata.title, |item| item.label.as_str())
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -1380,14 +1534,44 @@ impl DesktopReader {
                         }
                         if navigation_button(
                             ui,
-                            Icon::Library,
-                            self.language.text("返回书架", "Back to library"),
+                            Icon::BookOpen,
+                            match self.reader.style().spread {
+                                SpreadMode::Single => self.language.text("单栏模式", "Single mode"),
+                                SpreadMode::Double => self.language.text("双栏模式", "Double mode"),
+                                SpreadMode::Scroll => self.language.text("滑动模式", "Scroll mode"),
+                            },
                             false,
                         )
                         .clicked()
                         {
-                            self.request_exit();
+                            let spread = if self.is_scroll_mode() {
+                                SpreadMode::Double
+                            } else {
+                                SpreadMode::Scroll
+                            };
+                            self.request_settings_change(ReaderSettingsChange::Spread(spread));
                         }
+                        let dark_mode = crate::ui::theme() == AppTheme::Dark;
+                        if navigation_button(
+                            ui,
+                            if dark_mode { Icon::Moon } else { Icon::Sun },
+                            if dark_mode {
+                                self.language.text("黑夜模式", "Dark mode")
+                            } else {
+                                self.language.text("浅色模式", "Light mode")
+                            },
+                            false,
+                        )
+                        .clicked()
+                        {
+                            let theme = if dark_mode {
+                                AppTheme::Light
+                            } else {
+                                AppTheme::Dark
+                            };
+                            self.request_settings_change(ReaderSettingsChange::Theme(theme));
+                        }
+                        self.selection_mode_menu(ui);
                     });
             });
         let clicked_outside = self.ui.overlay == ReaderOverlay::Menu
@@ -1404,6 +1588,43 @@ impl DesktopReader {
         }
     }
 
+    fn selection_mode_menu(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.label(
+            RichText::new(self.language.text("文字选择", "Text selection"))
+                .size(crate::ui::scaled_font_size(12.0))
+                .color(palette().muted),
+        );
+        let choices = [
+            (
+                SelectionGranularity::Free,
+                self.language.text("自由选择", "Free selection"),
+            ),
+            (
+                SelectionGranularity::Word,
+                self.language.text("按单词", "By word"),
+            ),
+            (
+                SelectionGranularity::Sentence,
+                self.language.text("按句子", "By sentence"),
+            ),
+            (
+                SelectionGranularity::Paragraph,
+                self.language.text("按段落", "By paragraph"),
+            ),
+        ];
+        let requested = choices.into_iter().find_map(|(granularity, label)| {
+            navigation_text_button(ui, label, self.selection_granularity == granularity)
+                .clicked()
+                .then_some(granularity)
+        });
+        if let Some(granularity) = requested {
+            self.selection_granularity = granularity;
+            self.cancel_text_selection();
+            self.close_overlay();
+        }
+    }
+
     fn selection_actions(&mut self, ctx: &egui::Context, page_rect: Rect) {
         if !self.selection_toolbar_visible {
             return;
@@ -1413,9 +1634,18 @@ impl DesktopReader {
         };
         let anchor = selection.rects.last().copied();
         let position = anchor.map_or(page_rect.center(), |rect| {
+            let page_top = if self.is_scroll_mode() {
+                self.scroll_section
+                    .as_ref()
+                    .and_then(|layout| layout.page_top(rect.position))
+                    .zip(self.scroll_viewport)
+                    .map_or(0.0, |(top, viewport)| top - viewport.offset_y)
+            } else {
+                0.0
+            };
             Pos2::new(
                 page_rect.left() + rect.x + rect.width * 0.5,
-                page_rect.top() + rect.y + rect.height + 8.0,
+                page_rect.top() + page_top + rect.y + rect.height + 8.0,
             )
         });
         let selection_text = selection.text.clone();
@@ -1521,7 +1751,14 @@ impl DesktopReader {
         if self.format == rebook_formats::BookFormat::Pdf {
             return false;
         }
-        let image = match self.reader.image_at_current_spread(x, y) {
+        let image = match if self.is_scroll_mode() {
+            self.scroll_page_coordinates(x, y)
+                .map_or(Ok(None), |(position, page_x, page_y)| {
+                    self.reader.image_at_page(position, page_x, page_y)
+                })
+        } else {
+            self.reader.image_at_current_spread(x, y)
+        } {
             Ok(Some(image)) => image,
             Ok(None) => return false,
             Err(error) => {
@@ -2438,6 +2675,45 @@ fn unit_f32(value: f64) -> f32 {
     value.clamp(0.0, 1.0) as f32
 }
 
+fn toolbar_title_x(toolbar_rect: Rect, content_left: f32, toolbar_visible: bool) -> f32 {
+    if toolbar_visible {
+        toolbar_rect.center().x
+    } else {
+        toolbar_rect.left() + content_left
+    }
+}
+
+fn paint_toolbar_title(
+    ui: &egui::Ui,
+    toolbar_rect: Rect,
+    content_left: f32,
+    toolbar_visible: bool,
+    title: &str,
+) {
+    let title_x = toolbar_title_x(toolbar_rect, content_left, toolbar_visible);
+    let title_inset = (TOOLBAR_CONTROL_SIZE * 3.0 + f32::from(SIDEBAR_PADDING))
+        .min((toolbar_rect.width() / 2.0 - 1.0).max(0.0));
+    let title_clip = if toolbar_visible {
+        toolbar_rect.shrink2(Vec2::new(title_inset, 0.0))
+    } else {
+        Rect::from_min_max(
+            Pos2::new(toolbar_rect.left() + content_left, toolbar_rect.top()),
+            toolbar_rect.max,
+        )
+    };
+    ui.painter().with_clip_rect(title_clip).text(
+        Pos2::new(title_x, toolbar_rect.center().y),
+        if toolbar_visible {
+            egui::Align2::CENTER_CENTER
+        } else {
+            egui::Align2::LEFT_CENTER
+        },
+        title,
+        egui::FontId::proportional(crate::ui::scaled_font_size(TOOLBAR_TITLE_SIZE)),
+        palette().text,
+    );
+}
+
 #[cfg(test)]
 mod reference_suggestion_label_tests {
     use super::*;
@@ -2451,6 +2727,14 @@ mod reference_suggestion_label_tests {
             link: "link:/test".into(),
             excerpt: None,
         }
+    }
+
+    #[test]
+    fn chapter_title_aligns_with_content_when_hidden_and_centers_when_toolbar_is_visible() {
+        let toolbar = Rect::from_min_size(Pos2::new(20.0, 10.0), Vec2::new(1000.0, 48.0));
+
+        assert!((toolbar_title_x(toolbar, 140.0, false) - 160.0).abs() <= f32::EPSILON);
+        assert!((toolbar_title_x(toolbar, 140.0, true) - 520.0).abs() <= f32::EPSILON);
     }
 
     #[test]

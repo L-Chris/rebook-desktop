@@ -21,6 +21,12 @@ pub(crate) struct AppliedSettings {
     pub(crate) sync_password: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReaderSettingsChange {
+    Spread(SpreadMode),
+    Theme(AppTheme),
+}
+
 pub(crate) struct SettingsFeature {
     settings_tab: SettingsTab,
     draft_spread: SpreadMode,
@@ -113,6 +119,40 @@ impl SettingsFeature {
 
     pub(crate) fn applied(&self) -> &AppliedSettings {
         &self.applied
+    }
+
+    pub(crate) fn apply_reader_change(
+        &mut self,
+        change: ReaderSettingsChange,
+    ) -> Result<(), String> {
+        let mut preferences = ReaderPreferences {
+            interface_typography: self.applied.interface_typography.clone(),
+            typography: self.applied.typography.clone(),
+            language: self.applied.language,
+            spread: self.applied.spread,
+            theme: self.applied.theme,
+        };
+        match change {
+            ReaderSettingsChange::Spread(spread) => preferences.spread = spread,
+            ReaderSettingsChange::Theme(theme) => preferences.theme = theme,
+        }
+        if preferences.spread == self.applied.spread && preferences.theme == self.applied.theme {
+            return Ok(());
+        }
+        preferences::save_reader_preferences(&preferences).map_err(|error| {
+            format!(
+                "{}: {error}",
+                self.applied
+                    .language
+                    .text("保存阅读设置失败", "Failed to save reader settings")
+            )
+        })?;
+        self.applied.spread = preferences.spread;
+        self.applied.theme = preferences.theme;
+        self.draft_spread = preferences.spread;
+        self.draft_theme = preferences.theme;
+        self.revision = self.revision.wrapping_add(1);
+        Ok(())
     }
 
     fn close_overlay(&mut self) {

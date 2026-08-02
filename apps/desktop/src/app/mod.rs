@@ -59,6 +59,15 @@ impl DesktopApp {
         if settings_requested {
             self.settings.open();
         }
+        if let Some(change) = self
+            .reader
+            .as_mut()
+            .and_then(DesktopReader::take_settings_change_request)
+            && let Err(error) = self.settings.apply_reader_change(change)
+            && let Some(reader) = self.reader.as_mut()
+        {
+            reader.report_settings_error(error);
+        }
         settings_overlay(ui.ctx(), &mut self.settings);
         self.apply_settings_if_changed(ui.ctx());
         plan

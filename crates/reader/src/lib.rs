@@ -16,6 +16,7 @@ use rebook_publication::{
 };
 use rebook_renderer::{DisplayListCompiler, PageDisplayList, PageImageHit, PageTextHit};
 use thiserror::Error;
+use unicode_segmentation::UnicodeSegmentation;
 
 const PREFETCH_DISTANCE: usize = 2;
 const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = PREFETCH_DISTANCE * 2 + 3;
@@ -27,6 +28,16 @@ const FRAGMENT_BLOCK_BUDGET: usize = 64;
 pub enum PageDirection {
     Next,
     Previous,
+}
+
+/// Semantic unit used to expand pointer-driven text selections.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SelectionGranularity {
+    #[default]
+    Free,
+    Word,
+    Sentence,
+    Paragraph,
 }
 
 /// Stable current position exposed to the application shell.
@@ -61,6 +72,7 @@ pub struct ReaderTextHit {
 /// floating action toolbar.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReaderSelectionRect {
+    pub position: ReaderPosition,
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -102,6 +114,13 @@ pub struct ReaderSpread {
     pub secondary: Option<Arc<PageDisplayList>>,
     pub primary_offset_x: f32,
     pub secondary_offset_x: f32,
+}
+
+/// One compiled logical page in the active authored section.
+#[derive(Clone)]
+pub struct ReaderSectionPage {
+    pub position: ReaderPosition,
+    pub page: Arc<PageDisplayList>,
 }
 
 /// Flattened, presentation-ready table-of-contents item.
@@ -557,6 +576,10 @@ impl ReaderSession {
         &self.toc_items
     }
 
+    pub fn section_count(&self) -> usize {
+        self.source.book().sections.len()
+    }
+
     pub fn location(&self) -> ReaderLocation {
         let segment_count = self.current_section_data().segments.len();
         ReaderLocation {
@@ -749,6 +772,120 @@ impl ReaderSession {
         })
     }
 
+    /// Compiles and returns every logical page in the active authored section.
+    /// Pages are retained by the returned `Arc`s even when the segment LRU later
+    /// evicts their owning compiled segment.
+    pub fn current_section_pages(&mut self) -> Result<Vec<ReaderSectionPage>, ReaderError> {
+        self.poll_prefetch()?;
+        let section_index = self.current_section;
+        let segment_count = self.current_section_data().segments.len();
+        let mut pages = Vec::new();
+        for segment_index in 0..segment_count {
+            let key = SegmentKey {
+                section_index,
+                segment_index,
+            };
+            self.ensure_segment(key)?;
+            let segment_pages = self
+                .cache
+                .get(&key)
+                .ok_or(ReaderError::SegmentOutOfBounds {
+                    section: section_index,
+                    segment: segment_index,
+                })?
+                .pages
+                .clone();
+            pages.extend(
+                segment_pages
+                    .into_iter()
+                    .enumerate()
+                    .map(|(page_index, page)| ReaderSectionPage {
+                        position: ReaderPosition {
+                            section_index,
+                            segment_index,
+                            page_index,
+                        },
+                        page,
+                    }),
+            );
+        }
+        Ok(pages)
+    }
+
+    /// Updates the durable reading position to the first page visible in a
+    /// continuous section view without changing layout or authored section.
+    pub fn set_visible_position(
+        &mut self,
+        position: ReaderPosition,
+    ) -> Result<ReaderSnapshot, ReaderError> {
+        if position.section_index != self.current_section {
+            return Err(ReaderError::SectionOutOfBounds(position.section_index));
+        }
+        let key = SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        };
+        self.ensure_segment(key)?;
+        let page_exists = self
+            .cache
+            .get(&key)
+            .is_some_and(|segment| position.page_index < segment.pages.len());
+        if !page_exists {
+            return Err(ReaderError::PageOutOfBounds(position));
+        }
+        self.install_position(position);
+        Ok(self.snapshot())
+    }
+
+    pub fn hit_test_page(
+        &mut self,
+        position: ReaderPosition,
+        x: f32,
+        y: f32,
+        exact: bool,
+    ) -> Result<Option<ReaderTextHit>, ReaderError> {
+        let key = SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        };
+        self.ensure_segment(key)?;
+        Ok(self
+            .page_at(position)?
+            .hit_test_text(x, y, exact)
+            .map(|hit| reader_text_hit(position, hit)))
+    }
+
+    pub fn image_at_page(
+        &mut self,
+        position: ReaderPosition,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<ReaderImage>, ReaderError> {
+        let key = SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        };
+        self.ensure_segment(key)?;
+        Ok(self.page_at(position)?.image_at(x, y).map(reader_image))
+    }
+
+    pub fn source_ranges_contain_point_on_page(
+        &mut self,
+        position: ReaderPosition,
+        ranges: &[SourceRange],
+        x: f32,
+        y: f32,
+    ) -> Result<bool, ReaderError> {
+        let key = SegmentKey {
+            section_index: position.section_index,
+            segment_index: position.segment_index,
+        };
+        self.ensure_segment(key)?;
+        Ok(self
+            .page_at(position)?
+            .source_ranges_contain_point(ranges, x, y))
+    }
+
     /// Returns the authored spine sections represented by the currently
     /// visible logical pages, in visual order and without duplicates.
     pub fn current_spread_section_indices(&mut self) -> Result<Vec<usize>, ReaderError> {
@@ -830,14 +967,35 @@ impl ReaderSession {
     }
 
     /// Builds a source-backed selection between two pointer hits. Native
-    /// selections are intentionally bounded to the currently visible spread;
-    /// the returned per-block ranges remain stable after repagination.
+    /// The returned per-block ranges remain stable after repagination. A
+    /// continuous section view may select across multiple logical pages.
     pub fn selection_between(
         &mut self,
         anchor: &ReaderTextHit,
         focus: &ReaderTextHit,
     ) -> Result<Option<ReaderSelection>, ReaderError> {
-        let pages = self.current_spread_pages()?;
+        self.selection_between_with_granularity(anchor, focus, SelectionGranularity::Free)
+    }
+
+    /// Builds a source-backed selection whose endpoints expand to semantic
+    /// text units. Word, sentence, and paragraph ranges may continue across
+    /// logical page boundaries within the current authored section.
+    pub fn selection_between_with_granularity(
+        &mut self,
+        anchor: &ReaderTextHit,
+        focus: &ReaderTextHit,
+        granularity: SelectionGranularity,
+    ) -> Result<Option<ReaderSelection>, ReaderError> {
+        let pages = if granularity == SelectionGranularity::Free
+            || anchor.position.section_index != focus.position.section_index
+        {
+            self.selection_pages(anchor, focus)?
+        } else {
+            self.current_section_pages()?
+                .into_iter()
+                .map(|entry| (entry.position, entry.page, 0.0))
+                .collect()
+        };
         let Some(anchor_page) = pages
             .iter()
             .position(|(position, _, _)| *position == anchor.position)
@@ -852,79 +1010,47 @@ impl ReaderSession {
         };
         let anchor_order = (anchor_page, anchor.region_index, anchor.byte_index);
         let focus_order = (focus_page, focus.region_index, focus.byte_index);
-        let (start, end, start_page, end_page, start_byte, end_byte) =
-            if anchor_order <= focus_order {
-                (
-                    anchor,
-                    focus,
-                    anchor_page,
-                    focus_page,
-                    anchor.cluster_start,
-                    focus.byte_index,
-                )
-            } else {
-                (
-                    focus,
-                    anchor,
-                    focus_page,
-                    anchor_page,
-                    focus.byte_index,
-                    anchor.cluster_end,
-                )
+        let (start_hit, end_hit, mut start, mut end) = if anchor_order <= focus_order {
+            (
+                anchor,
+                focus,
+                SelectionBoundary::new(anchor_page, anchor.region_index, anchor.cluster_start),
+                SelectionBoundary::new(focus_page, focus.region_index, focus.byte_index),
+            )
+        } else {
+            (
+                focus,
+                anchor,
+                SelectionBoundary::new(focus_page, focus.region_index, focus.byte_index),
+                SelectionBoundary::new(anchor_page, anchor.region_index, anchor.cluster_end),
+            )
+        };
+        if granularity != SelectionGranularity::Free {
+            let start_range = semantic_source_range(&pages[start.page].1, start_hit, granularity);
+            let end_range = semantic_source_range(&pages[end.page].1, end_hit, granularity);
+            let (Some(start_range), Some(end_range)) = (start_range, end_range) else {
+                return Ok(None);
             };
-
-        let mut ranges = Vec::new();
-        let mut quote = String::new();
-        let mut rects = Vec::new();
-        for (page_index, (_, page, offset_x)) in
-            pages.iter().enumerate().take(end_page + 1).skip(start_page)
-        {
-            let first_region = if page_index == start_page {
-                start.region_index
+            let start_range = if granularity == SelectionGranularity::Paragraph {
+                expand_paragraph_source_range(&pages, start_range)
             } else {
-                0
+                start_range
             };
-            let last_region = if page_index == end_page {
-                end.region_index
+            let end_range = if granularity == SelectionGranularity::Paragraph {
+                expand_paragraph_source_range(&pages, end_range)
             } else {
-                page.text_region_count().saturating_sub(1)
+                end_range
             };
-            for region_index in first_region..=last_region {
-                let Some(visible) = page.text_region_visible_range(region_index) else {
-                    continue;
-                };
-                let byte_start = if page_index == start_page && region_index == start.region_index {
-                    start_byte
-                } else {
-                    visible.start
-                };
-                let byte_end = if page_index == end_page && region_index == end.region_index {
-                    end_byte
-                } else {
-                    visible.end
-                };
-                let Some(fragment) = page.selection_fragment(region_index, byte_start..byte_end)
-                else {
-                    continue;
-                };
-                append_selection_quote(&mut quote, &fragment.quote);
-                push_source_range(&mut ranges, fragment.range);
-                rects.extend(fragment.rects.into_iter().map(|rect| ReaderSelectionRect {
-                    x: logical_coordinate(rect.x0) + *offset_x,
-                    y: logical_coordinate(rect.y0),
-                    width: logical_coordinate(rect.width()),
-                    height: logical_coordinate(rect.height()),
-                }));
-            }
+            let Some(expanded_start) = first_source_boundary(&pages, &start_range) else {
+                return Ok(None);
+            };
+            let Some(expanded_end) = last_source_boundary(&pages, &end_range) else {
+                return Ok(None);
+            };
+            start = expanded_start;
+            end = expanded_end;
         }
-        if ranges.is_empty() || quote.trim().is_empty() || rects.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(ReaderSelection {
-            ranges,
-            text: quote,
-            rects,
-        }))
+        Ok(build_reader_selection(&pages, start, end))
     }
 
     /// Returns whether a canvas point falls inside the resolved geometry for a
@@ -1250,6 +1376,28 @@ impl ReaderSession {
             pages.push((position, secondary, spread.secondary_offset_x));
         }
         Ok(pages)
+    }
+
+    fn selection_pages(
+        &mut self,
+        anchor: &ReaderTextHit,
+        focus: &ReaderTextHit,
+    ) -> Result<Vec<(ReaderPosition, Arc<PageDisplayList>, f32)>, ReaderError> {
+        let pages = self.current_spread_pages()?;
+        let spread_contains_both = pages
+            .iter()
+            .any(|(position, _, _)| *position == anchor.position)
+            && pages
+                .iter()
+                .any(|(position, _, _)| *position == focus.position);
+        if spread_contains_both || anchor.position.section_index != focus.position.section_index {
+            return Ok(pages);
+        }
+        Ok(self
+            .current_section_pages()?
+            .into_iter()
+            .map(|entry| (entry.position, entry.page, 0.0))
+            .collect())
     }
 
     fn next_page(&mut self) -> Result<NavigationResult, ReaderError> {
@@ -2073,6 +2221,230 @@ fn reader_text_hit(position: ReaderPosition, hit: PageTextHit) -> ReaderTextHit 
     }
 }
 
+type SelectionPage = (ReaderPosition, Arc<PageDisplayList>, f32);
+
+#[derive(Clone, Copy)]
+struct SelectionBoundary {
+    page: usize,
+    region: usize,
+    byte: usize,
+}
+
+impl SelectionBoundary {
+    const fn new(page_index: usize, region_index: usize, byte_index: usize) -> Self {
+        Self {
+            page: page_index,
+            region: region_index,
+            byte: byte_index,
+        }
+    }
+}
+
+fn semantic_source_range(
+    page: &PageDisplayList,
+    hit: &ReaderTextHit,
+    granularity: SelectionGranularity,
+) -> Option<SourceRange> {
+    let text = page.text_region_text(hit.region_index)?;
+    let selectable = page.text_region_selectable_range(hit.region_index)?;
+    let byte_range = semantic_byte_range(text, selectable, hit, granularity)?;
+    page.text_region_source_range(hit.region_index, byte_range)
+}
+
+fn semantic_byte_range(
+    text: &str,
+    selectable: Range<usize>,
+    hit: &ReaderTextHit,
+    granularity: SelectionGranularity,
+) -> Option<Range<usize>> {
+    let source_text = text.get(selectable.clone())?;
+    if source_text.is_empty() {
+        return None;
+    }
+    if granularity == SelectionGranularity::Paragraph {
+        return Some(selectable);
+    }
+    let ranges = match granularity {
+        SelectionGranularity::Word => source_text
+            .unicode_word_indices()
+            .map(|(start, word)| selectable.start + start..selectable.start + start + word.len())
+            .collect::<Vec<_>>(),
+        SelectionGranularity::Sentence => source_text
+            .split_sentence_bound_indices()
+            .filter_map(|(start, sentence)| {
+                trim_whitespace_range(
+                    text,
+                    selectable.start + start..selectable.start + start + sentence.len(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        SelectionGranularity::Free | SelectionGranularity::Paragraph => return None,
+    };
+    nearest_semantic_range(
+        &ranges,
+        hit.cluster_start.max(selectable.start)..hit.cluster_end.min(selectable.end),
+        hit.byte_index.clamp(selectable.start, selectable.end),
+    )
+}
+
+fn nearest_semantic_range(
+    ranges: &[Range<usize>],
+    cluster: Range<usize>,
+    caret: usize,
+) -> Option<Range<usize>> {
+    ranges
+        .iter()
+        .min_by_key(|range| {
+            if range.start < cluster.end && range.end > cluster.start {
+                0
+            } else if caret < range.start {
+                range.start - caret
+            } else {
+                caret.saturating_sub(range.end)
+            }
+        })
+        .cloned()
+}
+
+fn trim_whitespace_range(text: &str, mut range: Range<usize>) -> Option<Range<usize>> {
+    while range.start < range.end {
+        let character = text.get(range.start..range.end)?.chars().next()?;
+        if !character.is_whitespace() {
+            break;
+        }
+        range.start += character.len_utf8();
+    }
+    while range.start < range.end {
+        let character = text.get(range.start..range.end)?.chars().next_back()?;
+        if !character.is_whitespace() {
+            break;
+        }
+        range.end -= character.len_utf8();
+    }
+    (range.start < range.end).then_some(range)
+}
+
+fn first_source_boundary(
+    pages: &[SelectionPage],
+    range: &SourceRange,
+) -> Option<SelectionBoundary> {
+    pages
+        .iter()
+        .enumerate()
+        .find_map(|(page_index, (_, page, _))| {
+            (0..page.text_region_count()).find_map(|region_index| {
+                page.text_region_byte_range_for_source(region_index, range)
+                    .map(|bytes| SelectionBoundary::new(page_index, region_index, bytes.start))
+            })
+        })
+}
+
+fn expand_paragraph_source_range(
+    pages: &[SelectionPage],
+    mut paragraph: SourceRange,
+) -> SourceRange {
+    for (_, page, _) in pages {
+        for region_index in 0..page.text_region_count() {
+            let Some(selectable) = page.text_region_selectable_range(region_index) else {
+                continue;
+            };
+            let Some(candidate) = page.text_region_source_range(region_index, selectable) else {
+                continue;
+            };
+            if candidate.start.spine != paragraph.start.spine
+                || candidate.start.node != paragraph.start.node
+            {
+                continue;
+            }
+            if candidate.start.text_offset < paragraph.start.text_offset {
+                paragraph.start = candidate.start;
+            }
+            if candidate.end.text_offset > paragraph.end.text_offset {
+                paragraph.end = candidate.end;
+            }
+        }
+    }
+    paragraph
+}
+
+fn last_source_boundary(pages: &[SelectionPage], range: &SourceRange) -> Option<SelectionBoundary> {
+    pages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(page_index, (_, page, _))| {
+            (0..page.text_region_count())
+                .rev()
+                .find_map(|region_index| {
+                    page.text_region_byte_range_for_source(region_index, range)
+                        .map(|bytes| SelectionBoundary::new(page_index, region_index, bytes.end))
+                })
+        })
+}
+
+fn build_reader_selection(
+    pages: &[SelectionPage],
+    start: SelectionBoundary,
+    end: SelectionBoundary,
+) -> Option<ReaderSelection> {
+    let mut ranges = Vec::new();
+    let mut quote = String::new();
+    let mut rects = Vec::new();
+    for (page_index, (position, page, offset_x)) in
+        pages.iter().enumerate().take(end.page + 1).skip(start.page)
+    {
+        let first_region = if page_index == start.page {
+            start.region
+        } else {
+            0
+        };
+        let last_region = if page_index == end.page {
+            end.region
+        } else {
+            page.text_region_count().saturating_sub(1)
+        };
+        for region_index in first_region..=last_region {
+            let Some(visible) = page.text_region_visible_range(region_index) else {
+                continue;
+            };
+            let byte_start = if page_index == start.page && region_index == start.region {
+                start.byte
+            } else {
+                visible.start
+            };
+            let byte_end = if page_index == end.page && region_index == end.region {
+                end.byte
+            } else {
+                visible.end
+            };
+            let Some(fragment) = page.selection_fragment(region_index, byte_start..byte_end) else {
+                continue;
+            };
+            let source_continues = ranges.last().is_some_and(|previous: &SourceRange| {
+                previous.end.spine == fragment.range.start.spine
+                    && previous.end.node == fragment.range.start.node
+                    && previous.end.text_offset == fragment.range.start.text_offset
+            });
+            append_selection_quote(&mut quote, &fragment.quote, source_continues);
+            push_source_range(&mut ranges, fragment.range);
+            rects.extend(fragment.rects.into_iter().map(|rect| ReaderSelectionRect {
+                position: *position,
+                x: logical_coordinate(rect.x0) + *offset_x,
+                y: logical_coordinate(rect.y0),
+                width: logical_coordinate(rect.width()),
+                height: logical_coordinate(rect.height()),
+            }));
+        }
+    }
+    (!ranges.is_empty() && !quote.trim().is_empty() && !rects.is_empty()).then_some(
+        ReaderSelection {
+            ranges,
+            text: quote,
+            rects,
+        },
+    )
+}
+
 fn reader_image(hit: PageImageHit) -> ReaderImage {
     ReaderImage {
         width: hit.width,
@@ -2081,11 +2453,12 @@ fn reader_image(hit: PageImageHit) -> ReaderImage {
     }
 }
 
-fn append_selection_quote(output: &mut String, value: &str) {
+fn append_selection_quote(output: &mut String, value: &str, source_continues: bool) {
     if value.is_empty() {
         return;
     }
-    if !output.is_empty()
+    if !source_continues
+        && !output.is_empty()
         && output
             .chars()
             .next_back()
@@ -2478,6 +2851,46 @@ mod tests {
     }
 
     #[test]
+    fn continuous_section_pages_cover_every_segment_and_update_visible_position() {
+        let source = CountingSource::new(&["连续章节滑动测试。".repeat(1_500)]);
+        let mut reader = ReaderSession::open(
+            source.clone(),
+            viewport(600, 400),
+            ReaderStyle {
+                spread: SpreadMode::Scroll,
+                ..ReaderStyle::default()
+            },
+        )
+        .unwrap();
+        let initial = reader.location();
+        let pages = reader.current_section_pages().unwrap();
+
+        assert!(pages.len() >= initial.page_count);
+        assert!(pages.len() > 1);
+        assert_eq!(
+            pages
+                .iter()
+                .map(|entry| entry.position.segment_index)
+                .collect::<HashSet<_>>()
+                .len(),
+            initial.segment_count,
+        );
+        assert!(pages.windows(2).all(|pair| {
+            let left = pair[0].position;
+            let right = pair[1].position;
+            (left.section_index, left.segment_index, left.page_index)
+                < (right.section_index, right.segment_index, right.page_index)
+        }));
+        assert_eq!(source.parse_count(0), 1);
+
+        let last = pages.last().unwrap().position;
+        let snapshot = reader.set_visible_position(last).unwrap();
+        assert_eq!(snapshot.location.section_index, last.section_index);
+        assert_eq!(snapshot.location.segment_index, last.segment_index);
+        assert_eq!(snapshot.location.page_index, last.page_index);
+    }
+
+    #[test]
     fn native_selection_round_trips_to_source_ranges_and_geometry() {
         let source = CountingSource::new(&["选择文字行为".into()]);
         let mut reader =
@@ -2554,6 +2967,86 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reverse_selection.text, "选择文字");
+    }
+
+    #[test]
+    fn semantic_selection_expands_to_word_sentence_and_paragraph_boundaries() {
+        let text = "Hello, world! 下一句。";
+        let word_start = text.find("world").unwrap();
+        let hit = ReaderTextHit {
+            position: ReaderPosition {
+                section_index: 0,
+                segment_index: 0,
+                page_index: 0,
+            },
+            region_index: 0,
+            byte_index: word_start + 2,
+            cluster_start: word_start + 1,
+            cluster_end: word_start + 2,
+        };
+
+        assert_eq!(
+            semantic_byte_range(text, 0..text.len(), &hit, SelectionGranularity::Word),
+            Some(word_start..word_start + "world".len())
+        );
+        assert_eq!(
+            semantic_byte_range(text, 0..text.len(), &hit, SelectionGranularity::Sentence),
+            Some(0.."Hello, world!".len())
+        );
+        assert_eq!(
+            semantic_byte_range(text, 0..text.len(), &hit, SelectionGranularity::Paragraph),
+            Some(0..text.len())
+        );
+    }
+
+    #[test]
+    fn paragraph_selection_covers_continuations_across_logical_pages() {
+        let text = "alpha beta gamma delta. ".repeat(800);
+        let source = CountingSource::new(std::slice::from_ref(&text));
+        let style = ReaderStyle {
+            spread: SpreadMode::Single,
+            ..ReaderStyle::default()
+        };
+        let mut reader = ReaderSession::open(source, viewport(320, 180), style).unwrap();
+        let first_character = SourceRange {
+            start: SourceAnchor {
+                spine: SpineItemId::new("section-0").unwrap(),
+                node: "paragraph-0".into(),
+                text_offset: 0,
+            },
+            end: SourceAnchor {
+                spine: SpineItemId::new("section-0").unwrap(),
+                node: "paragraph-0".into(),
+                text_offset: 1,
+            },
+        };
+        let rect = reader
+            .current_page()
+            .source_rects(std::slice::from_ref(&first_character))[0];
+        let hit = reader
+            .hit_test_current_spread(
+                logical_coordinate(rect.center().x),
+                logical_coordinate(rect.center().y),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+
+        let selection = reader
+            .selection_between_with_granularity(&hit, &hit, SelectionGranularity::Paragraph)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selection.ranges.first().unwrap().start.text_offset, 0);
+        assert_eq!(
+            selection.ranges.last().unwrap().end.text_offset,
+            u64::try_from(text.chars().count()).unwrap()
+        );
+        assert_eq!(selection.text, text);
+        assert_ne!(
+            selection.rects.first().unwrap().position,
+            selection.rects.last().unwrap().position
+        );
     }
 
     #[test]

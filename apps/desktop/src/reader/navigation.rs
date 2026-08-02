@@ -1,6 +1,6 @@
 use rebook_layout::LayoutViewport;
 use rebook_publication::PublicationUrl;
-use rebook_reader::ReaderSnapshot;
+use rebook_reader::{PageDirection, ReaderSnapshot};
 
 use super::{
     DesktopReader, FollowUp, MarkRetention, ProgressChange, SceneChange, SnapshotEffects,
@@ -15,6 +15,23 @@ impl DesktopReader {
                 self.apply_snapshot(result.snapshot, SnapshotEffects::navigation());
             }
             Err(error) => self.error = Some(format!("目录跳转失败：{error}")),
+        }
+    }
+
+    pub(in crate::reader) fn go_to_adjacent_section(&mut self, direction: PageDirection) {
+        let current = self.snapshot.location.section_index;
+        let target = match direction {
+            PageDirection::Previous => current.checked_sub(1),
+            PageDirection::Next => {
+                (current + 1 < self.reader.section_count()).then_some(current + 1)
+            }
+        };
+        let Some(target) = target else {
+            return;
+        };
+        match self.reader.go_to_section(target) {
+            Ok(result) => self.apply_snapshot(result.snapshot, SnapshotEffects::navigation()),
+            Err(error) => self.error = Some(format!("章节跳转失败：{error}")),
         }
     }
 
@@ -64,8 +81,23 @@ impl DesktopReader {
         snapshot: ReaderSnapshot,
         effects: SnapshotEffects,
     ) {
+        let previous_section = self.snapshot.location.section_index;
+        let target_position = rebook_reader::ReaderPosition {
+            section_index: snapshot.location.section_index,
+            segment_index: snapshot.location.segment_index,
+            page_index: snapshot.location.page_index,
+        };
         self.pending_page_turn = None;
         self.install_snapshot(snapshot);
+        if previous_section != target_position.section_index {
+            self.scroll_section = None;
+        }
+        if self.is_scroll_mode() {
+            self.scroll_target_position = Some(target_position);
+        } else {
+            self.scroll_target_position = None;
+            self.scroll_viewport = None;
+        }
         self.selection_toolbar_visible = false;
         self.annotation_note_draft = None;
         self.selection_anchor = None;

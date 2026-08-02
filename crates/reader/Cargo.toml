@@ -11,6 +11,7 @@ rebook-layout = { path = "../layout" }
 rebook-publication = { path = "../publication" }
 rebook-renderer = { path = "../renderer" }
 thiserror.workspace = true
+unicode-segmentation.workspace = true
 
 [lints]
 workspace = true

@@ -1,9 +1,42 @@
 use crate::highlights::StoredHighlight;
-use rebook_reader::{NavigationAttempt, NavigationOutcome, PageDirection};
+use rebook_reader::{NavigationAttempt, NavigationOutcome, PageDirection, SelectionGranularity};
 
 use super::{DesktopReader, FollowUp, MarkRetention, ProgressChange, SidebarTab, SnapshotEffects};
 
 impl DesktopReader {
+    fn hit_test_canvas(
+        &mut self,
+        x: f32,
+        y: f32,
+        exact: bool,
+    ) -> Result<Option<rebook_reader::ReaderTextHit>, rebook_reader::ReaderError> {
+        if self.is_scroll_mode() {
+            let Some((position, page_x, page_y)) = self.scroll_page_coordinates(x, y) else {
+                return Ok(None);
+            };
+            self.reader.hit_test_page(position, page_x, page_y, exact)
+        } else {
+            self.reader.hit_test_current_spread(x, y, exact)
+        }
+    }
+
+    fn source_ranges_contain_canvas_point(
+        &mut self,
+        ranges: &[rebook_publication::SourceRange],
+        x: f32,
+        y: f32,
+    ) -> Result<bool, rebook_reader::ReaderError> {
+        if self.is_scroll_mode() {
+            let Some((position, page_x, page_y)) = self.scroll_page_coordinates(x, y) else {
+                return Ok(false);
+            };
+            self.reader
+                .source_ranges_contain_point_on_page(position, ranges, page_x, page_y)
+        } else {
+            self.reader.source_ranges_contain_point(ranges, x, y)
+        }
+    }
+
     pub(in crate::reader) fn request_exit(&mut self) {
         self.persist_progress();
         self.exit_requested = true;
@@ -12,7 +45,7 @@ impl DesktopReader {
     pub(in crate::reader) fn begin_text_selection(&mut self, x: f32, y: f32) {
         self.selection_toolbar_visible = false;
         self.annotation_note_draft = None;
-        match self.reader.hit_test_current_spread(x, y, true) {
+        match self.hit_test_canvas(x, y, true) {
             Ok(anchor) => {
                 self.selection_anchor = anchor;
                 self.selection = None;
@@ -27,14 +60,15 @@ impl DesktopReader {
         let Some(anchor) = self.selection_anchor.clone() else {
             return;
         };
-        let result = self
-            .reader
-            .hit_test_current_spread(x, y, false)
-            .and_then(|focus| {
-                focus.map_or(Ok(None), |focus| {
-                    self.reader.selection_between(&anchor, &focus)
-                })
-            });
+        let result = self.hit_test_canvas(x, y, false).and_then(|focus| {
+            focus.map_or(Ok(None), |focus| {
+                self.reader.selection_between_with_granularity(
+                    &anchor,
+                    &focus,
+                    self.selection_granularity,
+                )
+            })
+        });
         match result {
             Ok(selection) if self.selection != selection => {
                 self.selection = selection;
@@ -55,6 +89,31 @@ impl DesktopReader {
             return;
         }
 
+        if self.selection_granularity != SelectionGranularity::Free {
+            match self.hit_test_canvas(x, y, true).and_then(|hit| {
+                hit.map_or(Ok(None), |hit| {
+                    self.reader
+                        .selection_between_with_granularity(&hit, &hit, self.selection_granularity)
+                        .map(|selection| selection.map(|selection| (hit, selection)))
+                })
+            }) {
+                Ok(Some((hit, selection))) => {
+                    self.selection_anchor = Some(hit);
+                    self.selection = Some(selection);
+                    self.selection_toolbar_visible = true;
+                    self.annotation_note_draft = None;
+                    self.selected_highlight_id = None;
+                    self.bump_scene_revision();
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.error = Some(format!("Text selection failed: {error}"));
+                    return;
+                }
+            }
+        }
+
         self.selection_toolbar_visible = false;
         self.annotation_note_draft = None;
         self.selection_anchor = None;
@@ -66,8 +125,7 @@ impl DesktopReader {
             .map(|highlight| (highlight.id.clone(), highlight.ranges.clone()))
             .collect::<Vec<_>>();
         let activated = candidates.into_iter().find_map(|(id, ranges)| {
-            self.reader
-                .source_ranges_contain_point(&ranges, x, y)
+            self.source_ranges_contain_canvas_point(&ranges, x, y)
                 .ok()
                 .filter(|contains| *contains)
                 .map(|_| id)

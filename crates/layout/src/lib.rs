@@ -177,6 +177,8 @@ pub enum SpreadMode {
     Single,
     /// Use a two-page spread when both columns can remain comfortably readable.
     Double,
+    /// Paginate as single pages and present the active section as a vertical flow.
+    Scroll,
 }
 
 impl SpreadMode {
@@ -184,7 +186,8 @@ impl SpreadMode {
     pub fn toggled(self) -> Self {
         match self {
             Self::Single => Self::Double,
-            Self::Double => Self::Single,
+            Self::Double => Self::Scroll,
+            Self::Scroll => Self::Single,
         }
     }
 }
@@ -1169,6 +1172,20 @@ mod tests {
         assert_eq!(single.visible_pages, 1);
         assert!((single.width - MAX_COLUMN_WIDTH).abs() < f32::EPSILON);
         assert!((single.left - (viewport_width - MAX_COLUMN_WIDTH) / 2.0).abs() < f32::EPSILON);
+
+        let scroll = resolve_page_geometry(
+            viewport_width,
+            page_height,
+            &ReaderStyle {
+                spread: SpreadMode::Scroll,
+                ..ReaderStyle::default()
+            },
+        );
+        assert_eq!(scroll.visible_pages, 1);
+        assert!((scroll.width - single.width).abs() < f32::EPSILON);
+        assert!((scroll.left - single.left).abs() < f32::EPSILON);
+        assert!((scroll.top - single.top).abs() < f32::EPSILON);
+        assert!((scroll.bottom - single.bottom).abs() < f32::EPSILON);
 
         let double = resolve_page_geometry(
             viewport_width,
