@@ -1598,19 +1598,19 @@ impl DesktopReader {
         let choices = [
             (
                 SelectionGranularity::Free,
-                self.language.text("自由选择", "Free selection"),
+                self.language.text("自由", "Free"),
             ),
             (
                 SelectionGranularity::Word,
-                self.language.text("按单词", "By word"),
+                self.language.text("单词", "Word"),
             ),
             (
                 SelectionGranularity::Sentence,
-                self.language.text("按句子", "By sentence"),
+                self.language.text("句子", "Sentence"),
             ),
             (
                 SelectionGranularity::Paragraph,
-                self.language.text("按段落", "By paragraph"),
+                self.language.text("段落", "Paragraph"),
             ),
         ];
         let requested = choices.into_iter().find_map(|(granularity, label)| {
@@ -1620,8 +1620,25 @@ impl DesktopReader {
         });
         if let Some(granularity) = requested {
             self.selection_granularity = granularity;
-            self.cancel_text_selection();
-            self.close_overlay();
+            self.request_settings_change(ReaderSettingsChange::SelectionGranularity(granularity));
+        }
+    }
+
+    fn selection_action_anchor(
+        &mut self,
+        rects: &[rebook_reader::ReaderSelectionRect],
+    ) -> Option<rebook_reader::ReaderSelectionRect> {
+        if self.is_scroll_mode() {
+            return rects.last().copied();
+        }
+        match self.reader.current_spread_positions() {
+            Ok(positions) => last_visible_selection_rect(rects, &positions),
+            Err(error) => {
+                self.error = Some(format!(
+                    "Resolve selection toolbar position failed: {error}"
+                ));
+                rects.last().copied()
+            }
         }
     }
 
@@ -1632,7 +1649,9 @@ impl DesktopReader {
         let Some(selection) = &self.selection else {
             return;
         };
-        let anchor = selection.rects.last().copied();
+        let selection_text = selection.text.clone();
+        let selection_rects = selection.rects.clone();
+        let anchor = self.selection_action_anchor(&selection_rects);
         let position = anchor.map_or(page_rect.center(), |rect| {
             let page_top = if self.is_scroll_mode() {
                 self.scroll_section
@@ -1648,7 +1667,6 @@ impl DesktopReader {
                 page_rect.top() + page_top + rect.y + rect.height + 8.0,
             )
         });
-        let selection_text = selection.text.clone();
         let mut copy_selection = false;
         let mut create_highlight = false;
         let mut open_note = false;
@@ -2714,6 +2732,17 @@ fn paint_toolbar_title(
     );
 }
 
+fn last_visible_selection_rect(
+    rects: &[rebook_reader::ReaderSelectionRect],
+    positions: &[rebook_reader::ReaderPosition],
+) -> Option<rebook_reader::ReaderSelectionRect> {
+    rects
+        .iter()
+        .rev()
+        .find(|rect| positions.contains(&rect.position))
+        .copied()
+}
+
 #[cfg(test)]
 mod reference_suggestion_label_tests {
     use super::*;
@@ -2735,6 +2764,28 @@ mod reference_suggestion_label_tests {
 
         assert!((toolbar_title_x(toolbar, 140.0, false) - 160.0).abs() <= f32::EPSILON);
         assert!((toolbar_title_x(toolbar, 140.0, true) - 520.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn selection_toolbar_anchors_to_the_last_rect_on_the_visible_spread() {
+        let position = |page_index| rebook_reader::ReaderPosition {
+            section_index: 0,
+            segment_index: 0,
+            page_index,
+        };
+        let rect = |page_index, x| rebook_reader::ReaderSelectionRect {
+            position: position(page_index),
+            x,
+            y: 20.0,
+            width: 30.0,
+            height: 18.0,
+        };
+        let rects = [rect(0, 40.0), rect(1, 650.0), rect(2, 40.0)];
+
+        assert_eq!(
+            last_visible_selection_rect(&rects, &[position(0), position(1)]),
+            Some(rects[1])
+        );
     }
 
     #[test]

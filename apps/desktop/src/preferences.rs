@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 use rebook_layout::{ReaderTypography, SpreadMode};
+use rebook_reader::SelectionGranularity;
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::write_json_atomic;
@@ -62,6 +63,7 @@ pub(crate) struct ReaderPreferences {
     pub(crate) language: AppLanguage,
     pub(crate) spread: SpreadMode,
     pub(crate) theme: AppTheme,
+    pub(crate) selection_granularity: SelectionGranularity,
 }
 
 impl Default for ReaderPreferences {
@@ -72,6 +74,7 @@ impl Default for ReaderPreferences {
             language: AppLanguage::default(),
             spread: SpreadMode::Double,
             theme: AppTheme::default(),
+            selection_granularity: SelectionGranularity::Free,
         }
     }
 }
@@ -117,6 +120,8 @@ struct StoredReaderPreferences {
     theme: AppTheme,
     #[serde(default = "default_spread")]
     spread: StoredSpreadMode,
+    #[serde(default)]
+    selection_granularity: StoredSelectionGranularity,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -126,6 +131,38 @@ enum StoredSpreadMode {
     #[default]
     Double,
     Scroll,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum StoredSelectionGranularity {
+    #[default]
+    Free,
+    Word,
+    Sentence,
+    Paragraph,
+}
+
+impl From<StoredSelectionGranularity> for SelectionGranularity {
+    fn from(value: StoredSelectionGranularity) -> Self {
+        match value {
+            StoredSelectionGranularity::Free => Self::Free,
+            StoredSelectionGranularity::Word => Self::Word,
+            StoredSelectionGranularity::Sentence => Self::Sentence,
+            StoredSelectionGranularity::Paragraph => Self::Paragraph,
+        }
+    }
+}
+
+impl From<SelectionGranularity> for StoredSelectionGranularity {
+    fn from(value: SelectionGranularity) -> Self {
+        match value {
+            SelectionGranularity::Free => Self::Free,
+            SelectionGranularity::Word => Self::Word,
+            SelectionGranularity::Sentence => Self::Sentence,
+            SelectionGranularity::Paragraph => Self::Paragraph,
+        }
+    }
 }
 
 impl From<StoredSpreadMode> for SpreadMode {
@@ -192,6 +229,7 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
         language: stored.language,
         spread: stored.spread.into(),
         theme: stored.theme,
+        selection_granularity: stored.selection_granularity.into(),
     })
 }
 
@@ -211,6 +249,7 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
         language: preferences.language,
         spread: preferences.spread.into(),
         theme: preferences.theme,
+        selection_granularity: preferences.selection_granularity.into(),
     };
     write_json_atomic(path, &stored)?;
     Ok(())
@@ -245,6 +284,7 @@ mod tests {
             language: AppLanguage::English,
             spread: SpreadMode::Single,
             theme: AppTheme::Dark,
+            selection_granularity: SelectionGranularity::Sentence,
         };
         save_to(&path, &preferences).unwrap();
         let loaded = load_from(path.clone()).unwrap();
@@ -262,6 +302,7 @@ mod tests {
         assert_eq!(loaded.language, AppLanguage::English);
         assert_eq!(loaded.spread, SpreadMode::Single);
         assert_eq!(loaded.theme, AppTheme::Dark);
+        assert_eq!(loaded.selection_granularity, SelectionGranularity::Sentence);
         fs::remove_file(path).unwrap();
     }
 
@@ -273,6 +314,10 @@ mod tests {
         assert_eq!(stored.interface_typography, InterfaceTypography::default());
         assert!(matches!(stored.spread, StoredSpreadMode::Double));
         assert_eq!(stored.theme, AppTheme::Light);
+        assert!(matches!(
+            stored.selection_granularity,
+            StoredSelectionGranularity::Free
+        ));
     }
 
     #[test]
@@ -282,6 +327,22 @@ mod tests {
 
         assert_eq!(json, "\"scroll\"");
         assert_eq!(SpreadMode::from(stored), SpreadMode::Scroll);
+    }
+
+    #[test]
+    fn selection_granularity_round_trips_through_stored_preferences() {
+        for granularity in [
+            SelectionGranularity::Free,
+            SelectionGranularity::Word,
+            SelectionGranularity::Sentence,
+            SelectionGranularity::Paragraph,
+        ] {
+            let stored = StoredSelectionGranularity::from(granularity);
+            let json = serde_json::to_string(&stored).unwrap();
+            let decoded: StoredSelectionGranularity = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(SelectionGranularity::from(decoded), granularity);
+        }
     }
 
     #[test]

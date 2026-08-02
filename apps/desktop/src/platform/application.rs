@@ -16,7 +16,6 @@ use crate::preferences::AppTheme;
 
 const INITIAL_WIDTH: u32 = 1200;
 const INITIAL_HEIGHT: u32 = 800;
-
 fn app_icon() -> Option<Icon> {
     let image = image::load_from_memory(include_bytes!("../../../../assets/windows/torto-256.png"))
         .ok()?
@@ -124,10 +123,16 @@ impl ApplicationHandler<UserEvent> for Application {
             return;
         }
         let attributes = Window::default_attributes()
-            .with_title("Torto · 小龟阅读")
+            .with_title("Torto")
             .with_window_icon(app_icon())
             .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
             .with_min_inner_size(LogicalSize::new(720_u32, 520_u32));
+        #[cfg(target_os = "windows")]
+        let attributes = {
+            use winit::platform::windows::WindowAttributesExtWindows as _;
+
+            attributes.with_taskbar_icon(app_icon())
+        };
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -181,6 +186,8 @@ impl ApplicationHandler<UserEvent> for Application {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::RepaintAfter(delay) => self.schedule_repaint(event_loop, delay),
+            #[cfg(target_os = "windows")]
+            UserEvent::Update(message) => self.app.complete_update(message),
             UserEvent::ShelfSync(message) => self.app.complete_shelf_sync(message),
             UserEvent::ReaderSearch(message) => self.app.complete_reader_search(message),
             UserEvent::ReaderChatStream(message) => self.app.update_reader_chat_stream(message),
@@ -279,6 +286,16 @@ impl ApplicationHandler<UserEvent> for Application {
                         state.applied_theme = theme;
                     }
                     self.app.spawn_pending_tasks(&self.runtime, &self.proxy);
+                    #[cfg(target_os = "windows")]
+                    if let Some(request) = self.app.take_update_install_request() {
+                        match crate::updater::launch_installer_after_exit(&request) {
+                            Ok(()) => event_loop.exit(),
+                            Err(error) => {
+                                self.app.report_update_install_error(request, error);
+                                state.window.request_redraw();
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -317,5 +334,11 @@ mod tests {
             false,
             &Key::Named(NamedKey::F10),
         ));
+    }
+
+    #[test]
+    fn installer_shortcuts_use_the_embedded_application_icon() {
+        let wix = include_str!("../../wix/main.wxs");
+        assert_eq!(wix.matches("Icon='ProductIcon.exe'").count(), 2);
     }
 }

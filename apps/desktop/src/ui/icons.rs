@@ -20,6 +20,7 @@ pub(crate) enum Icon {
     Cloud,
     Copy,
     Highlighter,
+    Info,
     Languages,
     Library,
     ListTree,
@@ -48,7 +49,7 @@ pub(crate) enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    const ALL: [Self; 33] = [
+    const ALL: [Self; 34] = [
         Self::AlertCircle,
         Self::BookOpen,
         Self::Bot,
@@ -58,6 +59,7 @@ impl Icon {
         Self::Cloud,
         Self::Copy,
         Self::Highlighter,
+        Self::Info,
         Self::Languages,
         Self::Library,
         Self::ListTree,
@@ -95,6 +97,7 @@ impl Icon {
             Self::Cloud => asset!("cloud"),
             Self::Copy => asset!("copy"),
             Self::Highlighter => asset!("highlighter"),
+            Self::Info => asset!("info"),
             Self::Languages => asset!("languages"),
             Self::Library => asset!("library"),
             Self::ListTree => asset!("list-tree"),

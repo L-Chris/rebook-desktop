@@ -1,5 +1,6 @@
 use peniko::Blob;
 use rebook_layout::{LayoutEngine, ReaderTypography, SpreadMode};
+use rebook_reader::SelectionGranularity;
 
 use crate::plugins::PluginSettings;
 use crate::preferences::{self, AppLanguage, AppTheme, InterfaceTypography, ReaderPreferences};
@@ -17,6 +18,7 @@ pub(crate) struct AppliedSettings {
     pub(crate) plugin_settings: PluginSettings,
     pub(crate) language: AppLanguage,
     pub(crate) theme: AppTheme,
+    pub(crate) selection_granularity: SelectionGranularity,
     pub(crate) sync_settings: SyncSettings,
     pub(crate) sync_password: String,
 }
@@ -25,6 +27,7 @@ pub(crate) struct AppliedSettings {
 pub(crate) enum ReaderSettingsChange {
     Spread(SpreadMode),
     Theme(AppTheme),
+    SelectionGranularity(SelectionGranularity),
 }
 
 pub(crate) struct SettingsFeature {
@@ -43,6 +46,12 @@ pub(crate) struct SettingsFeature {
     revision: u64,
     error: Option<String>,
     open: bool,
+    #[cfg(target_os = "windows")]
+    update_check_requested: bool,
+    #[cfg(target_os = "windows")]
+    update_requested: bool,
+    #[cfg(target_os = "windows")]
+    update_check_status: UpdateCheckStatus,
 }
 
 impl SettingsFeature {
@@ -73,6 +82,7 @@ impl SettingsFeature {
             plugin_settings,
             language: preferences.language,
             theme: preferences.theme,
+            selection_granularity: preferences.selection_granularity,
             sync_settings,
             sync_password,
         };
@@ -92,6 +102,12 @@ impl SettingsFeature {
             revision: 0,
             error: None,
             open: false,
+            #[cfg(target_os = "windows")]
+            update_check_requested: false,
+            #[cfg(target_os = "windows")]
+            update_requested: false,
+            #[cfg(target_os = "windows")]
+            update_check_status: UpdateCheckStatus::Idle,
         }
     }
 
@@ -121,6 +137,32 @@ impl SettingsFeature {
         &self.applied
     }
 
+    #[cfg(target_os = "windows")]
+    pub(crate) fn take_update_check_request(&mut self) -> bool {
+        std::mem::take(&mut self.update_check_requested)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn take_update_request(&mut self) -> bool {
+        std::mem::take(&mut self.update_requested)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn complete_update_check(
+        &mut self,
+        result: crate::updater::ManualUpdateCheckResult,
+    ) {
+        self.update_check_status = match result {
+            crate::updater::ManualUpdateCheckResult::UpToDate => UpdateCheckStatus::UpToDate,
+            crate::updater::ManualUpdateCheckResult::Available(version) => {
+                UpdateCheckStatus::Available(version)
+            }
+            crate::updater::ManualUpdateCheckResult::Failed(error) => {
+                UpdateCheckStatus::Failed(error)
+            }
+        };
+    }
+
     pub(crate) fn apply_reader_change(
         &mut self,
         change: ReaderSettingsChange,
@@ -131,12 +173,23 @@ impl SettingsFeature {
             language: self.applied.language,
             spread: self.applied.spread,
             theme: self.applied.theme,
+            selection_granularity: self.applied.selection_granularity,
         };
+        let layout_changed = matches!(
+            change,
+            ReaderSettingsChange::Spread(_) | ReaderSettingsChange::Theme(_)
+        );
         match change {
             ReaderSettingsChange::Spread(spread) => preferences.spread = spread,
             ReaderSettingsChange::Theme(theme) => preferences.theme = theme,
+            ReaderSettingsChange::SelectionGranularity(granularity) => {
+                preferences.selection_granularity = granularity;
+            }
         }
-        if preferences.spread == self.applied.spread && preferences.theme == self.applied.theme {
+        if preferences.spread == self.applied.spread
+            && preferences.theme == self.applied.theme
+            && preferences.selection_granularity == self.applied.selection_granularity
+        {
             return Ok(());
         }
         preferences::save_reader_preferences(&preferences).map_err(|error| {
@@ -149,9 +202,12 @@ impl SettingsFeature {
         })?;
         self.applied.spread = preferences.spread;
         self.applied.theme = preferences.theme;
+        self.applied.selection_granularity = preferences.selection_granularity;
         self.draft_spread = preferences.spread;
         self.draft_theme = preferences.theme;
-        self.revision = self.revision.wrapping_add(1);
+        if layout_changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -176,6 +232,7 @@ impl SettingsFeature {
             language,
             theme,
             spread: self.draft_spread,
+            selection_granularity: self.applied.selection_granularity,
         };
         if sync_settings.enabled
             && let Err(error) = sync_settings.validate()
@@ -207,6 +264,7 @@ impl SettingsFeature {
             plugin_settings,
             language,
             theme,
+            selection_granularity: self.applied.selection_granularity,
             sync_settings,
             sync_password,
         };
@@ -272,4 +330,14 @@ enum SettingsTab {
     AiChat,
     Translation,
     Cloud,
+    About,
+}
+
+#[cfg(target_os = "windows")]
+enum UpdateCheckStatus {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(String),
+    Failed(String),
 }

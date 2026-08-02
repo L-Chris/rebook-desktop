@@ -118,11 +118,21 @@
                                 Icon='ProductIcon.exe'
                                 IconIndex='0'
                                 Advertise='yes'/>
+                            <Shortcut
+                                Id='DesktopShortcut'
+                                Directory='DesktopFolder'
+                                Name='Torto'
+                                Description='Torto e-book reader'
+                                WorkingDirectory='APPLICATIONFOLDER'
+                                Icon='ProductIcon.exe'
+                                IconIndex='0'
+                                Advertise='yes'/>
                         </File>
                     </Component>
                 </Directory>
             </Directory>
             <Directory Id='ProgramMenuFolder'/>
+            <Directory Id='DesktopFolder'/>
         </Directory>
 
         <Feature

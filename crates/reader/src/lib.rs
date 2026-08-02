@@ -812,6 +812,16 @@ impl ReaderSession {
         Ok(pages)
     }
 
+    /// Returns the logical positions currently composed into the fixed-page
+    /// spread, in visual order from left to right.
+    pub fn current_spread_positions(&mut self) -> Result<Vec<ReaderPosition>, ReaderError> {
+        Ok(self
+            .current_spread_pages()?
+            .into_iter()
+            .map(|(position, _, _)| position)
+            .collect())
+    }
+
     /// Updates the durable reading position to the first page visible in a
     /// continuous section view without changing layout or authored section.
     pub fn set_visible_position(
@@ -991,9 +1001,16 @@ impl ReaderSession {
         {
             self.selection_pages(anchor, focus)?
         } else {
+            let visible_offsets = self.current_spread_pages()?;
             self.current_section_pages()?
                 .into_iter()
-                .map(|entry| (entry.position, entry.page, 0.0))
+                .map(|entry| {
+                    let offset_x = visible_offsets
+                        .iter()
+                        .find(|(position, _, _)| *position == entry.position)
+                        .map_or(0.0, |(_, _, offset_x)| *offset_x);
+                    (entry.position, entry.page, offset_x)
+                })
                 .collect()
         };
         let Some(anchor_page) = pages
@@ -1026,10 +1043,18 @@ impl ReaderSession {
             )
         };
         if granularity != SelectionGranularity::Free {
-            let start_range = semantic_source_range(&pages[start.page].1, start_hit, granularity);
-            let end_range = semantic_source_range(&pages[end.page].1, end_hit, granularity);
+            let start_range =
+                semantic_source_range(&pages[start.page].1, start_hit, granularity, false);
+            let end_range = semantic_source_range(&pages[end.page].1, end_hit, granularity, false);
             let (Some(start_range), Some(end_range)) = (start_range, end_range) else {
                 return Ok(None);
+            };
+            let end_range = if granularity == SelectionGranularity::Word && start_range != end_range
+            {
+                semantic_source_range(&pages[end.page].1, end_hit, granularity, true)
+                    .unwrap_or(end_range)
+            } else {
+                end_range
             };
             let start_range = if granularity == SelectionGranularity::Paragraph {
                 expand_paragraph_source_range(&pages, start_range)
@@ -2244,11 +2269,113 @@ fn semantic_source_range(
     page: &PageDisplayList,
     hit: &ReaderTextHit,
     granularity: SelectionGranularity,
+    include_trailing_boundary_punctuation: bool,
 ) -> Option<SourceRange> {
     let text = page.text_region_text(hit.region_index)?;
     let selectable = page.text_region_selectable_range(hit.region_index)?;
-    let byte_range = semantic_byte_range(text, selectable, hit, granularity)?;
+    let mut byte_range = semantic_byte_range(text, selectable.clone(), hit, granularity)?;
+    if include_trailing_boundary_punctuation && granularity == SelectionGranularity::Word {
+        byte_range = extend_word_to_sentence_or_paragraph_end(text, selectable, byte_range);
+    }
     page.text_region_source_range(hit.region_index, byte_range)
+}
+
+fn extend_word_to_sentence_or_paragraph_end(
+    text: &str,
+    selectable: Range<usize>,
+    word: Range<usize>,
+) -> Range<usize> {
+    let Some(source_text) = text.get(selectable.clone()) else {
+        return word;
+    };
+    let mut punctuation_end = word.end;
+    let mut has_sentence_terminal = false;
+    for character in text
+        .get(word.end..selectable.end)
+        .unwrap_or_default()
+        .chars()
+    {
+        if !is_selection_trailing_punctuation(character) {
+            break;
+        }
+        punctuation_end += character.len_utf8();
+        has_sentence_terminal |= is_sentence_terminal(character);
+    }
+    if punctuation_end > word.end && has_sentence_terminal {
+        return word.start..punctuation_end;
+    }
+    let sentence_end = source_text
+        .split_sentence_bound_indices()
+        .find_map(|(start, sentence)| {
+            let sentence_range =
+                selectable.start + start..selectable.start + start + sentence.len();
+            let trimmed = trim_whitespace_range(text, sentence_range)?;
+            range_ends_with_word(text, &trimmed, &word).then_some(trimmed.end)
+        });
+    let paragraph_end = trim_whitespace_range(text, selectable)
+        .filter(|range| range_ends_with_word(text, range, &word))
+        .map(|range| range.end);
+    let Some(end) = sentence_end.or(paragraph_end) else {
+        return word;
+    };
+    let Some(trailing) = text.get(word.end..end) else {
+        return word;
+    };
+    if trailing.is_empty() || !trailing.chars().all(is_selection_trailing_punctuation) {
+        return word;
+    }
+    word.start..end
+}
+
+fn range_ends_with_word(text: &str, range: &Range<usize>, word: &Range<usize>) -> bool {
+    text.get(range.clone())
+        .and_then(|value| value.unicode_word_indices().next_back())
+        .is_some_and(|(start, value)| {
+            range.start + start == word.start && range.start + start + value.len() == word.end
+        })
+}
+
+fn is_sentence_terminal(character: char) -> bool {
+    matches!(character, '.' | '!' | '?' | '。' | '！' | '？' | '…' | '‥')
+}
+
+fn is_selection_trailing_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '.' | ','
+            | ';'
+            | ':'
+            | '!'
+            | '?'
+            | '\''
+            | '"'
+            | ')'
+            | ']'
+            | '}'
+            | '。'
+            | '，'
+            | '、'
+            | '；'
+            | '：'
+            | '！'
+            | '？'
+            | '…'
+            | '‥'
+            | '’'
+            | '”'
+            | '»'
+            | '›'
+            | '）'
+            | '】'
+            | '》'
+            | '〉'
+            | '」'
+            | '』'
+            | '〕'
+            | '〗'
+            | '〙'
+            | '〛'
+    )
 }
 
 fn semantic_byte_range(
@@ -2997,6 +3124,126 @@ mod tests {
             semantic_byte_range(text, 0..text.len(), &hit, SelectionGranularity::Paragraph),
             Some(0..text.len())
         );
+    }
+
+    #[test]
+    fn word_boundary_extension_includes_only_terminal_punctuation() {
+        let sentence = "Alpha beta! Gamma.";
+        let beta = sentence.find("beta").unwrap();
+        assert_eq!(
+            extend_word_to_sentence_or_paragraph_end(
+                sentence,
+                0..sentence.len(),
+                beta..beta + "beta".len(),
+            ),
+            beta..beta + "beta!".len()
+        );
+
+        let middle = "Alpha beta, gamma.";
+        let beta = middle.find("beta").unwrap();
+        assert_eq!(
+            extend_word_to_sentence_or_paragraph_end(
+                middle,
+                0..middle.len(),
+                beta..beta + "beta".len(),
+            ),
+            beta..beta + "beta".len()
+        );
+
+        let quoted = "内容。” 下一句。";
+        assert_eq!(
+            extend_word_to_sentence_or_paragraph_end(quoted, 0..quoted.len(), 0.."内容".len(),),
+            0.."内容。”".len()
+        );
+    }
+
+    #[test]
+    fn dragging_words_to_sentence_end_includes_punctuation_but_clicking_does_not() {
+        let text = "Alpha beta! Gamma delta.";
+        let source = CountingSource::new(&[text.into()]);
+        let mut reader =
+            ReaderSession::open(source, viewport(600, 400), ReaderStyle::default()).unwrap();
+        let source_range = |start, end| SourceRange {
+            start: SourceAnchor {
+                spine: SpineItemId::new("section-0").unwrap(),
+                node: "paragraph-0".into(),
+                text_offset: start,
+            },
+            end: SourceAnchor {
+                spine: SpineItemId::new("section-0").unwrap(),
+                node: "paragraph-0".into(),
+                text_offset: end,
+            },
+        };
+        let hit_for = |reader: &mut ReaderSession, range: SourceRange| {
+            let rect = reader.current_page().source_rects(&[range])[0];
+            reader
+                .hit_test_current_spread(
+                    logical_coordinate(rect.center().x),
+                    logical_coordinate(rect.center().y),
+                    true,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let alpha = hit_for(&mut reader, source_range(0, 1));
+        let beta = hit_for(&mut reader, source_range(7, 8));
+
+        let dragged = reader
+            .selection_between_with_granularity(&alpha, &beta, SelectionGranularity::Word)
+            .unwrap()
+            .unwrap();
+        assert_eq!(dragged.text, "Alpha beta!");
+
+        let clicked = reader
+            .selection_between_with_granularity(&beta, &beta, SelectionGranularity::Word)
+            .unwrap()
+            .unwrap();
+        assert_eq!(clicked.text, "beta");
+    }
+
+    #[test]
+    fn semantic_selection_on_the_right_page_keeps_its_spread_offset() {
+        let source = CountingSource::new(&["word ".repeat(FRAGMENT_TEXT_BUDGET)]);
+        let mut reader = ReaderSession::open(
+            source,
+            viewport(1_200, 700),
+            ReaderStyle {
+                spread: SpreadMode::Double,
+                ..ReaderStyle::default()
+            },
+        )
+        .unwrap();
+        let spread = reader.current_spread().unwrap();
+        let secondary = spread.secondary.unwrap();
+        let offset_x = spread.secondary_offset_x;
+        let leading = secondary.leading_source_range().unwrap();
+        let target = secondary
+            .source_rects(std::slice::from_ref(&leading))
+            .into_iter()
+            .next()
+            .unwrap();
+        let hit = reader
+            .hit_test_current_spread(
+                logical_coordinate(target.center().x) + offset_x,
+                logical_coordinate(target.center().y),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+
+        let selection = reader
+            .selection_between_with_granularity(&hit, &hit, SelectionGranularity::Word)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            selection
+                .rects
+                .iter()
+                .all(|rect| rect.position == hit.position)
+        );
+        assert!(selection.rects.iter().all(|rect| rect.x >= offset_x));
     }
 
     #[test]

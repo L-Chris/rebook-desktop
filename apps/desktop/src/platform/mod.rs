@@ -6,6 +6,8 @@ pub(crate) use application::run;
 
 pub(crate) enum UserEvent {
     RepaintAfter(std::time::Duration),
+    #[cfg(target_os = "windows")]
+    Update(crate::updater::UpdateTaskMessage),
     ShelfSync(crate::shelf::SyncTaskMessage),
     ReaderSearch(crate::reader::SearchTaskMessage),
     ReaderChatStream(crate::reader::ChatStreamMessage),

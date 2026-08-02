@@ -131,6 +131,7 @@ fn settings_sidebar(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             "Translation",
         ),
         (SettingsTab::Cloud, Icon::Cloud, "云盘", "Cloud"),
+        (SettingsTab::About, Icon::Info, "关于", "About"),
     ] {
         let selected = state.settings_tab == tab;
         if navigation_button(ui, glyph, state.draft_language.text(zh, en), selected).clicked() {
@@ -140,6 +141,10 @@ fn settings_sidebar(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the settings shell keeps its tab routing and footer actions together"
+)]
 fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
     const HEADER_HEIGHT: f32 = 42.0;
     const FOOTER_HEIGHT: f32 = 48.0;
@@ -161,6 +166,7 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 SettingsTab::AiChat => state.draft_language.text("AI 对话", "AI chat"),
                 SettingsTab::Translation => state.draft_language.text("翻译", "Translation"),
                 SettingsTab::Cloud => state.draft_language.text("云盘同步", "Cloud sync"),
+                SettingsTab::About => state.draft_language.text("关于", "About"),
             };
             ui.heading(
                 RichText::new(title)
@@ -195,6 +201,7 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 SettingsTab::AiChat => ai_chat_settings(ui, state),
                 SettingsTab::Translation => translation_settings(ui, state),
                 SettingsTab::Cloud => cloud_settings(ui, state),
+                SettingsTab::About => about_settings(ui, state),
             });
             if let Some(error) = &state.error {
                 ui.add_space(8.0);
@@ -207,34 +214,141 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         Vec2::new(available.x, FOOTER_HEIGHT),
         egui::Layout::right_to_left(egui::Align::Center),
         |ui| {
-            if ui
-                .add_sized(
-                    [68.0, 32.0],
-                    egui::Button::new(
-                        RichText::new(state.draft_language.text("保存", "Save"))
-                            .color(Color32::WHITE),
+            if state.settings_tab == SettingsTab::About {
+                if ui
+                    .add_sized(
+                        [68.0, 32.0],
+                        egui::Button::new(state.draft_language.text("关闭", "Close"))
+                            .corner_radius(6),
                     )
-                    .fill(palette().accent)
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(6),
-                )
-                .clicked()
-            {
-                state.apply_settings();
-            }
-            if ui
-                .add_sized(
-                    [68.0, 32.0],
-                    egui::Button::new(state.draft_language.text("取消", "Cancel"))
-                        .frame_when_inactive(false)
+                    .clicked()
+                {
+                    state.close_overlay();
+                }
+            } else {
+                if ui
+                    .add_sized(
+                        [68.0, 32.0],
+                        egui::Button::new(
+                            RichText::new(state.draft_language.text("保存", "Save"))
+                                .color(Color32::WHITE),
+                        )
+                        .fill(palette().accent)
+                        .stroke(egui::Stroke::NONE)
                         .corner_radius(6),
-                )
-                .clicked()
-            {
-                state.close_overlay();
+                    )
+                    .clicked()
+                {
+                    state.apply_settings();
+                }
+                if ui
+                    .add_sized(
+                        [68.0, 32.0],
+                        egui::Button::new(state.draft_language.text("取消", "Cancel"))
+                            .frame_when_inactive(false)
+                            .corner_radius(6),
+                    )
+                    .clicked()
+                {
+                    state.close_overlay();
+                }
             }
         },
     );
+}
+
+fn about_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
+    settings_card(ui, |ui| {
+        egui::Grid::new("about-settings-grid")
+            .num_columns(2)
+            .spacing([28.0, 12.0])
+            .show(ui, |ui| {
+                field_label(ui, state.draft_language.text("应用", "Application"));
+                ui.label(RichText::new("Torto · 小龟阅读").color(palette().text));
+                ui.end_row();
+                field_label(ui, state.draft_language.text("版本", "Version"));
+                ui.label(RichText::new(env!("CARGO_PKG_VERSION")).color(palette().text));
+                ui.end_row();
+            });
+
+        ui.add_space(14.0);
+        #[cfg(target_os = "windows")]
+        ui.horizontal(|ui| {
+            let checking = matches!(
+                state.update_check_status,
+                super::UpdateCheckStatus::Checking
+            );
+            let check = ui.add_enabled_ui(!checking, |ui| {
+                secondary_button_sized(
+                    ui,
+                    if checking {
+                        state.draft_language.text("检查中...", "Checking...")
+                    } else {
+                        state.draft_language.text("检查", "Check")
+                    },
+                    72.0,
+                )
+            });
+            if check.inner.clicked() {
+                state.update_check_requested = true;
+                state.update_check_status = super::UpdateCheckStatus::Checking;
+            }
+            let update_available = matches!(
+                state.update_check_status,
+                super::UpdateCheckStatus::Available(_)
+            );
+            let update = ui.add_enabled_ui(update_available, |ui| {
+                secondary_button_sized(ui, state.draft_language.text("更新", "Update"), 72.0)
+            });
+            if update.inner.clicked() {
+                state.update_requested = true;
+            }
+        });
+
+        #[cfg(target_os = "windows")]
+        {
+            ui.add_space(8.0);
+            match &state.update_check_status {
+                super::UpdateCheckStatus::Idle | super::UpdateCheckStatus::Checking => {}
+                super::UpdateCheckStatus::UpToDate => {
+                    ui.colored_label(
+                        palette().accent,
+                        state
+                            .draft_language
+                            .text("当前已是最新版本。", "Torto is up to date."),
+                    );
+                }
+                super::UpdateCheckStatus::Available(version) => {
+                    ui.colored_label(
+                        palette().accent,
+                        format!(
+                            "{} {version}",
+                            state.draft_language.text("发现新版本", "Update available")
+                        ),
+                    );
+                }
+                super::UpdateCheckStatus::Failed(error) => {
+                    ui.colored_label(
+                        palette().error,
+                        format!(
+                            "{}: {error}",
+                            state
+                                .draft_language
+                                .text("检查更新失败", "Update check failed")
+                        ),
+                    );
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        ui.label(
+            RichText::new(state.draft_language.text(
+                "当前平台暂不支持应用内自动更新。",
+                "In-app updates are not available on this platform yet.",
+            ))
+            .color(palette().muted),
+        );
+    });
 }
 
 fn reading_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
@@ -1049,4 +1163,36 @@ fn secondary_button(ui: &mut egui::Ui, text: &str) -> Response {
             .corner_radius(6),
     )
     .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn secondary_button_sized(ui: &mut egui::Ui, text: &str, width: f32) -> Response {
+    ui.add_sized(
+        [width, 32.0],
+        egui::Button::new(RichText::new(text).color(palette().accent))
+            .fill(crate::ui::palette().accent_soft)
+            .stroke(egui::Stroke::new(
+                1.0,
+                palette().accent.gamma_multiply(0.22),
+            ))
+            .corner_radius(6),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secondary_buttons_keep_dynamic_and_fixed_widths_separate() {
+        egui::__run_test_ui(|ui| {
+            let dynamic = secondary_button(ui, "Add provider");
+            let fixed = secondary_button_sized(ui, "Check", 72.0);
+
+            assert!(dynamic.rect.width() > 0.0);
+            assert!((dynamic.rect.height() - 32.0).abs() < 0.01);
+            assert!((fixed.rect.width() - 72.0).abs() < 0.01);
+            assert!((fixed.rect.height() - 32.0).abs() < 0.01);
+        });
+    }
 }

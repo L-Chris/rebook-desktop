@@ -180,6 +180,7 @@ pub(super) fn open_reader(
             progress_store,
             plugin_settings,
             language: reader_preferences.language,
+            selection_granularity: reader_preferences.selection_granularity,
             sync_settings,
             sync_password,
         },
@@ -415,6 +416,10 @@ impl DesktopReader {
             }
         }
     }
+
+    pub(crate) fn prepare_for_shutdown(&self) {
+        self.persist_progress();
+    }
 }
 
 struct DesktopReaderResources {
@@ -430,6 +435,7 @@ struct DesktopReaderResources {
     progress_store: Option<SyncStore>,
     plugin_settings: PluginSettings,
     language: AppLanguage,
+    selection_granularity: SelectionGranularity,
     sync_settings: SyncSettings,
     sync_password: String,
 }
@@ -865,6 +871,7 @@ impl DesktopReader {
             progress_store,
             plugin_settings,
             language,
+            selection_granularity,
             sync_settings,
             sync_password,
         } = resources;
@@ -896,7 +903,7 @@ impl DesktopReader {
             progress_store,
             selection_anchor: None,
             selection: None,
-            selection_granularity: SelectionGranularity::Free,
+            selection_granularity,
             selection_toolbar_visible: false,
             image_preview: None,
             annotation_note_draft: None,

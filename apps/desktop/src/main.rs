@@ -17,6 +17,8 @@ mod settings;
 mod shelf;
 mod sync;
 mod ui;
+#[cfg(target_os = "windows")]
+mod updater;
 
 use std::env;
 use std::io;

@@ -66,6 +66,7 @@ impl DesktopReader {
         let mut style = self.reader.style();
         style.spread = settings.spread;
         style.typography.clone_from(&settings.typography);
+        self.selection_granularity = settings.selection_granularity;
         super::apply_theme_colors(&mut style, settings.theme);
         match self.reader.set_style(style) {
             Ok(snapshot) => {

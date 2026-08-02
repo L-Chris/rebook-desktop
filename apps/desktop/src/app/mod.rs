@@ -20,6 +20,8 @@ pub(crate) struct DesktopApp {
     reader: Option<DesktopReader>,
     settings: SettingsFeature,
     applied_settings_revision: u64,
+    #[cfg(target_os = "windows")]
+    updater: crate::updater::WindowsUpdater,
 }
 
 impl DesktopApp {
@@ -30,6 +32,8 @@ impl DesktopApp {
             reader: None,
             settings,
             applied_settings_revision: 0,
+            #[cfg(target_os = "windows")]
+            updater: crate::updater::WindowsUpdater::new(),
         }
     }
 
@@ -69,6 +73,17 @@ impl DesktopApp {
             reader.report_settings_error(error);
         }
         settings_overlay(ui.ctx(), &mut self.settings);
+        #[cfg(target_os = "windows")]
+        {
+            if self.settings.take_update_check_request() {
+                self.updater.request_check();
+            }
+            if self.settings.take_update_request() {
+                self.updater.request_update();
+            }
+            self.updater
+                .overlay(ui.ctx(), self.settings.applied().language);
+        }
         self.apply_settings_if_changed(ui.ctx());
         plan
     }
@@ -83,6 +98,8 @@ impl DesktopApp {
         proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     ) {
         self.shelf.spawn_pending_tasks(runtime, proxy);
+        #[cfg(target_os = "windows")]
+        self.updater.spawn_pending_tasks(runtime, proxy);
         if let Some(reader) = self.reader.as_mut() {
             reader.spawn_pending_tasks(runtime, proxy);
         }
@@ -90,6 +107,33 @@ impl DesktopApp {
 
     pub(crate) fn complete_shelf_sync(&mut self, message: SyncTaskMessage) {
         self.shelf.complete_sync(message);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn complete_update(&mut self, message: crate::updater::UpdateTaskMessage) {
+        if let Some(result) = self.updater.complete(message) {
+            self.settings.complete_update_check(result);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn take_update_install_request(&mut self) -> Option<crate::updater::InstallRequest> {
+        let request = self.updater.take_install_request();
+        if request.is_some()
+            && let Some(reader) = self.reader.as_ref()
+        {
+            reader.prepare_for_shutdown();
+        }
+        request
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn report_update_install_error(
+        &mut self,
+        request: crate::updater::InstallRequest,
+        message: String,
+    ) {
+        self.updater.report_install_error(request, message);
     }
 
     pub(crate) fn complete_reader_search(&mut self, message: SearchTaskMessage) {
