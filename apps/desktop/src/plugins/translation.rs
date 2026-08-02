@@ -90,12 +90,6 @@ impl TranslationBookSource {
         Ok(())
     }
 
-    pub fn has_section(&self, section_index: usize) -> bool {
-        self.state
-            .read()
-            .is_ok_and(|state| state.sections.contains_key(&section_index))
-    }
-
     pub fn clear(&self) -> Result<(), String> {
         self.state
             .write()
@@ -105,6 +99,7 @@ impl TranslationBookSource {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn translatable_blocks(
         &self,
         section_index: usize,
@@ -113,74 +108,76 @@ impl TranslationBookSource {
             .inner
             .parse_section(section_index)
             .map_err(|error| format!("解析第 {} 节失败：{error}", section_index + 1))?;
-        let is_pdf = self.fixed_page_replacement_only;
-        let mut blocks = Vec::new();
-        for (block_index, block) in section.blocks.iter().enumerate() {
-            match block {
-                Block::Text(block) => {
-                    let text = text_block_text(block);
-                    if !text.trim().is_empty() {
-                        blocks.push(TranslationBlockInput {
-                            block_index,
-                            segment_index: None,
-                            text,
-                        });
-                    }
-                }
-                Block::Image(image) if is_pdf => {
-                    let Some(layer) = image.text_layer.as_ref() else {
-                        continue;
-                    };
-                    blocks.extend(
-                        fixed_page_text_groups(layer)
-                            .into_iter()
-                            .filter(|segment| fixed_page_group_is_translatable(&segment.text))
-                            .map(|segment| TranslationBlockInput {
-                                block_index,
-                                segment_index: Some(segment.index),
-                                text: segment.text,
-                            }),
-                    );
-                }
-                Block::Image(image) => {
-                    let text = image
-                        .text_layer
-                        .as_ref()
-                        .map(|layer| layer.text.clone())
-                        .unwrap_or_default();
-                    if !text.trim().is_empty() {
-                        blocks.push(TranslationBlockInput {
-                            block_index,
-                            segment_index: None,
-                            text,
-                        });
-                    }
-                }
-                Block::Separator | Block::PageBreak => {}
-            }
-        }
-        Ok(blocks)
+        Ok(translatable_blocks(
+            &section,
+            self.fixed_page_replacement_only,
+        ))
     }
 
+    pub fn untranslated_blocks_for_ranges(
+        &self,
+        section_index: usize,
+        visible_ranges: &[SourceRange],
+    ) -> Result<Vec<TranslationBlockInput>, String> {
+        let section = self
+            .inner
+            .parse_section(section_index)
+            .map_err(|error| format!("解析第 {} 节失败：{error}", section_index + 1))?;
+        let state = self
+            .state
+            .read()
+            .map_err(|_| "正文翻译状态已损坏".to_owned())?;
+        let stored = state.sections.get(&section_index);
+        Ok(
+            translatable_blocks(&section, self.fixed_page_replacement_only)
+                .into_iter()
+                .filter(|input| {
+                    section
+                        .blocks
+                        .get(input.block_index)
+                        .and_then(block_source_range)
+                        .is_some_and(|source| {
+                            visible_ranges
+                                .iter()
+                                .any(|visible| source_range_nodes_overlap(source, visible))
+                        })
+                        && !stored.is_some_and(|translations| {
+                            translations
+                                .get(&input.block_index)
+                                .is_some_and(|translation| {
+                                    input.segment_index.map_or_else(
+                                        || translation.whole.is_some(),
+                                        |segment| translation.segments.contains_key(&segment),
+                                    )
+                                })
+                        })
+                })
+                .collect(),
+        )
+    }
+
+    pub fn store_batch(
+        &self,
+        section_index: usize,
+        translations: &[BlockTranslation],
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "正文翻译状态已损坏".to_owned())?;
+        let values = state.sections.entry(section_index).or_default();
+        merge_translations(values, translations);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn store_section(
         &self,
         section_index: usize,
         translations: &[BlockTranslation],
     ) -> Result<(), String> {
         let mut values = HashMap::<usize, StoredBlockTranslation>::new();
-        for translation in translations
-            .iter()
-            .filter(|translation| !translation.text.trim().is_empty())
-        {
-            let stored = values.entry(translation.block_index).or_default();
-            if let Some(segment_index) = translation.segment_index {
-                stored
-                    .segments
-                    .insert(segment_index, translation.text.clone());
-            } else {
-                stored.whole = Some(translation.text.clone());
-            }
-        }
+        merge_translations(&mut values, translations);
         self.state
             .write()
             .map_err(|_| "正文翻译状态已损坏".to_owned())?
@@ -188,6 +185,90 @@ impl TranslationBookSource {
             .insert(section_index, values);
         Ok(())
     }
+}
+
+fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockInput> {
+    let mut blocks = Vec::new();
+    for (block_index, block) in section.blocks.iter().enumerate() {
+        match block {
+            Block::Text(block) => {
+                let text = text_block_text(block);
+                if !text.trim().is_empty() {
+                    blocks.push(TranslationBlockInput {
+                        block_index,
+                        segment_index: None,
+                        text,
+                    });
+                }
+            }
+            Block::Image(image) if is_pdf => {
+                let Some(layer) = image.text_layer.as_ref() else {
+                    continue;
+                };
+                blocks.extend(
+                    fixed_page_text_groups(layer)
+                        .into_iter()
+                        .filter(|segment| fixed_page_group_is_translatable(&segment.text))
+                        .map(|segment| TranslationBlockInput {
+                            block_index,
+                            segment_index: Some(segment.index),
+                            text: segment.text,
+                        }),
+                );
+            }
+            Block::Image(image) => {
+                let text = image
+                    .text_layer
+                    .as_ref()
+                    .map(|layer| layer.text.clone())
+                    .unwrap_or_default();
+                if !text.trim().is_empty() {
+                    blocks.push(TranslationBlockInput {
+                        block_index,
+                        segment_index: None,
+                        text,
+                    });
+                }
+            }
+            Block::Separator | Block::PageBreak => {}
+        }
+    }
+    blocks
+}
+
+fn merge_translations(
+    values: &mut HashMap<usize, StoredBlockTranslation>,
+    translations: &[BlockTranslation],
+) {
+    for translation in translations
+        .iter()
+        .filter(|translation| !translation.text.trim().is_empty())
+    {
+        let stored = values.entry(translation.block_index).or_default();
+        if let Some(segment_index) = translation.segment_index {
+            stored
+                .segments
+                .insert(segment_index, translation.text.clone());
+        } else {
+            stored.whole = Some(translation.text.clone());
+        }
+    }
+}
+
+fn block_source_range(block: &Block) -> Option<&SourceRange> {
+    match block {
+        Block::Text(block) => block.source.as_ref(),
+        Block::Image(block) => block.source.as_ref(),
+        Block::Separator | Block::PageBreak => None,
+    }
+}
+
+fn source_range_nodes_overlap(source: &SourceRange, visible: &SourceRange) -> bool {
+    source.start.spine == visible.start.spine
+        && (source.start.node == visible.start.node
+            || source.start.node == visible.end.node
+            || source.end.node == visible.start.node
+            || source.end.node == visible.end.node)
 }
 
 impl BookSource for TranslationBookSource {
@@ -842,6 +923,71 @@ mod tests {
         assert_eq!(block_text(&bilingual.blocks[0]), "Hello");
         assert_eq!(block_text(&bilingual.blocks[1]), "你好");
         assert!(matches!(&bilingual.blocks[1], Block::Text(block) if block.source.is_none()));
+    }
+
+    #[test]
+    fn visible_window_requests_only_missing_blocks_and_batches_merge_immediately() {
+        let original = source();
+        let book = original.book().clone();
+        let mut section = original.parse_section(0).unwrap();
+        let mut hidden = section.blocks[0].clone();
+        let Block::Text(hidden) = &mut hidden else {
+            unreachable!();
+        };
+        hidden.content = vec![Inline::Text(TextRun {
+            text: "Hidden".into(),
+            style: TextStyle::default(),
+            link: None,
+        })];
+        let hidden_source = hidden.source.as_mut().unwrap();
+        hidden_source.start.node = "p-2".into();
+        hidden_source.end.node = "p-2".into();
+        hidden_source.end.text_offset = 6;
+        section.blocks.push(Block::Text(hidden.clone()));
+        let source = TranslationBookSource::new(
+            Arc::new(TestSource { book, section }),
+            TranslationMode::Replace,
+        );
+        let visible = SourceRange {
+            start: SourceAnchor {
+                spine: SpineItemId::new("chapter").unwrap(),
+                node: "p-1".into(),
+                text_offset: 1,
+            },
+            end: SourceAnchor {
+                spine: SpineItemId::new("chapter").unwrap(),
+                node: "p-1".into(),
+                text_offset: 4,
+            },
+        };
+
+        let pending = source
+            .untranslated_blocks_for_ranges(0, std::slice::from_ref(&visible))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].block_index, 0);
+        source
+            .store_batch(
+                0,
+                &[BlockTranslation {
+                    block_index: 0,
+                    segment_index: None,
+                    text: "你好".into(),
+                }],
+            )
+            .unwrap();
+
+        assert!(
+            source
+                .untranslated_blocks_for_ranges(0, &[visible])
+                .unwrap()
+                .is_empty()
+        );
+        source.set_enabled(true).unwrap();
+        assert_eq!(
+            block_text(&source.parse_section(0).unwrap().blocks[0]),
+            "你好"
+        );
     }
 
     #[test]

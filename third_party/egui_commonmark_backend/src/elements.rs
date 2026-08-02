@@ -16,7 +16,10 @@ pub fn soft_break(ui: &mut Ui) {
 
 #[inline]
 pub fn newline(ui: &mut Ui) {
-    ui.label("\n");
+    // This is a layout sentinel, not document text. Letting it participate in
+    // egui's multi-widget selection paints a small selection rectangle at the
+    // beginning of the next line, which can cover list markers rendered there.
+    ui.add(egui::Label::new("\n").selectable(false));
 }
 
 pub fn bullet_point(ui: &mut Ui) {

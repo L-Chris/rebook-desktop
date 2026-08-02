@@ -1,6 +1,6 @@
 # 核心依赖已知问题
 
-- 最近更新：2026-08-01
+- 最近更新：2026-08-02
 - 记录范围：已经在 Torto 中复现、确认存在上游问题，并需要本地兼容代码的问题
 
 依赖升级时应逐项检查本文。只有在上游修复已经进入当前版本，并且移除本地兼容代码后相关回归测试仍能通过，才删除对应兼容代码和本文条目。
@@ -60,6 +60,61 @@ epaint 的羽化由全局 tessellation 选项控制，当前不能针对单个 s
 3. 运行两个圆角回归测试。
 4. 在 Windows 100%、125%、150%、175% 和 200% DPI 下检查 hover、选中和透明状态，确认既无角线也无圆角锯齿。
 5. 全部通过后删除局部几何兼容代码，并删除本条记录。
+
+## egui_commonmark/egui：跨组件多行选区覆盖行首内容
+
+- 影响版本：`egui_commonmark 0.24.0`、`egui 0.35.0`
+- 上游状态：截至 2026-08-02 仍为 Open
+- 上游问题：[lampsitter/egui_commonmark#80](https://github.com/lampsitter/egui_commonmark/issues/80)；布局限制另见 [emilk/egui#4378](https://github.com/emilk/egui/issues/4378)
+- 本地位置：`third_party/egui_commonmark_backend/src/elements.rs` 中的 `newline`，以及 `apps/desktop/src/reader/chat_markdown.rs` 中的 `show_markdown_table`
+- 回归测试：`markdown_table_row_height_follows_the_tallest_wrapped_cell`；列表选区需人工检查
+
+### 表现
+
+跨多个 Markdown 组件选择 AI 回复时，纯布局换行也会被当成可选文字，并在下一行开头绘制一个选区矩形。列表编号和项目符号是独立绘制的图形，该矩形可能覆盖它们。上游报告还记录了多行选择吞掉每行首字符的问题，表格内更明显。表格使用 `egui::Grid` 时，较短单元格的背景和边框也不会自动撑到同一行中最高单元格的高度。
+
+### 原因
+
+egui 的多组件文字选择按各个 `Label` 独立生成选区网格，无法识别 egui_commonmark 用来驱动布局的空换行不是文档内容。表格方面，立即模式布局在绘制单元格时尚不知道该行最终最大高度；`Grid` 之后虽然会统一行布局高度，已经绘制的 `Frame` 不会回填。
+
+### 当前规避方案
+
+将 egui_commonmark 的纯布局换行标记为不可选择，真实文本仍保留跨组件选择和复制。AI 表格不再依赖 `Grid` 回填单元格：先按列宽测量每个单元格的换行高度，取整行最大值，再用相同高度的显式矩形绘制该行所有背景和边框。
+
+### 升级检查
+
+1. 检查上游 #80 是否已修复，并确认修复所需的 egui/egui_commonmark 版本。
+2. 升级后临时恢复可选择的布局换行，跨多段、多级有序/无序列表拖动选择，确认行首不再被覆盖。
+3. 尝试将 AI 表格恢复为上游表格实现，检查长短文本混排、引用链接和窄侧栏换行。
+4. 运行 `cargo test -p rebook-desktop markdown_table_row_height_follows_the_tallest_wrapped_cell`。
+5. 全部通过后删除本地兼容代码，并删除本条记录。
+
+## egui：滚动时离屏端点导致跨组件文字选区被清空
+
+- 影响版本：`egui 0.35.0`
+- 上游状态：截至 2026-08-02，上游当前源码仍包含该清理逻辑，尚未找到专门跟踪此行为的 issue
+- 上游代码：[`LabelSelectionState::on_end_pass`](https://github.com/emilk/egui/blob/4471969a16a130bc07f65eb747d5e2c3bfcf1d88/crates/egui/src/text_selection/label_text_selection.rs)
+- 本地位置：`third_party/egui/src/widgets/label.rs` 中的 `Label::ui`
+
+### 表现
+
+在 AI Chat 的长回复中从视口边缘继续拖动选区时，内容区虽然会自动滚动，但只要选区的起点或终点滚出可见区域，整个选区就会被取消，无法继续向上或向下扩展。
+
+### 原因
+
+`Label::ui` 默认只会把可见的标签提交给跨组件选区状态。滚动后，离屏端点所在的标签仍参与 `ScrollArea` 布局，却不会更新选区状态；`LabelSelectionState::on_end_pass` 在一帧内没有同时遇到两个端点时会主动清空选区，以规避虚拟化列表中的位置错乱。
+
+### 当前规避方案
+
+本地接管 `egui 0.35.0`：只要仍存在跨标签选区，`Label::ui` 就继续将裁剪区外的可选择标签提交给选区状态。标签和高亮仍受原有 painter 裁剪，不会绘制到滚动视口之外；已完成的选区在松开鼠标后也能保留并复制。
+
+### 升级检查
+
+1. 检查上游 `Label::ui` 与 `LabelSelectionState::on_end_pass` 是否已经支持离屏端点，或是否新增对应 issue。
+2. 升级 egui 后临时移除 `third_party/egui` 与 `[patch.crates-io]` 覆盖。
+3. 在长 AI 回复中从开头拖到视口顶部或底部，确认内容持续滚动、选区持续扩展。
+4. 松开鼠标后反向滚动，确认离屏选区仍保留，并验证 `Ctrl+C` 能复制完整内容。
+5. 全部通过后删除本地 egui 副本与本条记录。
 
 ## egui：`ScrollArea::show_rows` 在列表底部抖动
 

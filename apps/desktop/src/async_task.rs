@@ -54,6 +54,13 @@ impl<T> TaskSlot<T> {
         self.in_flight.take().map(|request| request.payload)
     }
 
+    pub fn in_flight(&self, id: u64) -> Option<&T> {
+        self.in_flight
+            .as_ref()
+            .filter(|request| request.id == id)
+            .map(|request| &request.payload)
+    }
+
     pub fn cancel(&mut self) {
         self.pending = None;
         self.in_flight = None;

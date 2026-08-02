@@ -347,6 +347,20 @@ impl ScrollSectionLayout {
             .find(|(index, _)| self.page_tops[*index] + self.page_heights[*index] > offset_y)
             .map(|(_, entry)| entry.position)
     }
+
+    fn visible_pages(&self, viewport: ScrollViewportState) -> Vec<ReaderPosition> {
+        let bottom = viewport.offset_y + viewport.size.y;
+        self.pages
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                let top = self.page_tops[*index];
+                let page_bottom = top + self.page_heights[*index];
+                page_bottom > viewport.offset_y && top < bottom
+            })
+            .map(|(_, entry)| entry.position)
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -414,6 +428,9 @@ impl DesktopReader {
                 }
                 Err(error) => self.error = Some(format!("更新滑动阅读位置失败：{error}")),
             }
+        }
+        if changed {
+            self.queue_visible_section_translation();
         }
     }
 
@@ -542,7 +559,13 @@ struct TranslationTask {
     blocks: Vec<TranslationBlockInput>,
 }
 
-pub(crate) type TranslationTaskMessage = TaskResult<Vec<BlockTranslation>>;
+pub(crate) enum TranslationTaskMessage {
+    Batch {
+        id: u64,
+        translations: Vec<BlockTranslation>,
+    },
+    Complete(TaskResult<()>),
+}
 
 #[derive(Clone)]
 struct TocTranslationTask {

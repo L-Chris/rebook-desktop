@@ -916,22 +916,22 @@ impl ReaderSession {
     ) -> Result<Vec<ReaderVisibleTextFragment>, ReaderError> {
         let mut fragments = Vec::new();
         for (position, page, _) in self.current_spread_pages()? {
-            for region_index in 0..page.text_region_count() {
-                let Some(visible_range) = page.text_region_visible_range(region_index) else {
-                    continue;
-                };
-                let Some(fragment) = page.selection_fragment(region_index, visible_range) else {
-                    continue;
-                };
-                if fragment.quote.trim().is_empty() {
-                    continue;
-                }
-                fragments.push(ReaderVisibleTextFragment {
-                    position,
-                    range: fragment.range,
-                    text: fragment.quote,
-                });
-            }
+            append_visible_text_fragments(&mut fragments, position, &page);
+        }
+        Ok(fragments)
+    }
+
+    /// Returns source-backed text retained on the requested cached logical
+    /// pages. This lets continuous-scroll consumers describe their actual
+    /// viewport instead of falling back to the session's leading page.
+    pub fn visible_text_fragments_for_pages(
+        &self,
+        positions: &[ReaderPosition],
+    ) -> Result<Vec<ReaderVisibleTextFragment>, ReaderError> {
+        let mut fragments = Vec::new();
+        for &position in positions {
+            let page = self.page_at(position)?;
+            append_visible_text_fragments(&mut fragments, position, &page);
         }
         Ok(fragments)
     }
@@ -2215,6 +2215,29 @@ fn block_text_len(block: &Block) -> usize {
     }
 }
 
+fn append_visible_text_fragments(
+    fragments: &mut Vec<ReaderVisibleTextFragment>,
+    position: ReaderPosition,
+    page: &PageDisplayList,
+) {
+    for region_index in 0..page.text_region_count() {
+        let Some(visible_range) = page.text_region_visible_range(region_index) else {
+            continue;
+        };
+        let Some(fragment) = page.selection_fragment(region_index, visible_range) else {
+            continue;
+        };
+        if fragment.quote.trim().is_empty() {
+            continue;
+        }
+        fragments.push(ReaderVisibleTextFragment {
+            position,
+            range: fragment.range,
+            text: fragment.quote,
+        });
+    }
+}
+
 fn block_source(block: &Block) -> Option<&SourceRange> {
     match block {
         Block::Text(block) => block.source.as_ref(),
@@ -3319,6 +3342,13 @@ mod tests {
             .iter()
             .map(|fragment| fragment.range.clone())
             .collect::<Vec<_>>();
+        let first_position = first[0].position;
+        assert_eq!(
+            reader
+                .visible_text_fragments_for_pages(&[first_position])
+                .unwrap(),
+            first
+        );
 
         assert_eq!(
             reader.turn_page(PageDirection::Next).unwrap().outcome,
@@ -3340,6 +3370,19 @@ mod tests {
                 .iter()
                 .map(|fragment| fragment.range.clone())
                 .collect::<Vec<_>>()
+        );
+        let combined = reader
+            .visible_text_fragments_for_pages(&[first_position, second[0].position])
+            .unwrap();
+        assert!(
+            combined
+                .iter()
+                .any(|fragment| fragment.position == first_position)
+        );
+        assert!(
+            combined
+                .iter()
+                .any(|fragment| fragment.position == second[0].position)
         );
     }
 

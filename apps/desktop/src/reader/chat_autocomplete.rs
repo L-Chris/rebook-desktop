@@ -1,5 +1,7 @@
 use percent_encoding::percent_decode_str;
 
+use crate::plugins::CHAT_CITATION_PREFIX;
+
 const MAX_REFERENCE_SUGGESTIONS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +35,7 @@ pub(super) struct ChatCitation {
 }
 
 pub(super) fn parse_chat_citation(locator: &str) -> Option<ChatCitation> {
-    let remainder = locator.strip_prefix("link:/j/")?;
+    let remainder = locator.strip_prefix(CHAT_CITATION_PREFIX)?;
     let (section, node) = remainder
         .split_once('/')
         .map_or((remainder, None), |(section, node)| (section, Some(node)));
@@ -190,7 +192,7 @@ pub(super) fn build_chat_prompt_with_references(
                 ),
             ];
             if reference.kind != ChatReferenceKind::Book {
-                lines.push(format!("link: {}", reference.link));
+                lines.push(format!("href: {}", reference.link));
             }
             if let Some(excerpt) = &reference.excerpt {
                 lines.push(format!(
@@ -200,9 +202,9 @@ pub(super) fn build_chat_prompt_with_references(
             }
             if reference.kind == ChatReferenceKind::Book {
                 lines.push(if english {
-                    "Use searchBook and getContent as needed to inspect the full book, and cite the link:/j/... links returned by those tools.".into()
+                    "Use searchBook and getContent as needed, and cite the link://j/... hrefs they return.".into()
                 } else {
-                    "请根据问题使用 searchBook 和 getContent 检索全文，并引用工具返回的 link:/j/... 链接。".into()
+                    "请按需使用 searchBook 和 getContent，并引用工具返回的 link://j/... href。".into()
                 });
             }
             lines.join("\n")
@@ -328,7 +330,7 @@ mod tests {
         assert!(prompt.contains("概括主旨"));
         assert!(prompt.contains("searchBook"));
         assert!(prompt.contains("getContent"));
-        assert!(prompt.contains("link:/j/..."));
+        assert!(prompt.contains("link://j/..."));
         assert!(!prompt.contains("link: book"));
         assert!(!prompt.contains("locator:"));
     }
@@ -336,37 +338,38 @@ mod tests {
     #[test]
     fn chapter_reference_supplies_a_required_citation_link() {
         let mut chapter = reference("section", ChatReferenceKind::Section, "第七章", "当前章节");
-        chapter.link = "link:/j/6".into();
+        chapter.link = "link://j/6".into();
 
         let prompt = build_chat_prompt_with_references("概括本章", &[chapter], false);
 
         assert!(prompt.contains("都必须引用其提供的链接"));
-        assert!(prompt.contains("link: link:/j/6"));
+        assert!(prompt.contains("href: link://j/6"));
     }
 
     #[test]
     fn citation_locator_keeps_the_section_and_full_node_id() {
         assert_eq!(
-            parse_chat_citation("link:/j/3/chapter/paragraph-2"),
+            parse_chat_citation("link://j/3/chapter/paragraph-2"),
             Some(ChatCitation {
                 section_index: 3,
                 node: Some("chapter/paragraph-2".into()),
             })
         );
         assert_eq!(
-            parse_chat_citation("link:/j/4"),
+            parse_chat_citation("link://j/4"),
             Some(ChatCitation {
                 section_index: 4,
                 node: None,
             })
         );
         assert_eq!(
-            parse_chat_citation("link:/j/5/chapter%2F%E6%AE%B5%E8%90%BD%20%232"),
+            parse_chat_citation("link://j/5/chapter%2F%E6%AE%B5%E8%90%BD%20%232"),
             Some(ChatCitation {
                 section_index: 5,
                 node: Some("chapter/段落 #2".into()),
             })
         );
+        assert_eq!(parse_chat_citation("link:/j/5/legacy"), None);
         assert_eq!(parse_chat_citation("https://example.com"), None);
     }
 }

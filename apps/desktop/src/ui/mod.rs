@@ -356,6 +356,7 @@ pub(crate) fn apply_visuals(ctx: &egui::Context, palette: &Palette) {
     visuals.window_fill = palette.surface;
     visuals.window_stroke = Stroke::new(1.0, palette.border);
     visuals.window_corner_radius = CornerRadius::same(10);
+    visuals.hyperlink_color = palette.accent;
     visuals.text_edit_bg_color = Some(palette.surface);
     visuals.widgets.inactive.bg_fill = palette.surface_muted;
     visuals.widgets.inactive.weak_bg_fill = palette.surface_muted;

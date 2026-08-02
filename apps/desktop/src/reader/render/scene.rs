@@ -15,6 +15,11 @@ const PDF_PAGE_SCENE_CACHE_CAPACITY: usize = 4;
 const ANNOTATION_MARK_COLOR: Color = Color::from_rgba8(96, 165, 250, 72);
 const TEXT_SELECTION_COLOR: Color = Color::from_rgba8(68, 137, 103, 72);
 
+pub(in crate::reader) fn text_selection_fill() -> egui::Color32 {
+    let rgba = TEXT_SELECTION_COLOR.to_rgba8();
+    egui::Color32::from_rgba_unmultiplied(rgba.r, rgba.g, rgba.b, rgba.a)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PageSceneKey {
     section: usize,

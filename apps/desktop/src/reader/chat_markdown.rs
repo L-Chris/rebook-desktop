@@ -5,12 +5,15 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
-use egui::{FontFamily, FontId, ImageSource, RichText, Sense, TextStyle, Vec2};
+use egui::{Color32, FontFamily, FontId, ImageSource, RichText, Sense, Stroke, TextStyle, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
+use crate::plugins::CHAT_CITATION_PREFIX;
 use crate::preferences::AppLanguage;
 use crate::ui::{Icon, icon_button, palette};
+
+use super::render::text_selection_fill;
 
 const MARKDOWN_FONT_SIZE: f32 = 13.0;
 const MARKDOWN_HEADING_FONT_SIZE: f32 = 16.0;
@@ -370,6 +373,7 @@ fn show_commonmark_fragment(
         }
     };
     ui.scope(|ui| {
+        apply_markdown_text_visuals(ui);
         ui.style_mut().interaction.selectable_labels = true;
         ui.style_mut().text_styles.insert(
             TextStyle::Body,
@@ -383,7 +387,6 @@ fn show_commonmark_fragment(
             TextStyle::Monospace,
             FontId::new(crate::ui::scaled_font_size(12.0), FontFamily::Monospace),
         );
-        egui_commonmark_backend::misc::set_strong_background_color(ui, palette().accent_soft);
         CommonMarkViewer::new()
             .indentation_spaces(2)
             .render_math_fn(Some(&math_renderer))
@@ -393,25 +396,28 @@ fn show_commonmark_fragment(
 }
 
 fn show_markdown_heading(ui: &mut egui::Ui, level: usize, source: &str, add_top_space: bool) {
-    if add_top_space {
-        ui.add_space(6.0);
-    }
-    let size = match level {
-        1 => markdown_heading_font_size(),
-        2 => crate::ui::scaled_font_size(13.75),
-        _ => markdown_font_size(),
-    };
-    ui.add(
-        egui::Label::new(
-            RichText::new(markdown_plain_text(source))
-                .size(size)
-                .strong()
-                .color(palette().text),
-        )
-        .wrap()
-        .selectable(true),
-    );
-    ui.add_space(3.0);
+    ui.scope(|ui| {
+        apply_markdown_text_visuals(ui);
+        if add_top_space {
+            ui.add_space(6.0);
+        }
+        let size = match level {
+            1 => markdown_heading_font_size(),
+            2 => crate::ui::scaled_font_size(13.75),
+            _ => markdown_font_size(),
+        };
+        ui.add(
+            egui::Label::new(
+                RichText::new(markdown_plain_text(source))
+                    .size(size)
+                    .strong()
+                    .color(palette().text),
+            )
+            .wrap()
+            .selectable(true),
+        );
+        ui.add_space(3.0);
+    });
 }
 
 fn show_markdown_table(
@@ -426,23 +432,27 @@ fn show_markdown_table(
         return None;
     }
     let mut clicked = None;
+    let table_width = ui.available_width().max(1.0);
     let display_column_count = u16::try_from(column_count).unwrap_or(u16::MAX);
-    let cell_width = (ui.available_width() / f32::from(display_column_count)).max(44.0);
+    let cell_width = table_width / f32::from(display_column_count);
     ui.add_space(3.0);
     ui.scope(|ui| {
+        apply_markdown_text_visuals(ui);
         ui.spacing_mut().item_spacing = Vec2::ZERO;
-        egui::Grid::new(
-            ui.id()
-                .with("chat-markdown-table")
-                .with(stable_hash(&table.rows)),
-        )
-        .spacing(Vec2::ZERO)
-        .show(ui, |ui| {
-            for (row_index, row) in table.rows.iter().enumerate() {
+        for (row_index, row) in table.rows.iter().enumerate() {
+            let row_height = markdown_table_row_height(ui, row, column_count, cell_width);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
                 for column_index in 0..column_count {
-                    let text = row
-                        .get(column_index)
-                        .map_or_else(String::new, |cell| markdown_plain_text(cell));
+                    let width = if column_index + 1 == column_count {
+                        (table_width
+                            - cell_width * f32::from(display_column_count.saturating_sub(1)))
+                        .max(1.0)
+                    } else {
+                        cell_width
+                    };
+                    let (rect, _) =
+                        ui.allocate_exact_size(Vec2::new(width, row_height), Sense::hover());
                     let fill = if row_index == 0 {
                         palette().surface_muted
                     } else if row_index % 2 == 0 {
@@ -450,36 +460,101 @@ fn show_markdown_table(
                     } else {
                         palette().surface
                     };
-                    egui::Frame::new()
-                        .fill(fill)
-                        .stroke(egui::Stroke::new(1.0, palette().border))
-                        .inner_margin(egui::Margin::symmetric(6, 5))
-                        .show(ui, |ui| {
-                            let content_width = (cell_width - 14.0).max(28.0);
-                            ui.set_min_width(content_width);
-                            ui.set_max_width(content_width);
-                            if citation_locators(&text).is_empty() {
-                                let mut text = RichText::new(text)
-                                    .size(markdown_font_size())
-                                    .color(palette().text);
-                                if row_index == 0 {
-                                    text = text.strong();
-                                }
-                                ui.add(egui::Label::new(text).wrap().selectable(true));
-                            } else {
-                                show_commonmark_fragment(ui, cache, &text, formula_assets);
-                                clicked = clicked
-                                    .take()
-                                    .or_else(|| clicked_citation(cache, all_citation_locators));
-                            }
-                        });
+                    ui.painter().rect(
+                        rect,
+                        0,
+                        fill,
+                        egui::Stroke::new(1.0, palette().border),
+                        egui::StrokeKind::Inside,
+                    );
+
+                    let content_rect = rect.shrink2(Vec2::new(6.0, 5.0));
+                    let mut cell_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .id_salt((
+                                "chat-markdown-table-cell",
+                                stable_hash(&table.rows),
+                                row_index,
+                                column_index,
+                            ))
+                            .max_rect(content_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    cell_ui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
+                    let markdown = row.get(column_index).map_or("", String::as_str);
+                    let text = markdown_plain_text(markdown);
+                    if citation_locators(markdown).is_empty() {
+                        let mut text = RichText::new(text)
+                            .size(markdown_font_size())
+                            .color(palette().text);
+                        if row_index == 0 {
+                            text = text.strong();
+                        }
+                        cell_ui.add(egui::Label::new(text).wrap().selectable(true));
+                    } else {
+                        show_commonmark_fragment(&mut cell_ui, cache, markdown, formula_assets);
+                        clicked = clicked
+                            .take()
+                            .or_else(|| clicked_citation(cache, all_citation_locators));
+                    }
                 }
-                ui.end_row();
-            }
-        });
+            });
+        }
     });
     ui.add_space(6.0);
     clicked
+}
+
+fn markdown_table_row_height(
+    ui: &mut egui::Ui,
+    row: &[String],
+    column_count: usize,
+    cell_width: f32,
+) -> f32 {
+    let content_width = (cell_width - 12.0).max(1.0);
+    let font_id = FontId::new(markdown_font_size(), FontFamily::Proportional);
+    let text_color = palette().text;
+    let content_height = (0..column_count)
+        .map(|column_index| {
+            let text = row
+                .get(column_index)
+                .map_or_else(String::new, |cell| markdown_plain_text(cell));
+            ui.fonts_mut(|fonts| {
+                fonts
+                    .layout(text, font_id.clone(), text_color, content_width)
+                    .size()
+                    .y
+            })
+        })
+        .fold(0.0, f32::max);
+    content_height.max(ui.text_style_height(&TextStyle::Body)) + 10.0
+}
+
+fn apply_markdown_text_visuals(ui: &mut egui::Ui) {
+    let palette = palette();
+    let surface = opaque_over(palette.surface, palette.background);
+    let selection = opaque_over(text_selection_fill(), surface);
+    let visuals = ui.visuals_mut();
+    visuals.override_text_color = Some(palette.text);
+    visuals.selection.bg_fill = selection;
+    visuals.selection.stroke = Stroke::new(1.0, palette.text);
+}
+
+fn opaque_over(foreground: Color32, background: Color32) -> Color32 {
+    let [foreground_r, foreground_g, foreground_b, foreground_a] =
+        foreground.to_srgba_unmultiplied();
+    let [background_r, background_g, background_b, _] = background.to_srgba_unmultiplied();
+    let alpha = u32::from(foreground_a);
+    let blend = |foreground: u8, background: u8| {
+        let value =
+            u32::from(foreground) * alpha + u32::from(background) * (u32::from(u8::MAX) - alpha);
+        u8::try_from((value + 127) / u32::from(u8::MAX)).unwrap_or(u8::MAX)
+    };
+    Color32::from_rgb(
+        blend(foreground_r, background_r),
+        blend(foreground_g, background_g),
+        blend(foreground_b, background_b),
+    )
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -1386,7 +1461,9 @@ fn citation_locators(markdown: &str) -> Vec<String> {
     for event in Parser::new_ext(markdown, markdown_options()) {
         if let Event::Start(Tag::Link { dest_url, .. }) = event {
             let locator = dest_url.as_ref();
-            if locator.starts_with("link:/j/") && !locators.iter().any(|item| item == locator) {
+            if locator.starts_with(CHAT_CITATION_PREFIX)
+                && !locators.iter().any(|item| item == locator)
+            {
                 locators.push(locator.to_owned());
             }
         }
@@ -1406,7 +1483,7 @@ fn citation_icon_markdown(markdown: &str) -> Cow<'_, str> {
         .into_offset_iter()
         .filter_map(|(event, range)| match event {
             Event::Start(Tag::Link { dest_url, .. })
-                if dest_url.as_ref().starts_with("link:/j/") =>
+                if dest_url.as_ref().starts_with(CHAT_CITATION_PREFIX) =>
             {
                 Some((range, dest_url.to_string()))
             }
@@ -1554,6 +1631,28 @@ flowchart LR
     }
 
     #[test]
+    fn markdown_table_row_height_follows_the_tallest_wrapped_cell() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let mut short_height = 0.0;
+        let mut wrapped_height = 0.0;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let short = vec!["Short".to_owned(), "Cell".to_owned()];
+            let wrapped = vec![
+                "Short".to_owned(),
+                "A much longer table cell that must wrap across several lines".to_owned(),
+            ];
+
+            short_height = markdown_table_row_height(ui, &short, 2, 100.0);
+            wrapped_height = markdown_table_row_height(ui, &wrapped, 2, 100.0);
+        });
+        assert!(
+            wrapped_height > short_height,
+            "wrapped={wrapped_height}, short={short_height}"
+        );
+    }
+
+    #[test]
     fn preview_defaults_to_full_size_and_can_be_compacted() {
         let state = PreviewState::default();
 
@@ -1648,16 +1747,17 @@ flowchart LR
     fn extracts_only_internal_reader_citations_from_markdown_links() {
         assert_eq!(
             citation_locators(
-                "See [source](link:/j/2/paragraph-3) and [web](https://example.com)."
+                "See [source](link://j/2/paragraph-3) and [web](https://example.com)."
             ),
-            vec!["link:/j/2/paragraph-3"]
+            vec!["link://j/2/paragraph-3"]
         );
+        assert!(citation_locators("[legacy](link:/j/2/paragraph-3)").is_empty());
     }
 
     #[test]
     fn internal_citation_labels_are_replaced_with_external_link_icons() {
         let source =
-            "结论[中文引用](link:/j/2/chapter%2Fparagraph-3)，另见[网页](https://example.com)。";
+            "结论[中文引用](link://j/2/chapter%2Fparagraph-3)，另见[网页](https://example.com)。";
         let iconized = citation_icon_markdown(source);
 
         assert!(!iconized.contains("中文引用"));
@@ -1665,14 +1765,29 @@ flowchart LR
         assert!(iconized.contains("[网页](https://example.com)"));
         assert_eq!(
             citation_locators(iconized.as_ref()),
-            vec!["link:/j/2/chapter%2Fparagraph-3"]
+            vec!["link://j/2/chapter%2Fparagraph-3"]
+        );
+    }
+
+    #[test]
+    fn citation_icon_rendering_preserves_model_authored_separators() {
+        let source = "[出处](link://j/1/n1)、[出处](link://j/2/n2)";
+
+        assert!(citation_icon_markdown(source).contains("、"));
+    }
+
+    #[test]
+    fn markdown_selection_fill_preserves_the_reader_green_when_precomposited() {
+        assert_eq!(
+            opaque_over(text_selection_fill(), Color32::WHITE),
+            Color32::from_rgb(202, 222, 212)
         );
     }
 
     #[test]
     fn an_earlier_fragment_click_survives_later_link_hook_resets() {
-        let first = "link:/j/1/first".to_owned();
-        let second = "link:/j/2/second".to_owned();
+        let first = "link://j/1/first".to_owned();
+        let second = "link://j/2/second".to_owned();
         let locators = vec![first.clone(), second.clone()];
         let mut cache = CommonMarkCache::default();
         cache.add_link_hook(first.clone());
@@ -1785,7 +1900,7 @@ flowchart LR
 
     #[test]
     fn diagnostic_summary_counts_unique_internal_citations() {
-        let source = "[one](link:/j/1/p-1) [again](link:/j/1/p-1) [two](link:/j/2)";
+        let source = "[one](link://j/1/p-1) [again](link://j/1/p-1) [two](link://j/2)";
 
         assert_eq!(diagnostic_summary(source).citations, 2);
     }

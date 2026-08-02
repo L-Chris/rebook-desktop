@@ -9,6 +9,7 @@ use crate::plugins::{
     BookSearchResult, ChatAnnotationAction, ChatCommand, ChatCommandResolution, ChatReadingContext,
     ChatResponse, ChatRole, ChatSelection, ChatTurn, TranslationBlockInput, chat_citation_link,
     chat_with_book, resolve_chat_command, search_book, section_title, translate_blocks,
+    translate_blocks_incremental,
 };
 
 use super::chat_autocomplete::{
@@ -88,11 +89,20 @@ impl DesktopReader {
             runtime.spawn(async move {
                 let id = request.id;
                 let payload = request.payload;
-                let result = translate_blocks(payload.settings, payload.blocks).await;
-                let _ = proxy.send_event(UserEvent::ReaderTranslation(TranslationTaskMessage {
-                    id,
-                    result,
-                }));
+                let batch_proxy = proxy.clone();
+                let result = translate_blocks_incremental(
+                    payload.settings,
+                    payload.blocks,
+                    move |translations| {
+                        let _ = batch_proxy.send_event(UserEvent::ReaderTranslation(
+                            TranslationTaskMessage::Batch { id, translations },
+                        ));
+                    },
+                )
+                .await;
+                let _ = proxy.send_event(UserEvent::ReaderTranslation(
+                    TranslationTaskMessage::Complete(crate::async_task::TaskResult { id, result }),
+                ));
             });
         }
         if let Some(request) = self.translation.toc_task.take_pending() {
@@ -351,7 +361,7 @@ impl DesktopReader {
             } else {
                 book_title
             },
-            link: "link:/book".into(),
+            link: "link://book".into(),
             excerpt: None,
         }];
 
@@ -780,6 +790,9 @@ impl DesktopReader {
             return;
         }
         self.translation.enabled = true;
+        if self.set_translation_rendering(true) {
+            self.refresh_translation_view();
+        }
         self.queue_visible_section_translation();
         self.queue_toc_translation();
     }
@@ -789,44 +802,41 @@ impl DesktopReader {
     }
 
     pub(super) fn queue_visible_section_translation(&mut self) {
-        if !self.translation.enabled {
+        if !self.translation.enabled || self.translation.task.is_pending() {
             return;
         }
-        let first_missing = self
-            .current_translation_sections()
-            .into_iter()
-            .find(|section_index| !self.translation_source.has_section(*section_index));
-        let Some(section_index) = first_missing else {
-            if !self.translation.render_enabled && self.set_translation_rendering(true) {
-                self.refresh_translation_view();
-                self.queue_visible_section_translation();
-            }
-            return;
-        };
-        if self.translation.render_enabled {
-            if !self.set_translation_rendering(false) {
+        let visible = match self.current_translation_ranges() {
+            Ok(visible) => visible,
+            Err(error) => {
+                self.translation.show_error(
+                    format!(
+                        "{}: {error}",
+                        self.language
+                            .text("读取当前页面失败", "Failed to inspect the current page")
+                    ),
+                    Instant::now(),
+                );
                 return;
             }
-            self.refresh_translation_view();
-        }
-        if self.translation.task.is_pending() {
-            return;
-        }
-        let blocks = match self.translation_source.translatable_blocks(section_index) {
-            Ok(blocks) => blocks,
+        };
+        let candidate = visible.into_iter().find_map(|(section_index, ranges)| {
+            match self
+                .translation_source
+                .untranslated_blocks_for_ranges(section_index, &ranges)
+            {
+                Ok(blocks) if blocks.is_empty() => None,
+                Ok(blocks) => Some(Ok((section_index, blocks))),
+                Err(error) => Some(Err(error)),
+            }
+        });
+        let Some(candidate) = candidate else { return };
+        let (section_index, blocks) = match candidate {
+            Ok(candidate) => candidate,
             Err(error) => {
                 self.translation.show_error(error, Instant::now());
                 return;
             }
         };
-        if blocks.is_empty() {
-            if let Err(error) = self.translation_source.store_section(section_index, &[]) {
-                self.translation.show_error(error, Instant::now());
-                return;
-            }
-            self.queue_visible_section_translation();
-            return;
-        }
         self.translation.clear_error();
         let mut settings = self.plugin_settings.clone();
         settings.target_language =
@@ -874,28 +884,44 @@ impl DesktopReader {
     }
 
     pub(crate) fn complete_translation(&mut self, message: TranslationTaskMessage) {
-        let Some(request) = self.translation.task.complete(message.id) else {
-            return;
-        };
-        match message.result {
-            Ok(translations) => {
+        match message {
+            TranslationTaskMessage::Batch { id, translations } => {
+                let Some(section_index) = self
+                    .translation
+                    .task
+                    .in_flight(id)
+                    .map(|request| request.section_index)
+                else {
+                    return;
+                };
                 if let Err(error) = self
                     .translation_source
-                    .store_section(request.section_index, &translations)
+                    .store_batch(section_index, &translations)
                 {
                     self.translation.show_error(error, Instant::now());
                     return;
                 }
                 self.translation.clear_error();
-                self.queue_visible_section_translation();
+                self.refresh_translation_view();
             }
-            Err(error) => {
-                self.error = Some(format!(
-                    "{}: {error}",
-                    self.language
-                        .text("翻译正文失败", "Failed to translate book content")
-                ));
-                self.translation.show_error(error, Instant::now());
+            TranslationTaskMessage::Complete(message) => {
+                let Some(_request) = self.translation.task.complete(message.id) else {
+                    return;
+                };
+                match message.result {
+                    Ok(()) => {
+                        self.translation.clear_error();
+                        self.queue_visible_section_translation();
+                    }
+                    Err(error) => {
+                        self.error = Some(format!(
+                            "{}: {error}",
+                            self.language
+                                .text("翻译正文失败", "Failed to translate book content")
+                        ));
+                        self.translation.show_error(error, Instant::now());
+                    }
+                }
             }
         }
     }
@@ -922,6 +948,7 @@ impl DesktopReader {
     }
 
     pub(super) fn refresh_translation_view(&mut self) {
+        let preserve_scroll_offset = self.is_scroll_mode() && self.scroll_viewport.is_some();
         match self.reader.refresh_source() {
             Ok(snapshot) => {
                 self.apply_snapshot(
@@ -931,6 +958,10 @@ impl DesktopReader {
                         ..SnapshotEffects::static_content_change()
                     },
                 );
+                if preserve_scroll_offset {
+                    self.scroll_target_position = None;
+                    self.scroll_viewport = None;
+                }
             }
             Err(error) => self.translation.show_error(
                 format!(
@@ -943,10 +974,36 @@ impl DesktopReader {
         }
     }
 
-    fn current_translation_sections(&mut self) -> Vec<usize> {
-        self.reader
-            .current_spread_section_indices()
-            .unwrap_or_else(|_| vec![self.snapshot.location.section_index])
+    fn current_translation_ranges(
+        &mut self,
+    ) -> Result<Vec<(usize, Vec<SourceRange>)>, rebook_reader::ReaderError> {
+        let fragments = if self.is_scroll_mode() {
+            let positions = self
+                .scroll_section
+                .as_ref()
+                .zip(self.scroll_viewport)
+                .map(|(layout, viewport)| layout.visible_pages(viewport));
+            if let Some(positions) = positions {
+                self.reader.visible_text_fragments_for_pages(&positions)?
+            } else {
+                self.reader.current_visible_text_fragments()?
+            }
+        } else {
+            self.reader.current_visible_text_fragments()?
+        };
+        let mut sections = Vec::<(usize, Vec<SourceRange>)>::new();
+        for fragment in fragments {
+            let section_index = fragment.position.section_index;
+            if let Some((_, ranges)) = sections
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == section_index)
+            {
+                ranges.push(fragment.range);
+            } else {
+                sections.push((section_index, vec![fragment.range]));
+            }
+        }
+        Ok(sections)
     }
 
     fn set_translation_rendering(&mut self, enabled: bool) -> bool {

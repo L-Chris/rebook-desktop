@@ -1,15 +1,11 @@
 use crate::alerts::AlertBundle;
-use egui::{Color32, Id, RichText, TextBuffer, TextStyle, Ui, text::LayoutJob};
+use egui::{
+    CursorIcon, Response, RichText, Sense, Stroke, TextBuffer, TextStyle, Ui, WidgetInfo,
+    WidgetType, pos2, text::LayoutJob, vec2,
+};
 use std::collections::HashMap;
 
 use crate::pulldown::ScrollableCache;
-
-const STRONG_BACKGROUND_COLOR_ID: &str = "egui-commonmark-strong-background-color";
-
-/// Selects an optional background color for Markdown strong spans in this context.
-pub fn set_strong_background_color(ui: &Ui, color: Color32) {
-    ui.data_mut(|data| data.insert_temp(Id::new(STRONG_BACKGROUND_COLOR_ID), color));
-}
 
 #[cfg(feature = "better_syntax_highlighting")]
 use syntect::{
@@ -178,11 +174,6 @@ impl Style {
         }
 
         if self.strong {
-            if let Some(color) = ui
-                .data(|data| data.get_temp::<Color32>(Id::new(STRONG_BACKGROUND_COLOR_ID)))
-            {
-                text = text.background_color(color);
-            }
             text = text.strong();
         }
 
@@ -229,7 +220,7 @@ impl Link {
             );
         }
         if cache.link_hooks().contains_key(&destination) {
-            let ui_link = ui.link(layout_job);
+            let ui_link = hook_link_icon(ui);
             if ui_link.clicked() || ui_link.middle_clicked() {
                 cache.link_hooks_mut().insert(destination, true);
             }
@@ -243,6 +234,53 @@ impl Link {
             ui.hyperlink_to(layout_job, destination);
         }
     }
+}
+
+/// Reader-owned link hooks are compact citations. Render the familiar Lucide
+/// external-link mark directly so the dependency stays SVG/font-free. Unlike
+/// a regular hyperlink, the icon changes color on hover without an underline.
+fn hook_link_icon(ui: &mut Ui) -> Response {
+    let line_height = ui.text_style_height(&TextStyle::Body).max(12.0);
+    let icon_size = line_height * 0.8;
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(line_height, line_height), Sense::click());
+    let response = response.on_hover_cursor(CursorIcon::PointingHand);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Link, ui.is_enabled(), "citation"));
+
+    if ui.is_rect_visible(rect) {
+        let color = if response.hovered() || response.has_focus() {
+            ui.visuals().hyperlink_color
+        } else {
+            ui.visuals().hyperlink_color.gamma_multiply(0.82)
+        };
+        let icon_rect = egui::Rect::from_center_size(rect.center(), vec2(icon_size, icon_size));
+        let point = |x: f32, y: f32| {
+            pos2(
+                icon_rect.left() + x * icon_rect.width() / 24.0,
+                icon_rect.top() + y * icon_rect.height() / 24.0,
+            )
+        };
+        let stroke = Stroke::new((icon_size / 16.0).max(1.0), color);
+        let painter = ui.painter();
+
+        // Lucide `external-link`: open box, diagonal, and arrow corner.
+        for (start, end) in [
+            ((18.0, 13.0), (18.0, 19.0)),
+            ((18.0, 19.0), (16.0, 21.0)),
+            ((16.0, 21.0), (5.0, 21.0)),
+            ((5.0, 21.0), (3.0, 19.0)),
+            ((3.0, 19.0), (3.0, 8.0)),
+            ((3.0, 8.0), (5.0, 6.0)),
+            ((5.0, 6.0), (11.0, 6.0)),
+            ((10.0, 14.0), (21.0, 3.0)),
+            ((15.0, 3.0), (21.0, 3.0)),
+            ((21.0, 3.0), (21.0, 9.0)),
+        ] {
+            painter.line_segment([point(start.0, start.1), point(end.0, end.1)], stroke);
+        }
+    }
+
+    response
 }
 
 pub struct Image {
@@ -627,4 +665,91 @@ pub fn prepare_show(cache: &mut CommonMarkCache, ctx: &egui::Context) {
     }
 
     cache.deactivate_link_hooks();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn citation_icon_reports_primary_clicks() {
+        let ctx = egui::Context::default();
+        let mut icon_rect = egui::Rect::NOTHING;
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            icon_rect = hook_link_icon(ui).rect;
+        });
+
+        let position = icon_rect.center();
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut clicked = false;
+        let _ = ctx.run_ui(input, |ui| {
+            clicked = hook_link_icon(ui).clicked();
+        });
+
+        assert!(clicked);
+    }
+
+    #[test]
+    fn citation_icon_click_activates_the_link_hook() {
+        let ctx = egui::Context::default();
+        let destination = "link://j/3/n4";
+        let mut icon_rect = egui::Rect::NOTHING;
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            icon_rect = hook_link_icon(ui).rect;
+        });
+
+        let position = icon_rect.center();
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut cache = CommonMarkCache::default();
+        cache.add_link_hook(destination);
+        let mut scroll_to_heading = None;
+        let _ = ctx.run_ui(input, |ui| {
+            Link {
+                destination: destination.into(),
+                text: vec![RichText::new("citation")],
+            }
+            .end(
+                ui,
+                &mut cache,
+                &CommonMarkOptions::default(),
+                &mut scroll_to_heading,
+            );
+        });
+
+        assert_eq!(cache.get_link_hook(destination), Some(true));
+    }
 }

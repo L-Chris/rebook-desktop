@@ -33,6 +33,9 @@ const ASSISTANT_EMPTY_TOP_PADDING: f32 = 12.0;
 const ASSISTANT_BOTTOM_PADDING: f32 = 12.0;
 const ASSISTANT_COMPOSER_RESERVED_HEIGHT: f32 = 52.0;
 const ASSISTANT_INPUT_HEIGHT: f32 = 32.0;
+const ASSISTANT_SELECTION_SCROLL_EDGE: f32 = 36.0;
+const ASSISTANT_SELECTION_SCROLL_MIN_SPEED: f32 = 90.0;
+const ASSISTANT_SELECTION_SCROLL_MAX_SPEED: f32 = 640.0;
 const TOOLBAR_HEIGHT: f32 = 48.0;
 const TOOLBAR_CONTROL_SIZE: f32 = 32.0;
 const TOOLBAR_TITLE_SIZE: f32 = 15.0;
@@ -1148,7 +1151,7 @@ impl DesktopReader {
             .as_ref()
             .map(|streaming| streaming.content.clone());
         let mut clicked_citation = None;
-        egui::ScrollArea::vertical()
+        let scroll_output = egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .max_height(height)
             .min_scrolled_height(height)
@@ -1184,20 +1187,21 @@ impl DesktopReader {
                     );
                 }
                 for (message_ordinal, message) in messages.iter().enumerate() {
-                    if let Some(locator) = chat_message_card(
-                        ui,
-                        message.role,
-                        message
-                            .display_content
-                            .as_deref()
-                            .unwrap_or(&message.content),
-                        self.language,
-                        &mut self.chat_markdown,
-                        message_ordinal,
-                        false,
-                    ) {
-                        clicked_citation = Some(locator);
-                    }
+                    capture_clicked_citation(
+                        &mut clicked_citation,
+                        chat_message_card(
+                            ui,
+                            message.role,
+                            message
+                                .display_content
+                                .as_deref()
+                                .unwrap_or(&message.content),
+                            self.language,
+                            &mut self.chat_markdown,
+                            message_ordinal,
+                            false,
+                        ),
+                    );
                     ui.add_space(10.0);
                 }
                 if busy {
@@ -1210,17 +1214,21 @@ impl DesktopReader {
                                 "Reading and searching the book…",
                             )
                         });
-                    let _ = chat_message_card(
-                        ui,
-                        ChatRole::Assistant,
-                        content,
-                        self.language,
-                        &mut self.chat_markdown,
-                        messages.len(),
-                        true,
+                    capture_clicked_citation(
+                        &mut clicked_citation,
+                        chat_message_card(
+                            ui,
+                            ChatRole::Assistant,
+                            content,
+                            self.language,
+                            &mut self.chat_markdown,
+                            messages.len(),
+                            true,
+                        ),
                     );
                 }
             });
+        auto_scroll_assistant_selection(ui.ctx(), &scroll_output);
         if let Some(locator) = clicked_citation {
             self.open_chat_citation(&locator);
         }
@@ -2500,6 +2508,73 @@ fn clipped_annotation_action_text(value: &str) -> String {
     clipped
 }
 
+fn capture_clicked_citation(current: &mut Option<String>, clicked: Option<String>) {
+    if let Some(locator) = clicked {
+        *current = Some(locator);
+    }
+}
+
+fn auto_scroll_assistant_selection(
+    ctx: &egui::Context,
+    output: &egui::containers::scroll_area::ScrollAreaOutput<()>,
+) {
+    let has_label_selection = ctx
+        .plugin::<egui::text_selection::LabelSelectionState>()
+        .lock()
+        .has_selection();
+    let Some((pointer, stable_dt)) = ctx.input(|input| {
+        (has_label_selection && input.pointer.primary_down())
+            .then(|| {
+                input
+                    .pointer
+                    .interact_pos()
+                    .map(|pointer| (pointer, input.stable_dt))
+            })
+            .flatten()
+    }) else {
+        return;
+    };
+    let delta = assistant_selection_autoscroll_delta(pointer, output.inner_rect, stable_dt);
+    if delta == 0.0 {
+        return;
+    }
+
+    let max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
+    let mut state = output.state;
+    let next_offset = (state.offset.y + delta).clamp(0.0, max_offset);
+    if (next_offset - state.offset.y).abs() <= f32::EPSILON {
+        return;
+    }
+    state.offset.y = next_offset;
+    state.store(ctx, output.id);
+    ctx.request_repaint();
+}
+
+fn assistant_selection_autoscroll_delta(pointer: Pos2, viewport: Rect, stable_dt: f32) -> f32 {
+    if pointer.x < viewport.left() || pointer.x > viewport.right() {
+        return 0.0;
+    }
+    let (direction, distance) = if pointer.y < viewport.top() + ASSISTANT_SELECTION_SCROLL_EDGE {
+        (
+            -1.0,
+            viewport.top() + ASSISTANT_SELECTION_SCROLL_EDGE - pointer.y,
+        )
+    } else if pointer.y > viewport.bottom() - ASSISTANT_SELECTION_SCROLL_EDGE {
+        (
+            1.0,
+            pointer.y - (viewport.bottom() - ASSISTANT_SELECTION_SCROLL_EDGE),
+        )
+    } else {
+        return 0.0;
+    };
+    let strength = (distance / ASSISTANT_SELECTION_SCROLL_EDGE).clamp(0.0, 1.0);
+    let speed = ASSISTANT_SELECTION_SCROLL_MIN_SPEED
+        + (ASSISTANT_SELECTION_SCROLL_MAX_SPEED - ASSISTANT_SELECTION_SCROLL_MIN_SPEED)
+            * strength
+            * strength;
+    direction * speed * stable_dt.min(0.05)
+}
+
 fn chat_message_card(
     ui: &mut egui::Ui,
     role: ChatRole,
@@ -2753,9 +2828,52 @@ mod reference_suggestion_label_tests {
             kind,
             label: label.into(),
             description: description.into(),
-            link: "link:/test".into(),
+            link: "link://test".into(),
             excerpt: None,
         }
+    }
+
+    #[test]
+    fn streaming_message_citations_are_forwarded_to_navigation() {
+        let mut clicked = None;
+
+        capture_clicked_citation(&mut clicked, Some("link://j/3/n4".into()));
+
+        assert_eq!(clicked.as_deref(), Some("link://j/3/n4"));
+    }
+
+    #[test]
+    fn assistant_selection_autoscroll_only_activates_near_vertical_edges() {
+        let viewport = Rect::from_min_size(Pos2::new(20.0, 100.0), Vec2::new(300.0, 400.0));
+        let frame_dt = 1.0 / 60.0;
+
+        assert!(
+            assistant_selection_autoscroll_delta(
+                Pos2::new(120.0, viewport.top() + 4.0),
+                viewport,
+                frame_dt,
+            ) < 0.0
+        );
+        assert!(
+            assistant_selection_autoscroll_delta(
+                Pos2::new(120.0, viewport.bottom() - 4.0),
+                viewport,
+                frame_dt,
+            ) > 0.0
+        );
+        assert!(
+            assistant_selection_autoscroll_delta(viewport.center(), viewport, frame_dt).abs()
+                <= f32::EPSILON
+        );
+        assert!(
+            assistant_selection_autoscroll_delta(
+                Pos2::new(viewport.right() + 1.0, viewport.bottom()),
+                viewport,
+                frame_dt,
+            )
+            .abs()
+                <= f32::EPSILON
+        );
     }
 
     #[test]

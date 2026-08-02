@@ -18,9 +18,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::persistence::write_json_atomic;
 
-pub(crate) use ai::{ChatAnnotationAction, ChatSelection, chat_citation_link};
+pub(crate) use ai::{
+    CHAT_CITATION_PREFIX, ChatAnnotationAction, ChatSelection, chat_citation_link,
+};
 pub use ai::{
     ChatReadingContext, ChatResponse, ChatRole, ChatTurn, chat_with_book, translate_blocks,
+    translate_blocks_incremental,
 };
 pub use commands::{
     ChatCommand, ChatCommandResolution, chat_command_suggestions, resolve_chat_command,
