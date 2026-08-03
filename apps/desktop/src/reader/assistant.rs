@@ -8,8 +8,8 @@ use crate::platform::UserEvent;
 use crate::plugins::{
     BookSearchResult, ChatAnnotationAction, ChatCommand, ChatCommandResolution, ChatReadingContext,
     ChatResponse, ChatRole, ChatSelection, ChatTurn, TranslationBlockInput, chat_citation_link,
-    chat_with_book, resolve_chat_command, search_book, section_title, translate_blocks,
-    translate_blocks_incremental,
+    chat_with_book, generate_pdf_toc, resolve_chat_command, search_book, section_title,
+    translate_blocks, translate_blocks_incremental,
 };
 
 use super::chat_autocomplete::{
@@ -18,9 +18,9 @@ use super::chat_autocomplete::{
 };
 use super::{
     AssistantPanel, ChatStreamMessage, ChatStreamingState, ChatTask, ChatTaskMessage,
-    DesktopReader, FocusedMark, MarkRetention, SearchTask, SearchTaskMessage, SidebarTab,
-    SnapshotEffects, TocTranslationTask, TocTranslationTaskMessage, TranslationTask,
-    TranslationTaskMessage,
+    DesktopReader, FocusedMark, MarkRetention, PdfTocTask, PdfTocTaskMessage, SearchTask,
+    SearchTaskMessage, SidebarTab, SnapshotEffects, TocTranslationTask, TocTranslationTaskMessage,
+    TranslationTask, TranslationTaskMessage,
 };
 
 impl DesktopReader {
@@ -117,6 +117,76 @@ impl DesktopReader {
                         result,
                     }));
             });
+        }
+        self.spawn_pending_pdf_toc(runtime, proxy);
+    }
+
+    fn spawn_pending_pdf_toc(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    ) {
+        if let Some(request) = self.pdf_toc.task.take_pending() {
+            let proxy = proxy.clone();
+            let progress_proxy = proxy.clone();
+            runtime.spawn(async move {
+                let id = request.id;
+                let payload = request.payload;
+                let result = generate_pdf_toc(payload.source, payload.settings, move |message| {
+                    let _ = progress_proxy.send_event(UserEvent::ReaderPdfToc(
+                        PdfTocTaskMessage::Progress { id, message },
+                    ));
+                })
+                .await;
+                let _ = proxy.send_event(UserEvent::ReaderPdfToc(PdfTocTaskMessage::Complete(
+                    crate::async_task::TaskResult { id, result },
+                )));
+            });
+        }
+    }
+
+    pub(super) fn start_pdf_toc_generation(&mut self) {
+        if self.pdf_toc.task.is_pending()
+            || self.format != rebook_formats::BookFormat::Pdf
+            || !self.plugin_settings.ocr_enabled
+        {
+            return;
+        }
+        self.pdf_toc.error = None;
+        self.pdf_toc.draft = None;
+        self.pdf_toc.editing = false;
+        self.pdf_toc.progress = "正在准备页面…".into();
+        self.pdf_toc.task.begin(PdfTocTask {
+            source: Arc::clone(&self.source),
+            settings: self.plugin_settings.clone(),
+        });
+    }
+
+    pub(crate) fn complete_pdf_toc(&mut self, message: PdfTocTaskMessage) {
+        match message {
+            PdfTocTaskMessage::Progress { id, message } => {
+                if self.pdf_toc.task.in_flight(id).is_some() {
+                    self.pdf_toc.progress = message;
+                }
+            }
+            PdfTocTaskMessage::Complete(message) => {
+                let Some(_request) = self.pdf_toc.task.complete(message.id) else {
+                    return;
+                };
+                match message.result {
+                    Ok(draft) => {
+                        self.pdf_toc.progress.clear();
+                        self.pdf_toc.error = None;
+                        self.pdf_toc.draft = Some(draft);
+                        self.pdf_toc.editing = false;
+                        self.apply_generated_toc();
+                    }
+                    Err(error) => {
+                        self.pdf_toc.progress.clear();
+                        self.pdf_toc.error = Some(error);
+                    }
+                }
+            }
         }
     }
 

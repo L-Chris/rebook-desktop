@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,7 @@ use rebook_reader::{
 };
 
 use crate::async_task::{TaskResult, TaskSlot};
+use crate::generated_toc::GeneratedTocDraft;
 use crate::highlights::{HighlightStore, StoredHighlight};
 use crate::library::LibraryBook;
 use crate::plugins::{
@@ -111,6 +112,14 @@ pub(super) fn open_reader(
         &canonical_source.book().metadata.title,
         &canonical_source.book().metadata.authors,
     );
+    let canonical_source = if format == BookFormat::Pdf {
+        crate::generated_toc::load_source(Arc::clone(&canonical_source)).unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to load generated PDF table of contents");
+            canonical_source
+        })
+    } else {
+        canonical_source
+    };
     let rewrite_source = Arc::new(RewriteBookSource::new(canonical_source));
     let mut plugin_settings = PluginSettings::load_default().unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to load plugin settings; using defaults");
@@ -183,6 +192,7 @@ pub(super) fn open_reader(
             selection_granularity: reader_preferences.selection_granularity,
             sync_settings,
             sync_password,
+            source_path: path.to_path_buf(),
         },
     ))
 }
@@ -231,6 +241,8 @@ pub(super) struct DesktopReader {
     selection: Option<ReaderSelection>,
     selection_granularity: SelectionGranularity,
     selection_toolbar_visible: bool,
+    selected_image: Option<SelectedImage>,
+    image_pointer_state: ImagePointerState,
     image_preview: Option<ImagePreview>,
     annotation_note_draft: Option<AnnotationDraft>,
     selected_highlight_id: Option<String>,
@@ -243,6 +255,7 @@ pub(super) struct DesktopReader {
     chat: ChatUiState,
     chat_markdown: chat_markdown::ChatMarkdownState,
     translation: TranslationUiState,
+    pdf_toc: PdfTocUiState,
     ui: ReaderUiState,
     canvas_size: Option<(u32, u32)>,
     scene_revision: u64,
@@ -258,6 +271,8 @@ pub(super) struct DesktopReader {
     notice_timer: TransientMessageTimer,
     error: Option<String>,
     error_timer: TransientMessageTimer,
+    source_path: PathBuf,
+    reopen_requested: Option<PathBuf>,
     pub(super) exit_requested: bool,
 }
 
@@ -267,6 +282,26 @@ struct ImagePreview {
     source_size: egui::Vec2,
     zoom: f32,
     pan: egui::Vec2,
+}
+
+struct ImagePressCandidate {
+    started_at: Instant,
+    origin: egui::Pos2,
+    image: rebook_reader::ReaderImage,
+    scroll_mode: bool,
+}
+
+enum ImagePointerState {
+    Idle,
+    Press(ImagePressCandidate),
+    SuppressNextClick,
+}
+
+struct SelectedImage {
+    image: egui::ColorImage,
+    position: ReaderPosition,
+    bounds: egui::Rect,
+    scroll_mode: bool,
 }
 
 struct ScrollSectionLayout {
@@ -437,6 +472,43 @@ impl DesktopReader {
     pub(crate) fn prepare_for_shutdown(&self) {
         self.persist_progress();
     }
+
+    pub(crate) fn take_reopen_request(&mut self) -> Option<PathBuf> {
+        self.reopen_requested.take()
+    }
+
+    fn apply_generated_toc(&mut self) {
+        let Some(draft) = self.pdf_toc.draft.as_ref() else {
+            return;
+        };
+        match crate::generated_toc::save(&self.book_id, draft) {
+            Ok(()) => {
+                self.pdf_toc.editing = false;
+                self.pdf_toc.draft = None;
+                self.persist_progress();
+                self.reopen_requested = Some(self.source_path.clone());
+            }
+            Err(error) => {
+                self.pdf_toc.error = Some(format!("保存 AI 目录失败：{error}"));
+            }
+        }
+    }
+
+    fn edit_generated_toc(&mut self) {
+        match crate::generated_toc::load(&self.book_id) {
+            Ok(Some(draft)) => {
+                self.pdf_toc.error = None;
+                self.pdf_toc.draft = Some(draft);
+                self.pdf_toc.editing = true;
+            }
+            Ok(None) => {
+                self.pdf_toc.error = Some("没有可编辑的 AI 目录".into());
+            }
+            Err(error) => {
+                self.pdf_toc.error = Some(format!("读取 AI 目录失败：{error}"));
+            }
+        }
+    }
 }
 
 struct DesktopReaderResources {
@@ -455,6 +527,7 @@ struct DesktopReaderResources {
     selection_granularity: SelectionGranularity,
     sync_settings: SyncSettings,
     sync_password: String,
+    source_path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -575,6 +648,26 @@ struct TocTranslationTask {
 }
 
 pub(crate) type TocTranslationTaskMessage = TaskResult<Vec<BlockTranslation>>;
+
+#[derive(Clone)]
+struct PdfTocTask {
+    source: Arc<dyn BookSource>,
+    settings: PluginSettings,
+}
+
+pub(crate) enum PdfTocTaskMessage {
+    Progress { id: u64, message: String },
+    Complete(TaskResult<GeneratedTocDraft>),
+}
+
+#[derive(Default)]
+struct PdfTocUiState {
+    progress: String,
+    error: Option<String>,
+    draft: Option<GeneratedTocDraft>,
+    editing: bool,
+    task: TaskSlot<PdfTocTask>,
+}
 
 #[derive(Default)]
 struct TranslationUiState {
@@ -880,6 +973,10 @@ impl DesktopReader {
         );
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "reader construction keeps all UI state defaults visible in one place"
+    )]
     fn new(mut reader: ReaderSession, resources: DesktopReaderResources) -> Self {
         let DesktopReaderResources {
             source,
@@ -897,6 +994,7 @@ impl DesktopReader {
             selection_granularity,
             sync_settings,
             sync_password,
+            source_path,
         } = resources;
         let error = reader
             .prefetch_adjacent()
@@ -928,6 +1026,8 @@ impl DesktopReader {
             selection: None,
             selection_granularity,
             selection_toolbar_visible: false,
+            selected_image: None,
+            image_pointer_state: ImagePointerState::Idle,
             image_preview: None,
             annotation_note_draft: None,
             selected_highlight_id: None,
@@ -936,6 +1036,7 @@ impl DesktopReader {
             chat: ChatUiState::default(),
             chat_markdown: chat_markdown::ChatMarkdownState::default(),
             translation: TranslationUiState::default(),
+            pdf_toc: PdfTocUiState::default(),
             ui: ReaderUiState {
                 sidebar_open: true,
                 sidebar_pinned: true,
@@ -974,6 +1075,8 @@ impl DesktopReader {
             notice_timer: TransientMessageTimer::default(),
             error,
             error_timer: TransientMessageTimer::default(),
+            source_path,
+            reopen_requested: None,
             exit_requested: false,
         }
     }

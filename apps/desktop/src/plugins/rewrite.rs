@@ -125,6 +125,10 @@ impl BookSource for RewriteBookSource {
         self.inner.book()
     }
 
+    fn table_of_contents_origin(&self) -> rebook_publication::TableOfContentsOrigin {
+        self.inner.table_of_contents_origin()
+    }
+
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
         let mut section = self.inner.parse_section(index)?;
         let rewrites = self

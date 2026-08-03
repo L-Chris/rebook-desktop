@@ -343,7 +343,8 @@ async fn translate_block_batch(
             }),
             json!({ "role": "user", "content": Value::Object(input.clone()).to_string() }),
         ];
-        let message = request_completion(client, provider, model, &messages, None).await?;
+        let message =
+            request_completion(client, provider, model, &messages, None, None, None).await?;
         let content = message_content(&message)
             .filter(|content| !content.trim().is_empty())
             .ok_or_else(|| "翻译服务返回了空内容".to_owned())?;
@@ -417,12 +418,14 @@ fn parse_translation_object(content: &str, keys: &[String]) -> Result<Vec<String
         .collect()
 }
 
-async fn request_completion(
+pub(super) async fn request_completion(
     client: &Client,
     provider: &AiProvider,
     model: &str,
     messages: &[Value],
     tools: Option<&Value>,
+    max_tokens: Option<u32>,
+    extra_body: Option<&Value>,
 ) -> Result<Value, String> {
     let mut body = json!({
         "model": if model.trim().is_empty() { "gpt-4o-mini" } else { model.trim() },
@@ -432,6 +435,17 @@ async fn request_completion(
     if let Some(tools) = tools {
         body["tools"] = tools.clone();
         body["tool_choice"] = Value::String("auto".into());
+    }
+    if let Some(max_tokens) = max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if let Some(extra_body) = extra_body.and_then(Value::as_object) {
+        let body = body
+            .as_object_mut()
+            .expect("completion request body should be an object");
+        for (key, value) in extra_body {
+            body.insert(key.clone(), value.clone());
+        }
     }
     let response = client
         .post(chat_completions_url(&provider.base_url))
@@ -460,7 +474,7 @@ async fn request_completion(
         .ok_or_else(|| "AI 响应缺少 choices[0].message".into())
 }
 
-async fn request_streaming_completion<F>(
+pub(super) async fn request_streaming_completion<F>(
     client: &Client,
     provider: &AiProvider,
     model: &str,
@@ -1598,7 +1612,7 @@ fn count_toc_items(entries: &[TocEntry]) -> usize {
         .sum()
 }
 
-fn message_content(message: &Value) -> Option<String> {
+pub(super) fn message_content(message: &Value) -> Option<String> {
     if let Some(content) = message.get("content").and_then(Value::as_str) {
         return Some(content.to_owned());
     }

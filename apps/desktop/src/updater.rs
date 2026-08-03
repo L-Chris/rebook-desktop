@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use directories::ProjectDirs;
-use egui::{RichText, Vec2};
+use egui::RichText;
+use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -11,11 +12,24 @@ use crate::async_task::{TaskResult, TaskSlot};
 use crate::persistence::write_bytes_atomic;
 use crate::platform::UserEvent;
 use crate::preferences::AppLanguage;
-use crate::ui::palette;
+use crate::ui::{dialog_action_button, palette};
 
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/L-Chris/torto/releases/latest";
 const RELEASE_DOWNLOAD_PREFIX: &str = "/L-Chris/torto/releases/download/";
 const MAX_INSTALLER_BYTES: u64 = 256 * 1024 * 1024;
+const WINDOWS_INSTALL_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$targetProcess = Get-Process -Id ([int]$env:TORTO_UPDATE_PARENT_PID) -ErrorAction SilentlyContinue
+if ($null -ne $targetProcess) { $targetProcess.WaitForExit() }
+$quotedInstaller = '"' + $env:TORTO_UPDATE_INSTALLER.Replace('"', '""') + '"'
+$quotedInstallDirectory = '"' + $env:TORTO_UPDATE_INSTALL_DIR.Replace('"', '""') + '"'
+$arguments = '/i ' + $quotedInstaller + ' APPLICATIONFOLDER=' + $quotedInstallDirectory + ' /passive /norestart'
+$installerProcess = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+if (Test-Path -LiteralPath $env:TORTO_UPDATE_RELAUNCH) {
+    Start-Process -FilePath $env:TORTO_UPDATE_RELAUNCH
+}
+exit $installerProcess.ExitCode
+"#;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UpdateRelease {
@@ -79,6 +93,7 @@ pub(crate) struct WindowsUpdater {
     install_request: Option<InstallRequest>,
     manual_check: bool,
     dialog_visible: bool,
+    release_notes_cache: CommonMarkCache,
 }
 
 impl WindowsUpdater {
@@ -94,6 +109,7 @@ impl WindowsUpdater {
             install_request: None,
             manual_check: false,
             dialog_visible: false,
+            release_notes_cache: CommonMarkCache::default(),
         }
     }
 
@@ -233,11 +249,10 @@ impl WindowsUpdater {
                     .max_height(220.0)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&view.release().notes).color(palette().text),
-                            )
-                            .wrap(),
+                        show_release_notes(
+                            ui,
+                            &mut self.release_notes_cache,
+                            &view.release().notes,
                         );
                     });
                 if let Some(message) = view.message() {
@@ -248,7 +263,7 @@ impl WindowsUpdater {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     match &view {
                         UpdateDialogView::Available(_) => {
-                            if primary_button(ui, language.text("下载更新", "Download update"))
+                            if dialog_action_button(ui, language.text("更新", "Update"), true)
                                 .clicked()
                             {
                                 action = Some(UpdateAction::Download);
@@ -259,23 +274,22 @@ impl WindowsUpdater {
                             ui.label(language.text("正在下载…", "Downloading…"));
                         }
                         UpdateDialogView::Ready(_) | UpdateDialogView::InstallFailed(_, _) => {
-                            if primary_button(
-                                ui,
-                                language.text("安装并重启", "Install and restart"),
-                            )
-                            .clicked()
+                            if dialog_action_button(ui, language.text("安装", "Install"), true)
+                                .clicked()
                             {
                                 action = Some(UpdateAction::Install);
                             }
                         }
                         UpdateDialogView::DownloadFailed(_, _) => {
-                            if primary_button(ui, language.text("重试", "Retry")).clicked() {
+                            if dialog_action_button(ui, language.text("重试", "Retry"), true)
+                                .clicked()
+                            {
                                 action = Some(UpdateAction::Download);
                             }
                         }
                     }
                     if !matches!(view, UpdateDialogView::Downloading(_))
-                        && ui.button(language.text("稍后", "Later")).clicked()
+                        && dialog_action_button(ui, language.text("稍后", "Later"), false).clicked()
                     {
                         action = Some(UpdateAction::Dismiss);
                     }
@@ -324,21 +338,12 @@ pub(crate) fn launch_installer_after_exit(request: &InstallRequest) -> Result<()
     use std::process::Command;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const INSTALL_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-$targetProcess = Get-Process -Id ([int]$env:TORTO_UPDATE_PARENT_PID) -ErrorAction SilentlyContinue
-if ($null -ne $targetProcess) { $targetProcess.WaitForExit() }
-$quotedInstaller = '"' + $env:TORTO_UPDATE_INSTALLER.Replace('"', '""') + '"'
-$arguments = '/i ' + $quotedInstaller + ' /passive /norestart'
-$installerProcess = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
-if (Test-Path -LiteralPath $env:TORTO_UPDATE_RELAUNCH) {
-    Start-Process -FilePath $env:TORTO_UPDATE_RELAUNCH
-}
-exit $installerProcess.ExitCode
-"#;
-
     verify_installer_file(&request.update)?;
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let install_directory = executable
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| "The current installation directory is unavailable".to_owned())?;
     Command::new("powershell.exe")
         .args([
             "-NoLogo",
@@ -347,11 +352,12 @@ exit $installerProcess.ExitCode
             "-WindowStyle",
             "Hidden",
             "-Command",
-            INSTALL_SCRIPT,
+            WINDOWS_INSTALL_SCRIPT,
         ])
         .env("TORTO_UPDATE_PARENT_PID", std::process::id().to_string())
         .env("TORTO_UPDATE_INSTALLER", &request.update.installer_path)
-        .env("TORTO_UPDATE_RELAUNCH", executable)
+        .env("TORTO_UPDATE_INSTALL_DIR", install_directory)
+        .env("TORTO_UPDATE_RELAUNCH", &executable)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|error| error.to_string())?;
@@ -413,14 +419,14 @@ enum UpdateAction {
     Install,
 }
 
-fn primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add_sized(
-        Vec2::new(116.0, 32.0),
-        egui::Button::new(RichText::new(label).color(egui::Color32::WHITE))
-            .fill(palette().accent)
-            .stroke(egui::Stroke::NONE)
-            .corner_radius(6),
-    )
+fn show_release_notes(ui: &mut egui::Ui, cache: &mut CommonMarkCache, markdown: &str) {
+    ui.scope(|ui| {
+        ui.visuals_mut().override_text_color = Some(palette().text);
+        ui.style_mut().interaction.selectable_labels = true;
+        CommonMarkViewer::new()
+            .indentation_spaces(2)
+            .show(ui, cache, markdown);
+    });
 }
 
 fn automatic_check_enabled() -> bool {
@@ -715,5 +721,42 @@ mod tests {
         assert!(updater.dialog_visible);
         assert!(updater.download_task.is_pending());
         assert!(matches!(updater.state, UpdateState::Downloading(_)));
+    }
+
+    #[test]
+    fn release_notes_render_markdown_instead_of_source_markers() {
+        fn collect_text(shape: &egui::epaint::Shape, output: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(text) => output.push_str(text.galley.text()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, output);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut cache = CommonMarkCache::default();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            show_release_notes(ui, &mut cache, "## Feature\n\n- Update support");
+        });
+        let mut painted_text = String::new();
+        for shape in &output.shapes {
+            collect_text(&shape.shape, &mut painted_text);
+        }
+
+        assert!(painted_text.contains("Feature"));
+        assert!(painted_text.contains("Update support"));
+        assert!(!painted_text.contains("## Feature"));
+        assert!(!painted_text.contains("- Update support"));
+    }
+
+    #[test]
+    fn unattended_upgrade_passes_the_existing_install_directory_to_msi() {
+        assert!(WINDOWS_INSTALL_SCRIPT.contains("TORTO_UPDATE_INSTALL_DIR"));
+        assert!(WINDOWS_INSTALL_SCRIPT.contains("APPLICATIONFOLDER="));
+        assert!(WINDOWS_INSTALL_SCRIPT.contains("/passive /norestart"));
     }
 }

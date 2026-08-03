@@ -102,6 +102,8 @@ impl DesktopReader {
         self.annotation_note_draft = None;
         self.selection_anchor = None;
         self.selection = None;
+        self.selected_image = None;
+        self.image_pointer_state = super::ImagePointerState::Idle;
         match effects.marks {
             MarkRetention::Keep => {}
             MarkRetention::ClearSelectedHighlight => self.selected_highlight_id = None,

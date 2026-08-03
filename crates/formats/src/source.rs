@@ -4,7 +4,8 @@ use std::sync::Arc;
 use rebook_html::parse_section;
 use rebook_publication::{
     Block, Book, BookSource, ImageBlock, ImageStyle, Metadata, PublicationError, PublicationId,
-    PublicationUrl, Resource, Section, SpineItem, SpineItemId, TocEntry, promote_single_toc_root,
+    PublicationUrl, Resource, Section, SpineItem, SpineItemId, TableOfContentsOrigin, TocEntry,
+    promote_single_toc_root,
 };
 
 use crate::{BookFormat, FormatError, conversion_error};
@@ -44,6 +45,7 @@ pub(crate) struct SourceTocEntry {
 
 pub(crate) struct DirectBookSource {
     book: Book,
+    table_of_contents_origin: TableOfContentsOrigin,
     sections: Vec<SectionContent>,
     resources: HashMap<String, StoredResource>,
 }
@@ -83,7 +85,12 @@ impl DirectBookSource {
             return Err(conversion_error(format, "没有可阅读的正文"));
         }
 
-        let table_of_contents = if book.table_of_contents.is_empty() {
+        let table_of_contents_origin = if book.table_of_contents.is_empty() {
+            TableOfContentsOrigin::Fallback
+        } else {
+            TableOfContentsOrigin::Embedded
+        };
+        let table_of_contents = if table_of_contents_origin == TableOfContentsOrigin::Fallback {
             fallback_toc
         } else {
             book.table_of_contents
@@ -120,6 +127,7 @@ impl DirectBookSource {
                 sections: descriptors,
                 table_of_contents,
             },
+            table_of_contents_origin,
             sections,
             resources,
         })
@@ -129,6 +137,10 @@ impl DirectBookSource {
 impl BookSource for DirectBookSource {
     fn book(&self) -> &Book {
         &self.book
+    }
+
+    fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
+        self.table_of_contents_origin
     }
 
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {

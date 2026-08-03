@@ -14,4 +14,5 @@ pub(crate) enum UserEvent {
     ReaderChat(crate::reader::ChatTaskMessage),
     ReaderTranslation(crate::reader::TranslationTaskMessage),
     ReaderTocTranslation(crate::reader::TocTranslationTaskMessage),
+    ReaderPdfToc(crate::reader::PdfTocTaskMessage),
 }

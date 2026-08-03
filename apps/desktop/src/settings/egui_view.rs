@@ -9,7 +9,7 @@ use crate::plugins::{
 };
 use crate::preferences::{AppLanguage, AppTheme};
 use crate::sync::{CloudProviderKind, SYNC_INTERVAL_OPTIONS};
-use crate::ui::{Icon, icon_button, navigation_button, palette};
+use crate::ui::{Icon, dialog_action_button, icon_button, navigation_button, palette};
 
 const SETTINGS_SELECT_WIDTH: f32 = 156.0;
 const SETTINGS_MODEL_SELECT_WIDTH: f32 = 280.0;
@@ -124,6 +124,7 @@ fn settings_sidebar(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         (SettingsTab::Font, Icon::Type, "字体", "Font"),
         (SettingsTab::Ai, Icon::Server, "AI 提供商", "AI providers"),
         (SettingsTab::AiChat, Icon::Bot, "AI 对话", "AI chat"),
+        (SettingsTab::Ocr, Icon::ScanText, "OCR", "OCR"),
         (
             SettingsTab::Translation,
             Icon::Languages,
@@ -164,6 +165,7 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 SettingsTab::Font => state.draft_language.text("字体", "Font"),
                 SettingsTab::Ai => state.draft_language.text("AI 提供商", "AI providers"),
                 SettingsTab::AiChat => state.draft_language.text("AI 对话", "AI chat"),
+                SettingsTab::Ocr => "OCR",
                 SettingsTab::Translation => state.draft_language.text("翻译", "Translation"),
                 SettingsTab::Cloud => state.draft_language.text("云盘同步", "Cloud sync"),
                 SettingsTab::About => state.draft_language.text("关于", "About"),
@@ -199,6 +201,7 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 SettingsTab::Font => font_settings(ui, state),
                 SettingsTab::Ai => ai_provider_settings(ui, state),
                 SettingsTab::AiChat => ai_chat_settings(ui, state),
+                SettingsTab::Ocr => ocr_settings(ui, state),
                 SettingsTab::Translation => translation_settings(ui, state),
                 SettingsTab::Cloud => cloud_settings(ui, state),
                 SettingsTab::About => about_settings(ui, state),
@@ -215,39 +218,18 @@ fn settings_content(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         egui::Layout::right_to_left(egui::Align::Center),
         |ui| {
             if state.settings_tab == SettingsTab::About {
-                if ui
-                    .add_sized(
-                        [68.0, 32.0],
-                        egui::Button::new(state.draft_language.text("关闭", "Close"))
-                            .corner_radius(6),
-                    )
+                if dialog_action_button(ui, state.draft_language.text("关闭", "Close"), false)
                     .clicked()
                 {
                     state.close_overlay();
                 }
             } else {
-                if ui
-                    .add_sized(
-                        [68.0, 32.0],
-                        egui::Button::new(
-                            RichText::new(state.draft_language.text("保存", "Save"))
-                                .color(Color32::WHITE),
-                        )
-                        .fill(palette().accent)
-                        .stroke(egui::Stroke::NONE)
-                        .corner_radius(6),
-                    )
+                if dialog_action_button(ui, state.draft_language.text("保存", "Save"), true)
                     .clicked()
                 {
                     state.apply_settings();
                 }
-                if ui
-                    .add_sized(
-                        [68.0, 32.0],
-                        egui::Button::new(state.draft_language.text("取消", "Cancel"))
-                            .frame_when_inactive(false)
-                            .corner_radius(6),
-                    )
+                if dialog_action_button(ui, state.draft_language.text("取消", "Cancel"), false)
                     .clicked()
                 {
                     state.close_overlay();
@@ -701,6 +683,36 @@ fn ai_chat_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     1,
                 );
             });
+    });
+}
+
+fn ocr_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
+    let language = state.draft_language;
+    let settings = &mut state.draft_plugin_settings;
+    let options = configured_model_options(settings);
+    settings_card(ui, |ui| {
+        ui.checkbox(
+            &mut settings.ocr_enabled,
+            language.text("启用目录识别", "Enable contents recognition"),
+        );
+        ui.add_space(8.0);
+        field_label(
+            ui,
+            language.text("目录识别模型", "Contents recognition model"),
+        );
+        configured_model_selector(
+            ui,
+            "ocr-model",
+            &options,
+            &mut settings.ocr_provider,
+            &mut settings.ocr_model,
+            language,
+        );
+        ui.add_space(8.0);
+        ui.weak(language.text(
+            "仅显示已在 AI 提供商中配置的模型；所选模型需要支持图片输入。",
+            "Only configured AI provider models are shown; the selected model must support image input.",
+        ));
     });
 }
 

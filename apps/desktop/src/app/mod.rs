@@ -8,8 +8,8 @@ use crate::library::LocalLibrary;
 use crate::platform::UserEvent;
 use crate::preferences::{AppTheme, InterfaceTypography};
 use crate::reader::{
-    ChatStreamMessage, ChatTaskMessage, SearchTaskMessage, TocTranslationTaskMessage,
-    TranslationTaskMessage,
+    ChatStreamMessage, ChatTaskMessage, PdfTocTaskMessage, SearchTaskMessage,
+    TocTranslationTaskMessage, TranslationTaskMessage,
 };
 use crate::reader::{DesktopReader, ReaderFramePlan, ReaderPageTexture};
 use crate::settings::{SettingsFeature, settings_overlay};
@@ -166,6 +166,12 @@ impl DesktopApp {
         }
     }
 
+    pub(crate) fn complete_reader_pdf_toc(&mut self, message: PdfTocTaskMessage) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.complete_pdf_toc(message);
+        }
+    }
+
     pub(crate) fn log_reader_diagnostics(&self, event: &'static str, focused: Option<bool>) {
         if let Some(reader) = self.reader.as_ref() {
             reader.log_diagnostic_snapshot(event, focused);
@@ -188,6 +194,14 @@ impl DesktopApp {
     }
 
     fn reconcile_state(&mut self, ctx: &egui::Context) {
+        if let Some(path) = self
+            .reader
+            .as_mut()
+            .and_then(DesktopReader::take_reopen_request)
+        {
+            self.reader = None;
+            self.shelf.open_book(&path);
+        }
         if self
             .reader
             .as_ref()

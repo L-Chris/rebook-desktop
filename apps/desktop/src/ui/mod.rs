@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use egui::emath::GuiRounding;
 use egui::{
     Align2, Color32, ColorImage, CornerRadius, FontData, FontDefinitions, FontFamily, Rect,
-    Response, Sense, Stroke, TextStyle, Ui, Vec2, WidgetInfo, WidgetType,
+    Response, RichText, Sense, Stroke, TextStyle, Ui, Vec2, WidgetInfo, WidgetType,
 };
 
 pub(crate) use icons::{Icon, IconWidget, paint_icon};
@@ -398,6 +398,10 @@ pub(crate) fn icon_button(ui: &mut Ui, glyph: Icon) -> Response {
     painted_icon_button(ui, glyph, false)
 }
 
+pub(crate) fn small_icon_button(ui: &mut Ui, glyph: Icon) -> Response {
+    painted_icon_button_sized(ui, glyph, false, 28.0, 15.0)
+}
+
 /// Icon action used as a tab. The selected state uses a quiet accent surface
 /// instead of the high-contrast fill intended for primary actions.
 pub(crate) fn selectable_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -> Response {
@@ -405,7 +409,17 @@ pub(crate) fn selectable_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -
 }
 
 fn painted_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+    painted_icon_button_sized(ui, glyph, selected, 32.0, 17.0)
+}
+
+fn painted_icon_button_sized(
+    ui: &mut Ui,
+    glyph: Icon,
+    selected: bool,
+    button_size: f32,
+    icon_size: f32,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(button_size), Sense::click());
     let palette = palette();
     let fill = if selected {
         palette.accent_soft
@@ -429,7 +443,7 @@ fn painted_icon_button(ui: &mut Ui, glyph: Icon, selected: bool) -> Response {
         }
         paint_icon(
             ui,
-            Rect::from_center_size(rect.center(), Vec2::splat(17.0)),
+            Rect::from_center_size(rect.center(), Vec2::splat(icon_size)),
             glyph,
             foreground,
         );
@@ -550,6 +564,26 @@ pub(crate) fn navigation_text_button(ui: &mut Ui, label: &str, selected: bool) -
     response
 }
 
+/// Text action used in modal footers. Primary and secondary actions share the
+/// same dimensions and corner treatment used by the Settings dialog.
+pub(crate) fn dialog_action_button(ui: &mut Ui, label: &str, primary: bool) -> Response {
+    let palette = palette();
+    let button = egui::Button::new(RichText::new(label).color(if primary {
+        Color32::WHITE
+    } else {
+        palette.text
+    }))
+    .min_size(Vec2::new(68.0, 32.0))
+    .corner_radius(6);
+    let button = if primary {
+        button.fill(palette.accent).stroke(Stroke::NONE)
+    } else {
+        button.frame_when_inactive(false)
+    };
+    ui.add(button)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 pub(crate) fn decode_color_image(bytes: &[u8]) -> Result<ColorImage, image::ImageError> {
     let image = image::load_from_memory(bytes)?.to_rgba8();
     let size = [image.width() as usize, image.height() as usize];
@@ -611,5 +645,19 @@ mod tests {
         ] {
             assert!((actual - expected).abs() < f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn dialog_actions_share_the_same_minimum_geometry() {
+        let ctx = egui::Context::default();
+        let mut primary = Rect::NOTHING;
+        let mut secondary = Rect::NOTHING;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            primary = dialog_action_button(ui, "Update", true).rect;
+            secondary = dialog_action_button(ui, "Later", false).rect;
+        });
+
+        assert_eq!(primary.size(), Vec2::new(68.0, 32.0));
+        assert_eq!(secondary.size(), Vec2::new(68.0, 32.0));
     }
 }

@@ -18,7 +18,7 @@ use kurbo::{Affine, BezPath, Point, Rect, Shape};
 use rebook_publication::{
     Block, Book, BookSource, FixedPageTextLayer, FixedPageTextRect, FixedPageTextSpan, Metadata,
     PublicationError, PublicationUrl, RasterResource, RenditionLayout, Resource, Section,
-    SourceAnchor, SourceRange,
+    SourceAnchor, SourceRange, TableOfContentsOrigin,
 };
 use sha2::{Digest, Sha256};
 
@@ -117,6 +117,10 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<PdfPublication, Form
 impl BookSource for PdfPublication {
     fn book(&self) -> &Book {
         self.descriptor.book()
+    }
+
+    fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
+        self.descriptor.table_of_contents_origin()
     }
 
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {

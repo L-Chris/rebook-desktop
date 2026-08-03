@@ -1,0 +1,257 @@
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use directories::ProjectDirs;
+use rebook_publication::{
+    Book, BookSource, PublicationError, PublicationUrl, RasterResource, Resource, Section,
+    TableOfContentsOrigin, TocEntry,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::persistence::write_json_atomic;
+
+const GENERATED_TOC_VERSION: u8 = 1;
+const GENERATED_TOC_DIRECTORY: &str = "generated-toc";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct GeneratedTocEntry {
+    pub(crate) depth: usize,
+    pub(crate) title: String,
+    pub(crate) printed_page: String,
+    /// One-based physical PDF page.
+    pub(crate) physical_page: usize,
+    pub(crate) confidence: f32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GeneratedTocDraft {
+    pub(crate) provider_name: String,
+    pub(crate) model: String,
+    pub(crate) source_pages: Vec<usize>,
+    pub(crate) entries: Vec<GeneratedTocEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredGeneratedToc {
+    version: u8,
+    book_id: String,
+    provider_name: String,
+    model: String,
+    source_pages: Vec<usize>,
+    entries: Vec<GeneratedTocEntry>,
+}
+
+impl StoredGeneratedToc {
+    fn from_draft(book_id: &str, draft: &GeneratedTocDraft) -> Self {
+        Self {
+            version: GENERATED_TOC_VERSION,
+            book_id: book_id.to_owned(),
+            provider_name: draft.provider_name.clone(),
+            model: draft.model.clone(),
+            source_pages: draft.source_pages.clone(),
+            entries: normalize_entries(draft.entries.clone()),
+        }
+    }
+}
+
+pub(crate) fn save(book_id: &str, draft: &GeneratedTocDraft) -> io::Result<()> {
+    let path = generated_toc_path(book_id)?;
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "generated TOC path does not have a parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    write_json_atomic(&path, &StoredGeneratedToc::from_draft(book_id, draft))
+}
+
+pub(crate) fn load(book_id: &str) -> io::Result<Option<GeneratedTocDraft>> {
+    let path = generated_toc_path(book_id)?;
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let stored: StoredGeneratedToc = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if stored.version != GENERATED_TOC_VERSION || stored.book_id != book_id {
+        return Ok(None);
+    }
+    Ok(Some(GeneratedTocDraft {
+        provider_name: stored.provider_name,
+        model: stored.model,
+        source_pages: stored.source_pages,
+        entries: normalize_entries(stored.entries),
+    }))
+}
+
+pub(crate) fn load_source(source: Arc<dyn BookSource>) -> io::Result<Arc<dyn BookSource>> {
+    let book_id = source.book().id.to_string();
+    let Some(draft) = load(&book_id)? else {
+        return Ok(source);
+    };
+    let entries = draft.entries;
+    if entries.is_empty()
+        || entries.iter().any(|entry| {
+            entry.physical_page == 0 || entry.physical_page > source.book().sections.len()
+        })
+    {
+        return Ok(source);
+    }
+    Ok(Arc::new(GeneratedTocBookSource::new(source, &entries)))
+}
+
+fn generated_toc_path(book_id: &str) -> io::Result<PathBuf> {
+    let project = ProjectDirs::from("com", "Rebook", "Rebook").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "application data directory is unavailable",
+        )
+    })?;
+    let safe_id = if book_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        book_id.to_owned()
+    } else {
+        format!("{:x}", Sha256::digest(book_id.as_bytes()))
+    };
+    Ok(project
+        .data_local_dir()
+        .join(GENERATED_TOC_DIRECTORY)
+        .join(format!("{safe_id}.json")))
+}
+
+fn normalize_entries(mut entries: Vec<GeneratedTocEntry>) -> Vec<GeneratedTocEntry> {
+    entries.retain(|entry| !entry.title.trim().is_empty() && entry.physical_page > 0);
+    let mut previous_depth = 0;
+    for (index, entry) in entries.iter_mut().enumerate() {
+        entry.title = entry.title.trim().to_owned();
+        entry.printed_page = entry.printed_page.trim().to_owned();
+        entry.confidence = entry.confidence.clamp(0.0, 1.0);
+        entry.depth = if index == 0 {
+            0
+        } else {
+            entry.depth.min(previous_depth + 1)
+        };
+        previous_depth = entry.depth;
+    }
+    entries
+}
+
+fn nested_toc(
+    entries: &[GeneratedTocEntry],
+    sections: &[rebook_publication::SpineItem],
+) -> Vec<TocEntry> {
+    let mut cursor = 0;
+    build_level(entries, sections, &mut cursor, 0)
+}
+
+fn build_level(
+    entries: &[GeneratedTocEntry],
+    sections: &[rebook_publication::SpineItem],
+    cursor: &mut usize,
+    depth: usize,
+) -> Vec<TocEntry> {
+    let mut output: Vec<TocEntry> = Vec::new();
+    while let Some(entry) = entries.get(*cursor) {
+        if entry.depth < depth {
+            break;
+        }
+        if entry.depth > depth
+            && let Some(parent) = output.last_mut()
+        {
+            parent.children = build_level(entries, sections, cursor, depth + 1);
+            continue;
+        }
+        let href = entry
+            .physical_page
+            .checked_sub(1)
+            .and_then(|index| sections.get(index))
+            .map(|section| section.href.clone());
+        output.push(TocEntry {
+            label: entry.title.clone(),
+            href,
+            children: Vec::new(),
+        });
+        *cursor += 1;
+        if entries.get(*cursor).is_some_and(|next| next.depth > depth) {
+            let children = build_level(entries, sections, cursor, depth + 1);
+            if let Some(parent) = output.last_mut() {
+                parent.children = children;
+            }
+        }
+    }
+    output
+}
+
+struct GeneratedTocBookSource {
+    inner: Arc<dyn BookSource>,
+    book: Book,
+}
+
+impl GeneratedTocBookSource {
+    fn new(inner: Arc<dyn BookSource>, entries: &[GeneratedTocEntry]) -> Self {
+        let mut book = inner.book().clone();
+        book.table_of_contents = nested_toc(entries, &book.sections);
+        Self { inner, book }
+    }
+}
+
+impl BookSource for GeneratedTocBookSource {
+    fn book(&self) -> &Book {
+        &self.book
+    }
+
+    fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
+        TableOfContentsOrigin::Generated
+    }
+
+    fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
+        self.inner.parse_section(index)
+    }
+
+    fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
+        self.inner.resource(href)
+    }
+
+    fn raster_resource(
+        &self,
+        href: &PublicationUrl,
+    ) -> Result<Option<RasterResource>, PublicationError> {
+        self.inner.raster_resource(href)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GeneratedTocEntry, normalize_entries};
+
+    #[test]
+    fn generated_depth_never_skips_a_level() {
+        let entries = normalize_entries(vec![
+            GeneratedTocEntry {
+                depth: 4,
+                title: " Chapter ".into(),
+                printed_page: " 1 ".into(),
+                physical_page: 8,
+                confidence: 2.0,
+            },
+            GeneratedTocEntry {
+                depth: 5,
+                title: "Section".into(),
+                printed_page: "2".into(),
+                physical_page: 9,
+                confidence: 0.8,
+            },
+        ]);
+        assert_eq!(entries[0].depth, 0);
+        assert_eq!(entries[1].depth, 1);
+        assert_eq!(entries[0].title, "Chapter");
+        assert!((entries[0].confidence - 1.0).abs() < f32::EPSILON);
+    }
+}

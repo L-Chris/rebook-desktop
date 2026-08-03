@@ -82,6 +82,20 @@
             Schedule='afterInstallInitialize'
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
 
+        <!-- Reuse the directory recorded by the previous version during both
+             interactive and unattended major upgrades. A command-line
+             APPLICATIONFOLDER supplied by the built-in updater remains the
+             source of truth for the first upgrade from older installers. -->
+        <Property Id='APPLICATIONFOLDER' Secure='yes'>
+            <RegistrySearch
+                Id='PreviousApplicationFolder'
+                Root='HKLM'
+                Key='Software\L-Chris\Torto'
+                Name='InstallLocation'
+                Type='raw'
+                Win64='yes'/>
+        </Property>
+
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
         <Property Id='DiskPrompt' Value='Torto Installation'/>
 
@@ -129,6 +143,18 @@
                                 Advertise='yes'/>
                         </File>
                     </Component>
+                    <Component
+                        Id='InstallLocationRegistry'
+                        Guid='7FEC8F25-D476-4C0D-8B3A-A5CDF26A0456'
+                        Win64='yes'>
+                        <RegistryValue
+                            Root='HKLM'
+                            Key='Software\L-Chris\Torto'
+                            Name='InstallLocation'
+                            Type='string'
+                            Value='[APPLICATIONFOLDER]'
+                            KeyPath='yes'/>
+                    </Component>
                 </Directory>
             </Directory>
             <Directory Id='ProgramMenuFolder'/>
@@ -151,6 +177,7 @@
             <ComponentRef Id='License'/>
 
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='InstallLocationRegistry'/>
         </Feature>
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>

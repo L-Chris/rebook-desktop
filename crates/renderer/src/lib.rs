@@ -34,6 +34,7 @@ pub struct PageSelectionFragment {
 /// Original raster content for the top-most image under a page coordinate.
 #[derive(Clone)]
 pub struct PageImageHit {
+    pub bounds: Rect,
     pub width: u32,
     pub height: u32,
     pub pixels: Arc<[u8]>,
@@ -101,6 +102,7 @@ impl PageDisplayList {
             .find_map(|command| match command {
                 DisplayCommand::Image(command) if command.bounds.contains(point) => {
                     Some(PageImageHit {
+                        bounds: command.bounds,
                         width: command.width,
                         height: command.height,
                         pixels: Arc::clone(&command.pixels),

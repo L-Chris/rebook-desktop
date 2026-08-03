@@ -3,6 +3,7 @@
 
 mod ai;
 mod commands;
+mod pdf_toc;
 mod rewrite;
 mod search;
 mod translation;
@@ -28,6 +29,7 @@ pub use ai::{
 pub use commands::{
     ChatCommand, ChatCommandResolution, chat_command_suggestions, resolve_chat_command,
 };
+pub(crate) use pdf_toc::generate_pdf_toc;
 pub use rewrite::RewriteBookSource;
 pub(crate) use search::section_title;
 pub use search::{BookSearchResult, search_book};
@@ -39,6 +41,7 @@ const DEFAULT_PROVIDER_ID: &str = "openai";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_CHAT_MAX_TOOL_STEPS: u16 = 24;
 const CHAT_TOOL_DEFAULTS_VERSION: u8 = 1;
+const OCR_SELECTION_DEFAULTS_VERSION: u8 = 1;
 const DEFAULT_CHAT_HISTORY_TURNS: u16 = 10;
 pub(crate) const CHAT_TOOL_STEPS_MIN: u16 = 1;
 pub(crate) const CHAT_TOOL_STEPS_MAX: u16 = 24;
@@ -145,6 +148,9 @@ pub struct PluginSettings {
     pub chat_model: String,
     pub chat_max_tool_steps: u16,
     pub chat_history_turns: u16,
+    pub ocr_enabled: bool,
+    pub ocr_provider: String,
+    pub ocr_model: String,
     pub translation_provider: String,
     pub translation_model: String,
     pub target_language: String,
@@ -152,6 +158,8 @@ pub struct PluginSettings {
     pub translate_toc: bool,
     #[serde(default)]
     chat_tool_defaults_version: u8,
+    #[serde(default)]
+    ocr_selection_defaults_version: u8,
     #[serde(default, rename = "base_url", skip_serializing)]
     legacy_base_url: Option<String>,
     #[serde(default, rename = "api_key", skip_serializing)]
@@ -166,12 +174,16 @@ impl Default for PluginSettings {
             chat_model: DEFAULT_MODEL.into(),
             chat_max_tool_steps: DEFAULT_CHAT_MAX_TOOL_STEPS,
             chat_history_turns: DEFAULT_CHAT_HISTORY_TURNS,
+            ocr_enabled: true,
+            ocr_provider: DEFAULT_PROVIDER_ID.into(),
+            ocr_model: DEFAULT_MODEL.into(),
             translation_provider: DEFAULT_PROVIDER_ID.into(),
             translation_model: DEFAULT_MODEL.into(),
             target_language: TARGET_LANGUAGE_INTERFACE.into(),
             translation_mode: TranslationMode::Bilingual,
             translate_toc: true,
             chat_tool_defaults_version: CHAT_TOOL_DEFAULTS_VERSION,
+            ocr_selection_defaults_version: 0,
             legacy_base_url: None,
             legacy_api_key: None,
         }
@@ -207,9 +219,11 @@ impl PluginSettings {
             }
             if let Some(provider) = settings.providers.first() {
                 settings.chat_provider.clone_from(&provider.id);
+                settings.ocr_provider.clone_from(&provider.id);
                 settings.translation_provider.clone_from(&provider.id);
             }
             settings.chat_model.clone_from(&value);
+            settings.ocr_model.clone_from(&value);
             settings.translation_model = value;
         }
         if let Ok(value) = env::var("REBOOK_AI_API_KEY")
@@ -241,6 +255,11 @@ impl PluginSettings {
             }
             self.chat_tool_defaults_version = CHAT_TOOL_DEFAULTS_VERSION;
         }
+        if self.ocr_selection_defaults_version < OCR_SELECTION_DEFAULTS_VERSION {
+            self.ocr_provider.clone_from(&self.chat_provider);
+            self.ocr_model.clone_from(&self.chat_model);
+            self.ocr_selection_defaults_version = OCR_SELECTION_DEFAULTS_VERSION;
+        }
         if self.providers.is_empty() {
             self.providers.push(AiProvider::default());
         }
@@ -268,6 +287,7 @@ impl PluginSettings {
             &mut self.chat_provider,
             &mut self.chat_model,
         );
+        normalize_selection(&self.providers, &mut self.ocr_provider, &mut self.ocr_model);
         normalize_selection(
             &self.providers,
             &mut self.translation_provider,
@@ -315,6 +335,7 @@ impl PluginSettings {
             &mut self.chat_provider,
             &mut self.chat_model,
         );
+        normalize_selection(&self.providers, &mut self.ocr_provider, &mut self.ocr_model);
         normalize_selection(
             &self.providers,
             &mut self.translation_provider,
@@ -335,6 +356,7 @@ impl PluginSettings {
             &mut self.chat_provider,
             &mut self.chat_model,
         );
+        normalize_selection(&self.providers, &mut self.ocr_provider, &mut self.ocr_model);
         normalize_selection(
             &self.providers,
             &mut self.translation_provider,
@@ -344,6 +366,10 @@ impl PluginSettings {
 
     pub fn chat_endpoint(&self) -> Result<(&AiProvider, &str), String> {
         self.endpoint(&self.chat_provider, &self.chat_model, "AI Chat")
+    }
+
+    pub fn ocr_endpoint(&self) -> Result<(&AiProvider, &str), String> {
+        self.endpoint(&self.ocr_provider, &self.ocr_model, "OCR")
     }
 
     pub fn translation_endpoint(&self) -> Result<(&AiProvider, &str), String> {
@@ -410,12 +436,13 @@ impl PluginSettings {
             if let Some(api_key) = self.legacy_api_key.take() {
                 provider.api_key = api_key;
             }
-            for model in [&self.chat_model, &self.translation_model] {
+            for model in [&self.chat_model, &self.ocr_model, &self.translation_model] {
                 if !model.trim().is_empty() && !provider.models.contains(model) {
                     provider.models.push(model.clone());
                 }
             }
             self.chat_provider.clone_from(&provider.id);
+            self.ocr_provider.clone_from(&provider.id);
             self.translation_provider.clone_from(&provider.id);
         }
     }
@@ -555,11 +582,14 @@ mod tests {
                 .contains(&"qwen-translate".into())
         );
         assert_eq!(settings.chat_model, "qwen-chat");
+        assert_eq!(settings.ocr_provider, DEFAULT_PROVIDER_ID);
+        assert_eq!(settings.ocr_model, "qwen-chat");
         assert_eq!(settings.translation_model, "qwen-translate");
         assert_eq!(settings.target_language, TARGET_LANGUAGE_ENGLISH);
         assert_eq!(settings.resolved_target_language("简体中文"), "English");
         assert_eq!(settings.translation_mode, TranslationMode::Bilingual);
         assert!(settings.translate_toc);
+        assert!(settings.ocr_enabled);
         assert_eq!(settings.chat_max_tool_steps, DEFAULT_CHAT_MAX_TOOL_STEPS);
         assert_eq!(settings.chat_history_turns, DEFAULT_CHAT_HISTORY_TURNS);
     }
@@ -616,19 +646,50 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_selected_provider_repairs_both_feature_selections() {
+    fn removing_a_selected_provider_repairs_all_feature_selections() {
         let mut settings = PluginSettings::default();
         settings.add_provider();
         let second = settings.providers[1].id.clone();
         settings.chat_provider.clone_from(&second);
+        settings.ocr_provider.clone_from(&second);
         settings.translation_provider = second;
 
         settings.remove_provider(1);
 
         assert_eq!(settings.chat_provider, DEFAULT_PROVIDER_ID);
+        assert_eq!(settings.ocr_provider, DEFAULT_PROVIDER_ID);
         assert_eq!(settings.translation_provider, DEFAULT_PROVIDER_ID);
         assert_eq!(settings.chat_model, DEFAULT_MODEL);
+        assert_eq!(settings.ocr_model, DEFAULT_MODEL);
         assert_eq!(settings.translation_model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn ocr_selection_round_trips_and_only_accepts_configured_models() {
+        let mut settings = PluginSettings {
+            ocr_enabled: false,
+            ..PluginSettings::default()
+        };
+        settings.providers[0].models.push("qwen/base".into());
+        settings.providers[0].api_key = "secret-key".into();
+        settings.providers[0].base_url = "https://example.com/v1".into();
+        settings.ocr_model = "qwen/base".into();
+        settings.ocr_selection_defaults_version = OCR_SELECTION_DEFAULTS_VERSION;
+        settings.normalize();
+
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored: PluginSettings = serde_json::from_str(&json).unwrap();
+        assert!(!restored.ocr_enabled);
+        assert_eq!(restored.ocr_provider, DEFAULT_PROVIDER_ID);
+        assert_eq!(restored.ocr_model, "qwen/base");
+
+        let (provider, model) = settings.ocr_endpoint().unwrap();
+        assert_eq!(provider.id, DEFAULT_PROVIDER_ID);
+        assert_eq!(model, "qwen/base");
+
+        settings.ocr_model = "not-configured".into();
+        settings.normalize();
+        assert_eq!(settings.ocr_model, DEFAULT_MODEL);
     }
 
     #[test]

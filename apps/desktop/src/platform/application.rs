@@ -196,6 +196,7 @@ impl ApplicationHandler<UserEvent> for Application {
             UserEvent::ReaderTocTranslation(message) => {
                 self.app.complete_reader_toc_translation(message);
             }
+            UserEvent::ReaderPdfToc(message) => self.app.complete_reader_pdf_toc(message),
         }
         if let Some(window) = &self.window {
             window.window.request_redraw();
@@ -337,8 +338,12 @@ mod tests {
     }
 
     #[test]
-    fn installer_shortcuts_use_the_embedded_application_icon() {
+    fn installer_keeps_shortcut_icons_and_remembers_the_install_location() {
         let wix = include_str!("../../wix/main.wxs");
         assert_eq!(wix.matches("Icon='ProductIcon.exe'").count(), 2);
+        assert!(wix.contains("<Property Id='APPLICATIONFOLDER' Secure='yes'>"));
+        assert!(wix.contains("Id='PreviousApplicationFolder'"));
+        assert!(wix.contains("Value='[APPLICATIONFOLDER]'"));
+        assert!(wix.contains("<ComponentRef Id='InstallLocationRegistry'/>"));
     }
 }

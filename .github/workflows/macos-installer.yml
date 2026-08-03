@@ -208,4 +208,5 @@ jobs:
             dist/*.dmg
             dist/*.sha256
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          # Release notes are created once by the publishing flow. Asset jobs
+          # must not append a second generated changelog to an existing release.

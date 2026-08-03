@@ -91,6 +91,13 @@ pub struct ReaderSelection {
 /// Original image pixels resolved from a point in the visible reader spread.
 #[derive(Clone)]
 pub struct ReaderImage {
+    pub position: ReaderPosition,
+    /// Left edge in the coordinate space used for the image query.
+    pub x: f32,
+    /// Top edge in the coordinate space used for the image query.
+    pub y: f32,
+    pub display_width: f32,
+    pub display_height: f32,
     pub width: u32,
     pub height: u32,
     pub pixels: Arc<[u8]>,
@@ -876,7 +883,10 @@ impl ReaderSession {
             segment_index: position.segment_index,
         };
         self.ensure_segment(key)?;
-        Ok(self.page_at(position)?.image_at(x, y).map(reader_image))
+        Ok(self
+            .page_at(position)?
+            .image_at(x, y)
+            .map(|hit| reader_image(position, hit, 0.0)))
     }
 
     pub fn source_ranges_contain_point_on_page(
@@ -972,8 +982,10 @@ impl ReaderSession {
             .current_spread_pages()?
             .iter()
             .rev()
-            .find_map(|(_, page, offset_x)| page.image_at(x - *offset_x, y))
-            .map(reader_image))
+            .find_map(|(position, page, offset_x)| {
+                page.image_at(x - *offset_x, y)
+                    .map(|hit| reader_image(*position, hit, *offset_x))
+            }))
     }
 
     /// Builds a source-backed selection between two pointer hits. Native
@@ -2595,8 +2607,17 @@ fn build_reader_selection(
     )
 }
 
-fn reader_image(hit: PageImageHit) -> ReaderImage {
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "page geometry is already represented as bounded f32 layout coordinates"
+)]
+fn reader_image(position: ReaderPosition, hit: PageImageHit, offset_x: f32) -> ReaderImage {
     ReaderImage {
+        position,
+        x: hit.bounds.x0 as f32 + offset_x,
+        y: hit.bounds.y0 as f32,
+        display_width: hit.bounds.width() as f32,
+        display_height: hit.bounds.height() as f32,
         width: hit.width,
         height: hit.height,
         pixels: hit.pixels,

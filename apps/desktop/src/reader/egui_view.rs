@@ -2,20 +2,23 @@ use std::time::{Duration, Instant};
 
 use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, Pos2, Rect, RichText, TextureId, Vec2};
-use rebook_layout::{SpreadMode, reading_content_left};
-use rebook_reader::{PageDirection, SelectionGranularity};
+use rebook_layout::{ReaderStyle, SpreadMode, reading_content_left};
+use rebook_reader::{PageDirection, ReaderImage, SelectionGranularity};
 
 use super::chat_autocomplete::{
     ChatReference, ChatReferenceKind, chat_reference_token, move_suggestion_index,
 };
 use super::chat_markdown::ChatMarkdownState;
-use super::{AnnotationDraft, AssistantPanel, DesktopReader, ReaderOverlay, SidebarTab};
+use super::{
+    AnnotationDraft, AssistantPanel, DesktopReader, GeneratedTocDraft, ImagePointerState,
+    ImagePressCandidate, ReaderOverlay, ScrollSectionLayout, SelectedImage, SidebarTab,
+};
 use crate::plugins::{ChatCommand, ChatRole, chat_command_suggestions};
-use crate::preferences::AppTheme;
+use crate::preferences::{AppLanguage, AppTheme};
 use crate::settings::ReaderSettingsChange;
 use crate::ui::{
-    Icon, decode_color_image, icon, icon_button, navigation_button, navigation_text_button,
-    paint_icon, palette, selectable_icon_button,
+    Icon, decode_color_image, dialog_action_button, icon, icon_button, navigation_button,
+    navigation_text_button, paint_icon, palette, selectable_icon_button, small_icon_button,
 };
 
 pub(super) const SIDEBAR_WIDTH: f32 = 256.0;
@@ -47,6 +50,8 @@ const IMAGE_PREVIEW_MARGIN: f32 = 48.0;
 const IMAGE_PREVIEW_MIN_ZOOM: f32 = 0.25;
 const IMAGE_PREVIEW_MAX_ZOOM: f32 = 8.0;
 const IMAGE_PREVIEW_WHEEL_SPEED: f32 = 0.0025;
+const IMAGE_LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
+const IMAGE_LONG_PRESS_MAX_TRAVEL: f32 = 8.0;
 
 #[derive(Clone, Copy)]
 struct AssistantComposerKeys {
@@ -155,6 +160,115 @@ fn panel_resize_pointer(ctx: &egui::Context, id: &'static str, edge_x: f32) -> O
         .flatten()
 }
 
+fn pdf_toc_editor_table(
+    ui: &mut egui::Ui,
+    draft: &mut GeneratedTocDraft,
+    language: AppLanguage,
+    page_count: usize,
+    max_height: f32,
+) -> Option<usize> {
+    let column_spacing = ui.spacing().item_spacing.x;
+    let level_width = 52.0;
+    let page_width = 68.0;
+    let action_width = 44.0;
+    let title_width = (ui.available_width()
+        - level_width
+        - page_width
+        - action_width
+        - column_spacing * 3.0
+        - 12.0)
+        .clamp(140.0, 360.0);
+    let header = |text| {
+        egui::Label::new(
+            RichText::new(text)
+                .size(crate::ui::scaled_font_size(12.0))
+                .strong()
+                .color(palette().muted),
+        )
+    };
+    ui.horizontal(|ui| {
+        ui.add_sized([level_width, 24.0], header(language.text("层级", "Level")));
+        ui.add_sized(
+            [title_width, 24.0],
+            header(language.text("目录标题", "Contents title")),
+        );
+        ui.add_sized([page_width, 24.0], header(language.text("页码", "Page")));
+        ui.add_sized(
+            [action_width, 24.0],
+            header(language.text("操作", "Action")),
+        );
+    });
+    ui.separator();
+    ui.add_space(4.0);
+    let mut remove = None;
+    egui::ScrollArea::vertical()
+        .max_height(max_height)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (index, entry) in draft.entries.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [level_width, 30.0],
+                        egui::DragValue::new(&mut entry.depth)
+                            .range(0..=6)
+                            .prefix("L"),
+                    )
+                    .on_hover_text(language.text("目录层级", "Hierarchy level"));
+                    ui.add_sized(
+                        [title_width, 30.0],
+                        egui::TextEdit::singleline(&mut entry.title)
+                            .vertical_align(egui::Align::Center),
+                    );
+                    ui.add_sized(
+                        [page_width, 30.0],
+                        egui::DragValue::new(&mut entry.physical_page).range(1..=page_count),
+                    );
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(action_width, 30.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            if small_icon_button(ui, Icon::Trash2)
+                                .on_hover_text(language.text("删除", "Delete"))
+                                .clicked()
+                            {
+                                remove = Some(index);
+                            }
+                        },
+                    );
+                });
+            }
+        });
+    remove
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "reader page geometry is viewport-bounded and represented as f32 by egui"
+)]
+fn page_image_left(page: &rebook_renderer::PageDisplayList) -> Option<f32> {
+    page.image_bounds()
+        .map(|bounds| bounds.x0)
+        .filter(|left| left.is_finite())
+        .map(|left| left as f32)
+}
+
+fn scroll_chapter_content_left(
+    layout: &ScrollSectionLayout,
+    format: rebook_formats::BookFormat,
+    viewport_width: f32,
+    style: &ReaderStyle,
+) -> f32 {
+    if format == rebook_formats::BookFormat::Pdf
+        && let Some(left) = layout
+            .pages
+            .first()
+            .and_then(|entry| page_image_left(&entry.page))
+    {
+        return left;
+    }
+    reading_content_left(viewport_width, style)
+}
+
 impl DesktopReader {
     pub(crate) fn ui(
         &mut self,
@@ -244,9 +358,11 @@ impl DesktopReader {
             interaction_blocked,
         );
         self.menu(&ctx);
+        self.selected_image_overlay(&ctx, page_rect);
         self.selection_actions(&ctx, page_rect);
         self.image_preview_overlay(&ctx);
         self.feedback(&ctx);
+        self.pdf_toc_review(&ctx);
 
         ReaderFramePlan {
             rect: page_rect,
@@ -326,7 +442,12 @@ impl DesktopReader {
 
             if layout.section_index > 0 {
                 let left = content_rect.left()
-                    + reading_content_left(viewport.width(), &self.reader.style());
+                    + scroll_chapter_content_left(
+                        &layout,
+                        self.format,
+                        viewport.width(),
+                        &self.reader.style(),
+                    );
                 let rect = Rect::from_min_size(
                     Pos2::new(left, content_rect.top() + 10.0),
                     Vec2::new(128.0, 36.0),
@@ -571,7 +692,7 @@ impl DesktopReader {
             ui.next_widget_position(),
             Vec2::new(toolbar_width, TOOLBAR_HEIGHT),
         );
-        let content_left = reading_content_left(toolbar_width, &self.reader.style());
+        let content_left = self.toolbar_content_left(toolbar_width);
         let toolbar_actions_visible = self.ui.toolbar_motion.value.clamp(0.0, 1.0) > 0.02
             || self.ui.overlay == ReaderOverlay::Menu;
         let chapter_title = self.current_chapter_title().to_owned();
@@ -585,8 +706,9 @@ impl DesktopReader {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let left_control_count = if self.ui.sidebar_open { 2.0 } else { 3.0 };
                     let left_controls_width = TOOLBAR_CONTROL_SIZE * left_control_count;
-                    let button_left = f32::from(SIDEBAR_PADDING)
-                        .min((content_left - left_controls_width).max(0.0));
+                    // Keep the first toolbar action clear of the sidebar divider.
+                    // Only the spacer after the action group may collapse on narrow layouts.
+                    let button_left = f32::from(SIDEBAR_PADDING);
                     ui.add_space(button_left);
                     if toolbar_actions_visible {
                         if !self.ui.sidebar_open
@@ -656,6 +778,21 @@ impl DesktopReader {
         if self.set_toolbar_hovered(hovered) {
             ui.ctx().request_repaint_after(Duration::from_millis(16));
         }
+    }
+
+    fn toolbar_content_left(&mut self, toolbar_width: f32) -> f32 {
+        let default = reading_content_left(toolbar_width, &self.reader.style());
+        if self.format != rebook_formats::BookFormat::Pdf {
+            return default;
+        }
+        self.reader
+            .current_spread()
+            .ok()
+            .and_then(|spread| {
+                page_image_left(&spread.primary).map(|left| left + spread.primary_offset_x)
+            })
+            .filter(|left| (0.0..toolbar_width).contains(left))
+            .unwrap_or(default)
     }
 
     fn current_chapter_title(&self) -> &str {
@@ -919,6 +1056,7 @@ impl DesktopReader {
     }
 
     fn toc(&mut self, ui: &mut egui::Ui) {
+        self.pdf_toc_controls(ui);
         let row_indices = self.visible_toc_row_indices();
         let active = self.snapshot.active_toc_id.clone();
         let should_auto_scroll = active != self.ui.last_auto_scrolled_toc;
@@ -972,6 +1110,133 @@ impl DesktopReader {
             should_auto_scroll,
             active_row.is_some(),
         );
+    }
+
+    fn pdf_toc_controls(&mut self, ui: &mut egui::Ui) {
+        if self.format != rebook_formats::BookFormat::Pdf
+            || self.source.table_of_contents_origin()
+                == rebook_publication::TableOfContentsOrigin::Embedded
+            || !self.plugin_settings.ocr_enabled
+        {
+            return;
+        }
+        let pending = self.pdf_toc.task.is_pending();
+        let generated = self.source.table_of_contents_origin()
+            == rebook_publication::TableOfContentsOrigin::Generated;
+        let recognize_label = if generated {
+            self.language.text("重新识别目录", "Regenerate contents")
+        } else {
+            self.language
+                .text("AI 识别目录", "Generate contents with AI")
+        };
+        ui.horizontal(|ui| {
+            let recognize = ui
+                .add_enabled_ui(!pending, |ui| small_icon_button(ui, Icon::ScanText))
+                .inner
+                .on_hover_text(recognize_label);
+            if recognize.clicked() {
+                self.start_pdf_toc_generation();
+            }
+            if generated
+                && small_icon_button(ui, Icon::Pencil)
+                    .on_hover_text(self.language.text("编辑目录", "Edit contents"))
+                    .clicked()
+            {
+                self.edit_generated_toc();
+            }
+        });
+        if pending {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(
+                    RichText::new(&self.pdf_toc.progress)
+                        .size(crate::ui::scaled_font_size(12.0))
+                        .color(palette().muted),
+                );
+            });
+        }
+        if let Some(error) = &self.pdf_toc.error {
+            ui.colored_label(palette().error, error);
+        }
+    }
+
+    fn pdf_toc_review(&mut self, ctx: &egui::Context) {
+        if !self.pdf_toc.editing {
+            return;
+        }
+        let Some(draft) = self.pdf_toc.draft.as_mut() else {
+            return;
+        };
+        let mut apply = false;
+        let mut cancel = false;
+        let mut remove = None;
+        let modal = egui::Modal::new(egui::Id::new("pdf-toc-review-modal"))
+            .area(egui::Modal::default_area(egui::Id::new(
+                "pdf-toc-review-modal",
+            )))
+            .backdrop_color(Color32::BLACK.gamma_multiply(0.42))
+            .frame(
+                egui::Frame::new()
+                    .fill(palette().surface)
+                    .stroke(egui::Stroke::new(1.0, palette().border))
+                    .corner_radius(12)
+                    .inner_margin(egui::Margin::symmetric(22, 18)),
+            )
+            .show(ctx, |ui| {
+                let width = 600.0_f32.min((ctx.content_rect().width() - 32.0).max(320.0));
+                ui.set_width(width);
+                ui.heading(
+                    self.language
+                        .text("编辑 AI 目录", "Edit generated contents"),
+                );
+                let entry_count = match self.language {
+                    crate::preferences::AppLanguage::SimplifiedChinese => {
+                        format!("{} 个条目", draft.entries.len())
+                    }
+                    crate::preferences::AppLanguage::English => {
+                        format!("{} entries", draft.entries.len())
+                    }
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {} · {}",
+                        draft.provider_name, draft.model, entry_count
+                    ))
+                    .color(palette().muted),
+                );
+                ui.add_space(10.0);
+                remove = pdf_toc_editor_table(
+                    ui,
+                    draft,
+                    self.language,
+                    self.source.book().sections.len(),
+                    (ctx.content_rect().height() - 210.0).clamp(220.0, 520.0),
+                );
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if dialog_action_button(ui, self.language.text("保存", "Save"), true).clicked()
+                    {
+                        apply = true;
+                    }
+                    if dialog_action_button(ui, self.language.text("取消", "Cancel"), false)
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+        if let Some(index) = remove {
+            draft.entries.remove(index);
+        }
+        if modal.should_close() {
+            cancel = true;
+        }
+        if apply {
+            self.apply_generated_toc();
+        } else if cancel {
+            self.pdf_toc.editing = false;
+            self.pdf_toc.draft = None;
+        }
     }
 
     fn highlights(&mut self, ui: &mut egui::Ui) {
@@ -1745,10 +2010,14 @@ impl DesktopReader {
 
     fn pointer_interaction(&mut self, response: &egui::Response) {
         let Some(position) = response.interact_pointer_pos() else {
+            if !response.ctx.input(|input| input.pointer.primary_down()) {
+                self.image_pointer_state = ImagePointerState::Idle;
+            }
             return;
         };
         let x = position.x - response.rect.min.x;
         let y = position.y - response.rect.min.y;
+        self.image_long_press_interaction(response, x, y);
         if response.drag_started() {
             self.begin_text_selection(x, y);
         }
@@ -1762,10 +2031,97 @@ impl DesktopReader {
             self.finish_text_selection(x, y, true);
         }
         if response.clicked() {
+            if matches!(
+                self.image_pointer_state,
+                ImagePointerState::SuppressNextClick
+            ) {
+                self.image_pointer_state = ImagePointerState::Idle;
+                return;
+            }
             if self.try_open_image_preview(&response.ctx, x, y) {
                 return;
             }
             self.finish_text_selection(x, y, false);
+        }
+    }
+
+    fn image_long_press_interaction(&mut self, response: &egui::Response, x: f32, y: f32) {
+        let ctx = &response.ctx;
+        let (primary_pressed, primary_down) = ctx.input(|input| {
+            (
+                input.pointer.primary_pressed(),
+                input.pointer.primary_down(),
+            )
+        });
+        let pointer = Pos2::new(x, y);
+        if primary_pressed {
+            self.selected_image = None;
+            self.image_pointer_state = ImagePointerState::Idle;
+            match self.image_at_canvas(x, y) {
+                Ok(Some(image)) => {
+                    self.image_pointer_state = ImagePointerState::Press(ImagePressCandidate {
+                        started_at: Instant::now(),
+                        origin: pointer,
+                        image,
+                        scroll_mode: self.is_scroll_mode(),
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => self.error = Some(format!("Select image failed: {error}")),
+            }
+        }
+
+        let now = Instant::now();
+        let ready = matches!(
+            &self.image_pointer_state,
+            ImagePointerState::Press(candidate)
+                if candidate.origin.distance(pointer) <= IMAGE_LONG_PRESS_MAX_TRAVEL
+                    && now.saturating_duration_since(candidate.started_at)
+                        >= IMAGE_LONG_PRESS_DURATION
+        );
+        if ready {
+            let ImagePointerState::Press(candidate) =
+                std::mem::replace(&mut self.image_pointer_state, ImagePointerState::Idle)
+            else {
+                unreachable!("ready long-press state must contain a candidate");
+            };
+            match selected_image(&candidate.image, candidate.scroll_mode) {
+                Ok(image) => {
+                    self.cancel_text_selection();
+                    self.selected_image = Some(image);
+                    self.image_pointer_state = ImagePointerState::SuppressNextClick;
+                    ctx.request_repaint();
+                }
+                Err(error) => self.error = Some(error.into()),
+            }
+        } else if matches!(
+            &self.image_pointer_state,
+            ImagePointerState::Press(candidate)
+                if !primary_down
+                    || candidate.origin.distance(pointer) > IMAGE_LONG_PRESS_MAX_TRAVEL
+        ) {
+            self.image_pointer_state = ImagePointerState::Idle;
+        } else if let ImagePointerState::Press(candidate) = &self.image_pointer_state {
+            let elapsed = now.saturating_duration_since(candidate.started_at);
+            ctx.request_repaint_after(IMAGE_LONG_PRESS_DURATION.saturating_sub(elapsed));
+        }
+        if !primary_down && !response.clicked() {
+            self.image_pointer_state = ImagePointerState::Idle;
+        }
+    }
+
+    fn image_at_canvas(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<ReaderImage>, rebook_reader::ReaderError> {
+        if self.is_scroll_mode() {
+            let Some((position, page_x, page_y)) = self.scroll_page_coordinates(x, y) else {
+                return Ok(None);
+            };
+            self.reader.image_at_page(position, page_x, page_y)
+        } else {
+            self.reader.image_at_current_spread(x, y)
         }
     }
 
@@ -1777,14 +2133,7 @@ impl DesktopReader {
         if self.format == rebook_formats::BookFormat::Pdf {
             return false;
         }
-        let image = match if self.is_scroll_mode() {
-            self.scroll_page_coordinates(x, y)
-                .map_or(Ok(None), |(position, page_x, page_y)| {
-                    self.reader.image_at_page(position, page_x, page_y)
-                })
-        } else {
-            self.reader.image_at_current_spread(x, y)
-        } {
+        let image = match self.image_at_canvas(x, y) {
             Ok(Some(image)) => image,
             Ok(None) => return false,
             Err(error) => {
@@ -1817,6 +2166,8 @@ impl DesktopReader {
             egui::TextureOptions::LINEAR,
         );
         self.cancel_text_selection();
+        self.selected_image = None;
+        self.image_pointer_state = ImagePointerState::Idle;
         self.image_preview = Some(super::ImagePreview {
             texture,
             image: color_image,
@@ -1829,9 +2180,21 @@ impl DesktopReader {
     }
 
     fn copy_shortcut(&mut self, ctx: &egui::Context) {
-        let copy_image = self.image_preview.is_some();
+        let copy_image = self
+            .image_preview
+            .as_ref()
+            .map(|preview| preview.image.clone())
+            .or_else(|| {
+                (!ctx.text_edit_focused())
+                    .then(|| {
+                        self.selected_image
+                            .as_ref()
+                            .map(|image| image.image.clone())
+                    })
+                    .flatten()
+            });
         let selection_text =
-            if !copy_image && self.selection_toolbar_visible && !ctx.text_edit_focused() {
+            if copy_image.is_none() && self.selection_toolbar_visible && !ctx.text_edit_focused() {
                 self.selection
                     .as_ref()
                     .map(|selection| selection.text.clone())
@@ -1839,22 +2202,16 @@ impl DesktopReader {
             } else {
                 None
             };
-        if !copy_image && selection_text.is_none() {
+        if copy_image.is_none() && selection_text.is_none() {
             return;
         }
         if !ctx.input_mut(consume_copy_shortcut) {
             return;
         }
 
-        if copy_image {
-            if let Some(image) = self
-                .image_preview
-                .as_ref()
-                .map(|preview| preview.image.clone())
-            {
-                ctx.copy_image(image);
-                self.show_copy_notice(ctx, true);
-            }
+        if let Some(image) = copy_image {
+            ctx.copy_image(image);
+            self.show_copy_notice(ctx, true);
         } else if let Some(text) = selection_text {
             ctx.copy_text(text);
             self.show_copy_notice(ctx, false);
@@ -1871,6 +2228,54 @@ impl DesktopReader {
         self.notice_timer
             .show(&mut self.notice, message.into(), Instant::now());
         ctx.request_repaint_after(super::NOTICE_AUTO_DISMISS_DELAY);
+    }
+
+    fn selected_image_overlay(&self, ctx: &egui::Context, page_rect: Rect) {
+        let Some(selected) = &self.selected_image else {
+            return;
+        };
+        let bounds = if selected.scroll_mode {
+            if !self.is_scroll_mode() {
+                return;
+            }
+            let Some((page_top, viewport)) = self
+                .scroll_section
+                .as_ref()
+                .and_then(|layout| layout.page_top(selected.position))
+                .zip(self.scroll_viewport)
+            else {
+                return;
+            };
+            selected.bounds.translate(Vec2::new(
+                page_rect.left(),
+                page_rect.top() + page_top - viewport.offset_y,
+            ))
+        } else {
+            if self.is_scroll_mode() {
+                return;
+            }
+            selected.bounds.translate(page_rect.min.to_vec2())
+        };
+        if !bounds.intersects(page_rect) {
+            return;
+        }
+
+        let accent = palette().accent;
+        let fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 64);
+        let stroke = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 190);
+        let painter = ctx
+            .layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("reader-selected-image"),
+            ))
+            .with_clip_rect(page_rect);
+        painter.rect_filled(bounds, 2.0, fill);
+        painter.rect_stroke(
+            bounds,
+            2.0,
+            egui::Stroke::new(1.0, stroke),
+            egui::StrokeKind::Inside,
+        );
     }
 
     fn image_preview_overlay(&mut self, ctx: &egui::Context) {
@@ -2656,6 +3061,35 @@ fn preview_wheel_delta(input: &egui::InputState) -> f32 {
         .sum()
 }
 
+fn selected_image(image: &ReaderImage, scroll_mode: bool) -> Result<SelectedImage, &'static str> {
+    let (Ok(width), Ok(height)) = (usize::try_from(image.width), usize::try_from(image.height))
+    else {
+        return Err("Image dimensions exceed the clipboard limit");
+    };
+    let Some(byte_len) = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return Err("Image dimensions exceed the clipboard limit");
+    };
+    if width == 0 || height == 0 || image.pixels.len() < byte_len {
+        return Err("Image data is incomplete and cannot be copied");
+    }
+    if image.display_width <= 0.0 || image.display_height <= 0.0 {
+        return Err("Image has invalid display bounds");
+    }
+
+    Ok(SelectedImage {
+        image: egui::ColorImage::from_rgba_unmultiplied([width, height], &image.pixels[..byte_len]),
+        position: image.position,
+        bounds: Rect::from_min_size(
+            Pos2::new(image.x, image.y),
+            Vec2::new(image.display_width, image.display_height),
+        ),
+        scroll_mode,
+    })
+}
+
 fn consume_copy_shortcut(input: &mut egui::InputState) -> bool {
     consume_copy_event(&mut input.events)
         || input.consume_key(egui::Modifiers::COMMAND, egui::Key::C)
@@ -3124,5 +3558,30 @@ mod reference_suggestion_label_tests {
             ]
         );
         assert!(!consume_copy_event(&mut events));
+    }
+
+    #[test]
+    fn selected_reader_image_keeps_original_pixels_and_display_bounds() {
+        let image = ReaderImage {
+            position: rebook_reader::ReaderPosition {
+                section_index: 2,
+                segment_index: 3,
+                page_index: 4,
+            },
+            x: 24.0,
+            y: 36.0,
+            display_width: 120.0,
+            display_height: 80.0,
+            width: 2,
+            height: 1,
+            pixels: std::sync::Arc::from([255, 0, 0, 255, 0, 255, 0, 255]),
+        };
+
+        let selected = selected_image(&image, true).expect("valid image");
+
+        assert_eq!(selected.image.size, [2, 1]);
+        assert_eq!(selected.bounds.min, Pos2::new(24.0, 36.0));
+        assert_eq!(selected.bounds.size(), Vec2::new(120.0, 80.0));
+        assert!(selected.scroll_mode);
     }
 }

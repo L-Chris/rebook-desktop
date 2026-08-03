@@ -222,6 +222,19 @@ pub struct TocEntry {
     pub children: Vec<Self>,
 }
 
+/// Describes where the currently exposed table of contents came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TableOfContentsOrigin {
+    /// Navigation authored by the publication.
+    #[default]
+    Embedded,
+    /// A mechanical reading-order fallback created by the parser.
+    Fallback,
+    /// Navigation generated and confirmed by the user.
+    Generated,
+}
+
 /// Promotes the children of a single top-level TOC entry by one level.
 ///
 /// This is a structural presentation rule: a sole parent adds no distinction
@@ -546,6 +559,10 @@ impl Default for BlockStyle {
 pub trait BookSource: Send + Sync {
     /// Lightweight descriptor available immediately after opening.
     fn book(&self) -> &Book;
+    /// Reports whether navigation is authored, mechanical, or generated.
+    fn table_of_contents_origin(&self) -> TableOfContentsOrigin {
+        TableOfContentsOrigin::Embedded
+    }
     /// Parses one section into the normalized reading IR.
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError>;
     /// Loads a referenced resource subject to format-specific budgets.
