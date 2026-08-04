@@ -5,6 +5,7 @@ members = [
     "crates/formats",
     "crates/html",
     "crates/layout",
+    "crates/macos-open-file",
     "crates/math",
     "crates/publication",
     "crates/reader",

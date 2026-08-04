@@ -3562,9 +3562,6 @@ dependencies = [
  "keyring",
  "kurbo",
  "mermaid-rs-renderer",
- "objc2 0.5.2",
- "objc2-app-kit 0.2.2",
- "objc2-foundation 0.2.2",
  "peniko",
  "percent-encoding",
  "pollster",
@@ -3572,6 +3569,7 @@ dependencies = [
  "quick-xml",
  "rebook-formats",
  "rebook-layout",
+ "rebook-macos-open-file",
  "rebook-math",
  "rebook-publication",
  "rebook-reader",
@@ -3643,6 +3641,15 @@ dependencies = [
  "rebook-publication",
  "serde",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "rebook-macos-open-file"
+version = "0.2.15"
+dependencies = [
+ "objc2 0.5.2",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
 ]
 
 [[package]]
