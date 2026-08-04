@@ -85,8 +85,7 @@ pub fn render_math_at<T: TextMeasure>(
         DisplayStyle::Inline
     };
 
-    let mathml =
-        latex_to_mathml(latex, style).map_err(|error| format!("LaTeX parse error: {error:?}"))?;
+    let mathml = latex_to_mathml_preserving_text(latex, style)?;
 
     let root = parse_mathml(&mathml)?;
     let mbox = layout_node(&root, font_size, text_color, measure, x, baseline_y);
@@ -97,6 +96,109 @@ pub fn render_math_at<T: TextMeasure>(
         descent: mbox.descent,
         svg_fragment: mbox.svg,
     })
+}
+
+fn latex_to_mathml_preserving_text(latex: &str, style: DisplayStyle) -> Result<String, String> {
+    let (protected, replacements) = protect_latex_text_commands(latex);
+    let mut mathml = latex_to_mathml(&protected, style)
+        .map_err(|error| format!("LaTeX parse error: {error:?}"))?;
+    for (placeholder, text) in replacements {
+        mathml = mathml.replace(&placeholder, &crate::xml::escape_xml(&text));
+    }
+    Ok(mathml)
+}
+
+fn protect_latex_text_commands(latex: &str) -> (String, Vec<(String, String)>) {
+    const TEXT_OPEN: &str = r"\text{";
+    let mut output = String::with_capacity(latex.len());
+    let mut replacements = Vec::new();
+    let mut copy_start = 0;
+    let mut search_start = 0;
+    while let Some(relative_start) = latex[search_start..].find(TEXT_OPEN) {
+        let command_start = search_start + relative_start;
+        if is_escaped_latex_command(latex, command_start) {
+            search_start = command_start + 1;
+            continue;
+        }
+        let text_start = command_start + TEXT_OPEN.len();
+        let Some(text_end) = find_latex_text_end(latex, text_start) else {
+            break;
+        };
+        let placeholder = format!(
+            "REBOOKTEXTPLACEHOLDER{}",
+            "X".repeat(replacements.len() + 1)
+        );
+        output.push_str(&latex[copy_start..command_start]);
+        output.push_str(r"\text{");
+        output.push_str(&placeholder);
+        output.push('}');
+        replacements.push((
+            placeholder,
+            decode_latex_text_content(&latex[text_start..text_end]),
+        ));
+        copy_start = text_end + 1;
+        search_start = copy_start;
+    }
+    if replacements.is_empty() {
+        return (latex.to_owned(), replacements);
+    }
+    output.push_str(&latex[copy_start..]);
+    (output, replacements)
+}
+
+fn find_latex_text_end(latex: &str, text_start: usize) -> Option<usize> {
+    let mut depth = 1_usize;
+    let mut escaped = false;
+    for (offset, character) in latex[text_start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text_start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn is_escaped_latex_command(latex: &str, command_start: usize) -> bool {
+    latex[..command_start]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn decode_latex_text_content(content: &str) -> String {
+    let mut decoded = String::with_capacity(content.len());
+    let mut characters = content.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        let Some(escaped) = characters.next() else {
+            decoded.push('\\');
+            break;
+        };
+        if matches!(escaped, '{' | '}' | '%' | '_' | '&' | '#' | '$' | '\\') {
+            decoded.push(escaped);
+        } else {
+            decoded.push('\\');
+            decoded.push(escaped);
+        }
+    }
+    decoded
 }
 
 struct MathBox {
@@ -980,4 +1082,40 @@ fn is_large_operator(text: &str) -> bool {
             | "⨂"
             | "⨀"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use latex2mathml::DisplayStyle;
+
+    use super::{latex_to_mathml_preserving_text, protect_latex_text_commands};
+
+    #[test]
+    fn text_commands_preserve_cjk_units_and_ascii_punctuation() {
+        let mathml =
+            latex_to_mathml_preserving_text(r"4\text{千卡/克}", DisplayStyle::Inline).unwrap();
+
+        assert!(mathml.contains("<mtext>千卡/克</mtext>"), "{mathml}");
+        assert!(!mathml.contains("REBOOKTEXTPLACEHOLDER"));
+    }
+
+    #[test]
+    fn text_command_placeholders_restore_spaces_escapes_and_xml_characters() {
+        let mathml =
+            latex_to_mathml_preserving_text(r"x\text{ 千卡/克 \& 糖\_类 }", DisplayStyle::Inline)
+                .unwrap();
+
+        assert!(
+            mathml.contains("<mtext> 千卡/克 &amp; 糖_类 </mtext>"),
+            "{mathml}"
+        );
+    }
+
+    #[test]
+    fn incomplete_text_commands_keep_the_original_parser_error_path() {
+        let (protected, replacements) = protect_latex_text_commands(r"4\text{千卡/克");
+
+        assert_eq!(protected, r"4\text{千卡/克");
+        assert!(replacements.is_empty());
+    }
 }

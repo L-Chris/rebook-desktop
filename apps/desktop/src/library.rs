@@ -137,6 +137,51 @@ impl LocalLibrary {
         Ok(summary)
     }
 
+    pub(crate) fn import_for_open(
+        &mut self,
+        source_path: &Path,
+    ) -> LibraryResult<(LibraryBook, bool)> {
+        if let Some(book) = self.books.iter().find(|book| book.path == source_path) {
+            return Ok((book.clone(), false));
+        }
+
+        let bytes = fs::read(source_path)?;
+        let id = format!("{:x}", Sha256::digest(&bytes));
+        if let Some(book) = self.books.iter().find(|book| book.id == id) {
+            return Ok((book.clone(), false));
+        }
+
+        let file_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "书籍文件名不是有效 Unicode")
+            })?
+            .to_owned();
+        let publication = open_bytes(bytes.clone(), &file_name)?;
+        let metadata = &publication.book().metadata;
+        let title = if metadata.title.trim().is_empty() {
+            title_from_file_name(source_path)
+        } else {
+            metadata.title.trim().to_owned()
+        };
+        let format = publication.format();
+        let storage_name = format!("{id}.{}", format.storage_extension());
+        let cover_bytes = publication.cover_bytes().map(<[u8]>::to_vec);
+        let cover_name = cover_bytes.as_ref().map(|_| format!("{id}.cover"));
+        let book = LibraryBook {
+            id,
+            title,
+            authors: metadata.authors.clone(),
+            file_name,
+            path: self.root.join(BOOKS_DIRECTORY).join(storage_name),
+            cover_bytes,
+            added_at: unix_timestamp_millis(),
+        };
+        self.commit_import(&book, &bytes, cover_name.as_deref())?;
+        Ok((book, true))
+    }
+
     pub fn import_remote(&mut self, remote: RemoteLibraryBook) -> LibraryResult<bool> {
         if self.books.iter().any(|book| book.id == remote.id) {
             return Ok(false);
@@ -178,42 +223,8 @@ impl LocalLibrary {
     }
 
     fn import_file(&mut self, source_path: &Path) -> LibraryResult<bool> {
-        let bytes = fs::read(source_path)?;
-        let id = format!("{:x}", Sha256::digest(&bytes));
-        if self.books.iter().any(|book| book.id == id) {
-            return Ok(false);
-        }
-
-        let file_name = source_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "书籍文件名不是有效 Unicode")
-            })?
-            .to_owned();
-        let publication = open_bytes(bytes.clone(), &file_name)?;
-        let metadata = &publication.book().metadata;
-        let title = if metadata.title.trim().is_empty() {
-            title_from_file_name(source_path)
-        } else {
-            metadata.title.trim().to_owned()
-        };
-        let format = publication.format();
-        let storage_name = format!("{id}.{}", format.storage_extension());
-        let cover_bytes = publication.cover_bytes().map(<[u8]>::to_vec);
-        let cover_name = cover_bytes.as_ref().map(|_| format!("{id}.cover"));
-
-        let book = LibraryBook {
-            id,
-            title,
-            authors: metadata.authors.clone(),
-            file_name,
-            path: self.root.join(BOOKS_DIRECTORY).join(storage_name),
-            cover_bytes,
-            added_at: unix_timestamp_millis(),
-        };
-        self.commit_import(&book, &bytes, cover_name.as_deref())?;
-        Ok(true)
+        self.import_for_open(source_path)
+            .map(|(_, imported)| imported)
     }
 
     pub fn remove(&mut self, id: &str) -> LibraryResult<bool> {
@@ -421,6 +432,32 @@ mod tests {
         assert_eq!(second.imported, 0);
         assert_eq!(second.duplicates, 1);
         assert_eq!(library.books.len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_an_external_book_imports_once_and_returns_the_managed_copy() {
+        let root = test_directory("open-import-epub");
+        let source = root.join("source.epub");
+        build_fixture(&source);
+        let mut library = LocalLibrary::load_from(root.join("data")).unwrap();
+
+        let (imported, was_imported) = library.import_for_open(&source).unwrap();
+        assert!(was_imported);
+        assert_ne!(imported.path, source);
+        assert!(imported.path.exists());
+        assert_eq!(library.books().len(), 1);
+
+        let (duplicate, was_imported) = library.import_for_open(&source).unwrap();
+        assert!(!was_imported);
+        assert_eq!(duplicate.id, imported.id);
+        assert_eq!(duplicate.path, imported.path);
+        assert_eq!(library.books().len(), 1);
+
+        let (managed, was_imported) = library.import_for_open(&imported.path).unwrap();
+        assert!(!was_imported);
+        assert_eq!(managed.id, imported.id);
 
         fs::remove_dir_all(root).unwrap();
     }

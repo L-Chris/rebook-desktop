@@ -7,9 +7,9 @@ use rebook_reader::ReaderVisibleTextFragment;
 use crate::platform::UserEvent;
 use crate::plugins::{
     BookSearchResult, ChatAnnotationAction, ChatCommand, ChatCommandResolution, ChatReadingContext,
-    ChatResponse, ChatRole, ChatSelection, ChatTurn, TranslationBlockInput, chat_citation_link,
-    chat_with_book, generate_pdf_toc, resolve_chat_command, search_book, section_title,
-    translate_blocks, translate_blocks_incremental,
+    ChatRequestKind, ChatResponse, ChatRole, ChatSelection, ChatTurn, TranslationBlockInput,
+    chat_citation_link, chat_with_book, generate_pdf_toc, resolve_chat_command, search_book,
+    section_title, translate_blocks, translate_blocks_incremental,
 };
 
 use super::chat_autocomplete::{
@@ -65,6 +65,8 @@ impl DesktopReader {
                 let payload = request.payload;
                 let result = chat_with_book(
                     payload.source,
+                    payload.format,
+                    payload.kind,
                     payload.rewrite_source,
                     payload.book_id,
                     payload.selection,
@@ -316,7 +318,11 @@ impl DesktopReader {
                 self.chat.suggestion_index = 0;
                 self.chat.error = None;
             }
-            ChatCommandResolution::Resolved { display, prompt } => {
+            ChatCommandResolution::Resolved {
+                display,
+                prompt,
+                kind,
+            } => {
                 let references = std::mem::take(&mut self.chat.references);
                 let prompt = build_chat_prompt_with_references(
                     &prompt,
@@ -326,7 +332,7 @@ impl DesktopReader {
                 self.chat.input.clear();
                 self.chat.cursor_char_index = 0;
                 self.chat.suggestion_index = 0;
-                self.queue_chat(prompt, Some(display));
+                self.queue_chat_with_kind(prompt, Some(display), kind);
             }
             ChatCommandResolution::NotCommand | ChatCommandResolution::Unknown => {
                 let references = std::mem::take(&mut self.chat.references);
@@ -568,6 +574,15 @@ impl DesktopReader {
     }
 
     pub(super) fn queue_chat(&mut self, question: String, display_content: Option<String>) {
+        self.queue_chat_with_kind(question, display_content, ChatRequestKind::Normal);
+    }
+
+    fn queue_chat_with_kind(
+        &mut self,
+        question: String,
+        display_content: Option<String>,
+        kind: ChatRequestKind,
+    ) {
         if let Err(error) = self.plugin_settings.chat_endpoint() {
             crate::diagnostics::log(
                 "chat.queue.rejected",
@@ -593,6 +608,8 @@ impl DesktopReader {
         let current = self.chat_reading_context();
         let id = self.chat.task.begin(ChatTask {
             source: Arc::clone(&self.source),
+            format: self.format,
+            kind,
             rewrite_source: Arc::clone(&self.rewrite_source),
             book_id: self.book_id.clone(),
             selection: self.selection.as_ref().map(|selection| ChatSelection {

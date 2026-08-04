@@ -1,30 +1,29 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
-use image::{DynamicImage, ImageBuffer, Rgb, RgbImage, RgbaImage};
-use rebook_publication::{Block, BookSource};
+use image::{DynamicImage, Rgb, RgbImage};
+use rebook_publication::BookSource;
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::task::JoinSet;
 
-use super::ai::{message_content, request_completion};
+#[cfg(test)]
+use super::pdf_vision::is_retryable_vision_response_error;
+use super::pdf_vision::{
+    PAGE_IMAGE_MAX_DIMENSION, encode_jpeg_data_url, parse_json_value, render_page_data_url,
+    render_page_image, request_vision_json,
+};
 use super::{AiProvider, PluginSettings};
 use crate::generated_toc::{GeneratedTocDraft, GeneratedTocEntry};
 
 const SCAN_BATCH_SIZE: usize = 8;
 const SCAN_PAGE_LIMIT: usize = 20;
 const SCAN_IMAGE_MAX_DIMENSION: u32 = 560;
-const EXTRACTION_IMAGE_MAX_DIMENSION: u32 = 1_600;
 const EXTRACTION_BATCH_SIZE: usize = 1;
 const VISION_REQUEST_CONCURRENCY: usize = 4;
-const VISION_RESPONSE_RETRIES: usize = 1;
 
 #[derive(Debug, Deserialize)]
 struct ScanResponse {
@@ -265,7 +264,7 @@ where
             content.push(json!({
                 "type": "image_url",
                 "image_url": {
-                    "url": render_page_data_url(source.as_ref(), physical_page - 1, EXTRACTION_IMAGE_MAX_DIMENSION)?
+                    "url": render_page_data_url(source.as_ref(), physical_page - 1, PAGE_IMAGE_MAX_DIMENSION)?
                 }
             }));
         }
@@ -316,114 +315,6 @@ where
         .collect())
 }
 
-async fn request_vision_json(
-    client: &Client,
-    provider: &AiProvider,
-    model: &str,
-    content: Vec<Value>,
-) -> Result<Value, String> {
-    let messages = vec![json!({ "role": "user", "content": content })];
-    let mut extra_body = json!({
-        "response_format": { "type": "json_object" }
-    });
-    if model.to_ascii_lowercase().contains("qwen") {
-        extra_body["enable_thinking"] = Value::Bool(false);
-    }
-    for attempt in 0..=VISION_RESPONSE_RETRIES {
-        let result = request_completion(
-            client,
-            provider,
-            model,
-            &messages,
-            None,
-            None,
-            Some(&extra_body),
-        )
-        .await
-        .and_then(|message| {
-            message_content(&message)
-                .filter(|content| !content.trim().is_empty())
-                .map(Value::String)
-                .ok_or_else(|| {
-                    if message
-                        .get("reasoning_content")
-                        .and_then(Value::as_str)
-                        .is_some_and(|content| !content.trim().is_empty())
-                    {
-                        "AI 目录识别只返回了思考过程，没有返回 JSON 正文".into()
-                    } else {
-                        "AI 目录识别响应缺少消息正文".into()
-                    }
-                })
-        });
-        match result {
-            Ok(value) => return Ok(value),
-            Err(error)
-                if attempt < VISION_RESPONSE_RETRIES
-                    && is_retryable_vision_response_error(&error) =>
-            {
-                tokio::time::sleep(Duration::from_millis(800)).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("vision response retry loop always returns")
-}
-
-fn is_retryable_vision_response_error(error: &str) -> bool {
-    [
-        "AI 响应缺少 choices[0].message",
-        "AI 目录识别响应缺少消息正文",
-        "AI 目录识别只返回了思考过程",
-        "AI 请求失败",
-        "429",
-        "502",
-        "503",
-        "504",
-    ]
-    .iter()
-    .any(|fragment| error.contains(fragment))
-}
-
-fn parse_json_value<T>(value: &Value) -> Result<T, String>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let text = if let Some(text) = value.as_str() {
-        text.to_owned()
-    } else if let Some(parts) = value.as_array() {
-        parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("")
-    } else {
-        return Err("AI 目录识别响应内容为空".into());
-    };
-    let trimmed = text.trim();
-    let candidate = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .and_then(|value| value.strip_suffix("```"))
-        .map(str::trim)
-        .or_else(|| {
-            let start = trimmed.find('{')?;
-            let end = trimmed.rfind('}')?;
-            (start <= end).then(|| &trimmed[start..=end])
-        })
-        .unwrap_or(trimmed);
-    serde_json::from_str(candidate).map_err(|error| format!("AI 目录识别结果协议无效：{error}"))
-}
-
-fn render_page_data_url(
-    source: &dyn BookSource,
-    page_index: usize,
-    max_dimension: u32,
-) -> Result<String, String> {
-    let image = render_page_image(source, page_index, max_dimension)?;
-    encode_jpeg_data_url(&image, page_index)
-}
-
 fn render_contact_sheet(
     source: &dyn BookSource,
     page_indices: &[usize],
@@ -452,51 +343,6 @@ fn render_contact_sheet(
     }
     let sheet = DynamicImage::ImageRgb8(sheet).resize(2_000, 2_000, FilterType::Triangle);
     encode_jpeg_data_url(&sheet, page_indices[0])
-}
-
-fn render_page_image(
-    source: &dyn BookSource,
-    page_index: usize,
-    max_dimension: u32,
-) -> Result<DynamicImage, String> {
-    let section = source
-        .parse_section(page_index)
-        .map_err(|error| format!("读取 PDF 第 {} 页失败：{error}", page_index + 1))?;
-    let href = section
-        .blocks
-        .iter()
-        .find_map(|block| match block {
-            Block::Image(image) => Some(&image.href),
-            _ => None,
-        })
-        .ok_or_else(|| format!("PDF 第 {} 页没有可识别图像", page_index + 1))?;
-    let image = if let Some(raster) = source
-        .raster_resource(href)
-        .map_err(|error| format!("渲染 PDF 第 {} 页失败：{error}", page_index + 1))?
-    {
-        let rgba: RgbaImage =
-            ImageBuffer::from_raw(raster.width, raster.height, raster.pixels.to_vec())
-                .ok_or_else(|| format!("PDF 第 {} 页的像素数据无效", page_index + 1))?;
-        DynamicImage::ImageRgba8(rgba)
-    } else {
-        let resource = source
-            .resource(href)
-            .map_err(|error| format!("读取 PDF 第 {} 页图像失败：{error}", page_index + 1))?;
-        image::load_from_memory(&resource.bytes)
-            .map_err(|error| format!("解码 PDF 第 {} 页图像失败：{error}", page_index + 1))?
-    };
-    Ok(image.resize(max_dimension, max_dimension, FilterType::Triangle))
-}
-
-fn encode_jpeg_data_url(image: &DynamicImage, page_index: usize) -> Result<String, String> {
-    let mut bytes = Cursor::new(Vec::new());
-    JpegEncoder::new_with_quality(&mut bytes, 82)
-        .encode_image(image)
-        .map_err(|error| format!("压缩 PDF 第 {} 页图像失败：{error}", page_index + 1))?;
-    Ok(format!(
-        "data:image/jpeg;base64,{}",
-        BASE64.encode(bytes.into_inner())
-    ))
 }
 
 fn infer_page_offset(anchors: &[PageNumberAnchor], last_toc_page: usize) -> Option<(isize, usize)> {

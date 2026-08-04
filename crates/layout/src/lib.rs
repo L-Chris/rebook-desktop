@@ -487,7 +487,11 @@ impl LayoutEngine {
         minimum_width: f32,
     ) -> PreparedText {
         let (text, spans, source_text_start) = flatten_text(block, reader_style.foreground);
-        let available_width = (content_width - block.style.indent).max(minimum_width);
+        let start_offset = (block.style.indent
+            + block.style.margin_start
+            + content_width * block.style.margin_start_fraction)
+            .clamp(0.0, (content_width - minimum_width).max(0.0));
+        let available_width = (content_width - start_offset).max(minimum_width);
         let typography = &reader_style.typography;
         let font_stack = if block.kind == TextBlockKind::Preformatted {
             typography.monospace_stack()
@@ -555,6 +559,7 @@ impl LayoutEngine {
             layout: Arc::new(layout),
             text: text.into(),
             source_text_start,
+            start_offset,
         }
     }
 
@@ -668,6 +673,7 @@ struct PreparedText {
     layout: Arc<Layout<TextBrush>>,
     text: Arc<str>,
     source_text_start: usize,
+    start_offset: f32,
 }
 
 struct FixedPageReplacementRequest {
@@ -837,7 +843,7 @@ impl Paginator {
                 text: Arc::clone(&prepared.text),
                 source_text_start: prepared.source_text_start,
                 lines: line_start..line_end,
-                origin_x: self.column_left() + block.style.indent,
+                origin_x: self.column_left() + prepared.start_offset,
                 origin_y: self.cursor_y - first_top,
                 source: block.source.clone(),
             }));
@@ -1286,6 +1292,65 @@ mod tests {
             )
             .unwrap();
         assert!(layout.pages.len() > 1);
+    }
+
+    #[test]
+    fn block_start_fraction_tracks_the_available_content_width() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let text_block = |text: &str, style| {
+            Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(rebook_publication::TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style,
+                source: None,
+            })
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![
+                text_block("Top-level entry", rebook_publication::BlockStyle::default()),
+                text_block(
+                    "Nested entry",
+                    rebook_publication::BlockStyle {
+                        margin_start: 12.0,
+                        margin_start_fraction: 0.1,
+                        ..rebook_publication::BlockStyle::default()
+                    },
+                ),
+            ],
+            anchors: Vec::new(),
+        };
+        let viewport = LayoutViewport::new(600, 400).unwrap();
+        let reader_style = ReaderStyle::default();
+        let content_width = resolve_page_geometry(600.0, 400.0, &reader_style).width;
+        let layout = LayoutEngine::new()
+            .layout_section(&source, &section, viewport, &reader_style)
+            .unwrap();
+        let origins = layout.pages[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                PageItem::Text(text) => Some(text.origin_x),
+                PageItem::Image(_) | PageItem::Separator(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(origins.len(), 2);
+        let expected_offset = 12.0 + content_width * 0.1;
+        assert!(((origins[1] - origins[0]) - expected_offset).abs() < 0.001);
     }
 
     #[test]

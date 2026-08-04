@@ -155,6 +155,38 @@
                             Value='[APPLICATIONFOLDER]'
                             KeyPath='yes'/>
                     </Component>
+                    <Component Id='FileAssociations' Guid='*' Win64='yes'>
+                        <RegistryValue
+                            Root='HKLM'
+                            Key='Software\RegisteredApplications'
+                            Name='Torto'
+                            Type='string'
+                            Value='Software\L-Chris\Torto\Capabilities'
+                            KeyPath='yes'/>
+                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities' Name='ApplicationName' Type='string' Value='Torto'/>
+                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities' Name='ApplicationDescription' Type='string' Value='Torto e-book reader'/>
+                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.epub' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.mobi' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.azw' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.azw3' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.fb2' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.fbz' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.cbz' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.pdf' Type='string' Value='Torto.Book'/>
+
+                        <RegistryValue Root='HKCR' Key='Torto.Book' Type='string' Value='Torto e-book'/>
+                        <RegistryValue Root='HKCR' Key='Torto.Book' Name='FriendlyTypeName' Type='string' Value='Torto e-book'/>
+                        <RegistryValue Root='HKCR' Key='Torto.Book\DefaultIcon' Type='string' Value='[#exe0],0'/>
+                        <RegistryValue Root='HKCR' Key='Torto.Book\shell\open\command' Type='string' Value='&quot;[#exe0]&quot; &quot;%1&quot;'/>
+                        <RegistryValue Root='HKCR' Key='.epub\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
+                        <RegistryValue Root='HKCR' Key='.mobi\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
+                        <RegistryValue Root='HKCR' Key='.azw\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
+                        <RegistryValue Root='HKCR' Key='.azw3\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
+                        <RegistryValue Root='HKCR' Key='.fb2\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
+                        <RegistryValue Root='HKCR' Key='.fbz\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
+                        <RegistryValue Root='HKCR' Key='.cbz\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
+                        <RegistryValue Root='HKCR' Key='.pdf\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
+                    </Component>
                 </Directory>
             </Directory>
             <Directory Id='ProgramMenuFolder'/>
@@ -178,6 +210,7 @@
 
             <ComponentRef Id='binary0'/>
             <ComponentRef Id='InstallLocationRegistry'/>
+            <ComponentRef Id='FileAssociations'/>
         </Feature>
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>

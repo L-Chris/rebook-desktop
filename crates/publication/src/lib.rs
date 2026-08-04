@@ -539,6 +539,12 @@ pub struct BlockStyle {
     pub align: TextAlignment,
     pub margin_before: f32,
     pub margin_after: f32,
+    /// Flattened CSS margin/padding on the inline-start edge, in pixels.
+    #[serde(default)]
+    pub margin_start: f32,
+    /// Inline-start margin/padding expressed as a fraction of the content width.
+    #[serde(default)]
+    pub margin_start_fraction: f32,
     pub indent: f32,
     pub line_height: f32,
 }
@@ -549,6 +555,8 @@ impl Default for BlockStyle {
             align: TextAlignment::Start,
             margin_before: 0.0,
             margin_after: 16.0,
+            margin_start: 0.0,
+            margin_start_fraction: 0.0,
             indent: 0.0,
             line_height: 1.72,
         }

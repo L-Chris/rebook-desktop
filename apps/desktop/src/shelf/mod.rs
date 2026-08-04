@@ -146,14 +146,26 @@ impl ShelfFeature {
             );
             return;
         };
-        let metadata = self
-            .shelf
-            .library
-            .books()
-            .iter()
-            .find(|book| book.path.as_path() == path)
-            .map(BookDisplayMetadata::from);
-        match open_reader(path, Arc::clone(&self.reader_fonts), metadata, local_store) {
+        let (book, imported) = match self.shelf.library.import_for_open(path) {
+            Ok(result) => result,
+            Err(error) => {
+                self.show_error(format!(
+                    "{}: {error}",
+                    self.language.text("无法打开书籍", "Unable to open book")
+                ));
+                return;
+            }
+        };
+        if imported {
+            self.cover_textures.clear();
+        }
+        let metadata = Some(BookDisplayMetadata::from(&book));
+        match open_reader(
+            &book.path,
+            Arc::clone(&self.reader_fonts),
+            metadata,
+            local_store,
+        ) {
             Ok(reader) => {
                 self.pending_reader = Some(reader);
                 self.shelf.error = None;

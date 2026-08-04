@@ -1,6 +1,6 @@
 use percent_encoding::percent_decode_str;
 
-use crate::plugins::CHAT_CITATION_PREFIX;
+use crate::plugins::{CHAT_CITATION_PREFIX, chat_citation_marker_from_link};
 
 const MAX_REFERENCE_SUGGESTIONS: usize = 8;
 
@@ -191,8 +191,10 @@ pub(super) fn build_chat_prompt_with_references(
                     reference.description
                 ),
             ];
-            if reference.kind != ChatReferenceKind::Book {
-                lines.push(format!("href: {}", reference.link));
+            if reference.kind != ChatReferenceKind::Book
+                && let Some(citation) = chat_citation_marker_from_link(&reference.link)
+            {
+                lines.push(format!("citation: {citation}"));
             }
             if let Some(excerpt) = &reference.excerpt {
                 lines.push(format!(
@@ -202,9 +204,10 @@ pub(super) fn build_chat_prompt_with_references(
             }
             if reference.kind == ChatReferenceKind::Book {
                 lines.push(if english {
-                    "Use searchBook and getContent as needed, and cite the link://j/... hrefs they return.".into()
+                    "Use searchBook and getContent as needed, and copy the citations they return."
+                        .into()
                 } else {
-                    "请按需使用 searchBook 和 getContent，并引用工具返回的 link://j/... href。".into()
+                    "请按需使用 searchBook 和 getContent，并逐字复制工具返回的 citation。".into()
                 });
             }
             lines.join("\n")
@@ -214,9 +217,9 @@ pub(super) fn build_chat_prompt_with_references(
     format!(
         "{base}\n\n{}\n\n{reference_text}",
         if english {
-            "The user referenced the following book content. Use it as the primary context. Every claim based on a chapter or paragraph reference must cite its supplied link:"
+            "The user referenced the following book content. Use it as the primary context. Every claim based on a chapter or paragraph reference must copy its supplied citation:"
         } else {
-            "用户在输入框中引用了以下书籍内容。请优先以这些内容为上下文；凡依据章节或段落引用作出的陈述，都必须引用其提供的链接："
+            "用户在输入框中引用了以下书籍内容。请优先以这些内容为上下文；凡依据章节或段落引用作出的陈述，都必须逐字复制其提供的 citation："
         }
     )
 }
@@ -330,7 +333,7 @@ mod tests {
         assert!(prompt.contains("概括主旨"));
         assert!(prompt.contains("searchBook"));
         assert!(prompt.contains("getContent"));
-        assert!(prompt.contains("link://j/..."));
+        assert!(prompt.contains("citation"));
         assert!(!prompt.contains("link: book"));
         assert!(!prompt.contains("locator:"));
     }
@@ -342,8 +345,8 @@ mod tests {
 
         let prompt = build_chat_prompt_with_references("概括本章", &[chapter], false);
 
-        assert!(prompt.contains("都必须引用其提供的链接"));
-        assert!(prompt.contains("href: link://j/6"));
+        assert!(prompt.contains("都必须逐字复制其提供的 citation"));
+        assert!(prompt.contains("citation: 【6†source】"));
     }
 
     #[test]

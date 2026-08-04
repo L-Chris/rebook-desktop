@@ -4,6 +4,7 @@
 mod ai;
 mod commands;
 mod pdf_toc;
+mod pdf_vision;
 mod rewrite;
 mod search;
 mod translation;
@@ -21,13 +22,15 @@ use crate::persistence::write_json_atomic;
 
 pub(crate) use ai::{
     CHAT_CITATION_PREFIX, ChatAnnotationAction, ChatSelection, chat_citation_link,
+    chat_citation_marker_from_link,
 };
 pub use ai::{
     ChatReadingContext, ChatResponse, ChatRole, ChatTurn, chat_with_book, translate_blocks,
     translate_blocks_incremental,
 };
 pub use commands::{
-    ChatCommand, ChatCommandResolution, chat_command_suggestions, resolve_chat_command,
+    ChatCommand, ChatCommandResolution, ChatRequestKind, chat_command_suggestions,
+    resolve_chat_command,
 };
 pub(crate) use pdf_toc::generate_pdf_toc;
 pub use rewrite::RewriteBookSource;

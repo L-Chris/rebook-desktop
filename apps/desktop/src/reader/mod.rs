@@ -17,8 +17,9 @@ use crate::generated_toc::GeneratedTocDraft;
 use crate::highlights::{HighlightStore, StoredHighlight};
 use crate::library::LibraryBook;
 use crate::plugins::{
-    BlockTranslation, BookSearchResult, ChatReadingContext, ChatResponse, ChatTurn, PluginSettings,
-    RewriteBookSource, TranslationBlockInput, TranslationBookSource, TranslationMode,
+    BlockTranslation, BookSearchResult, ChatReadingContext, ChatRequestKind, ChatResponse,
+    ChatTurn, PluginSettings, RewriteBookSource, TranslationBlockInput, TranslationBookSource,
+    TranslationMode,
 };
 use crate::preferences::{self, AppLanguage, AppTheme, ReaderPreferences};
 use crate::settings::ReaderSettingsChange;
@@ -585,6 +586,8 @@ struct SearchUiState {
 #[derive(Clone)]
 struct ChatTask {
     source: Arc<dyn BookSource>,
+    format: BookFormat,
+    kind: ChatRequestKind,
     rewrite_source: Arc<RewriteBookSource>,
     book_id: String,
     selection: Option<crate::plugins::ChatSelection>,

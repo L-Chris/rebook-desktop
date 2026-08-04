@@ -39,7 +39,12 @@ impl DesktopApp {
 
     pub(crate) fn open_book(&mut self, path: &Path) {
         self.shelf.open_book(path);
-        self.promote_opened_reader();
+        if let Some(next_reader) = self.shelf.take_opened_reader() {
+            if let Some(current_reader) = self.reader.as_ref() {
+                current_reader.prepare_for_shutdown();
+            }
+            self.reader = Some(next_reader);
+        }
     }
 
     pub(crate) fn ui(

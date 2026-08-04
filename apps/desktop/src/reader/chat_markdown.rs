@@ -1457,8 +1457,9 @@ fn is_escaped(bytes: &[u8], index: usize) -> bool {
 }
 
 fn citation_locators(markdown: &str) -> Vec<String> {
+    let normalized = normalize_internal_citations(markdown);
     let mut locators = Vec::new();
-    for event in Parser::new_ext(markdown, markdown_options()) {
+    for event in Parser::new_ext(normalized.as_ref(), markdown_options()) {
         if let Event::Start(Tag::Link { dest_url, .. }) = event {
             let locator = dest_url.as_ref();
             if locator.starts_with(CHAT_CITATION_PREFIX)
@@ -1479,19 +1480,27 @@ fn clicked_citation(cache: &CommonMarkCache, locators: &[String]) -> Option<Stri
 }
 
 fn citation_icon_markdown(markdown: &str) -> Cow<'_, str> {
-    let replacements = Parser::new_ext(markdown, markdown_options())
-        .into_offset_iter()
-        .filter_map(|(event, range)| match event {
+    let normalized = normalize_internal_citations(markdown);
+    let markdown = normalized.as_ref();
+    let mut replacements = Vec::new();
+    let mut citation_start = None::<(usize, String)>;
+    for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
+        match event {
             Event::Start(Tag::Link { dest_url, .. })
                 if dest_url.as_ref().starts_with(CHAT_CITATION_PREFIX) =>
             {
-                Some((range, dest_url.to_string()))
+                citation_start = Some((range.start, dest_url.to_string()));
             }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+            Event::End(TagEnd::Link) => {
+                if let Some((start, locator)) = citation_start.take() {
+                    replacements.push((start..range.end, locator));
+                }
+            }
+            _ => {}
+        }
+    }
     if replacements.is_empty() {
-        return Cow::Borrowed(markdown);
+        return normalized;
     }
 
     let mut output = String::with_capacity(markdown.len());
@@ -1510,6 +1519,161 @@ fn citation_icon_markdown(markdown: &str) -> Cow<'_, str> {
     }
     output.push_str(&markdown[cursor..]);
     Cow::Owned(output)
+}
+
+fn normalize_internal_citations(source: &str) -> Cow<'_, str> {
+    match normalize_openai_citation_markers(source) {
+        Cow::Borrowed(source) => normalize_legacy_internal_citations(source),
+        Cow::Owned(source) => Cow::Owned(
+            normalize_legacy_internal_citations(&source)
+                .as_ref()
+                .to_owned(),
+        ),
+    }
+}
+
+fn normalize_legacy_internal_citations(source: &str) -> Cow<'_, str> {
+    match normalize_ref_citations(source) {
+        Cow::Borrowed(source) => normalize_malformed_internal_citations(source),
+        Cow::Owned(source) => Cow::Owned(
+            normalize_malformed_internal_citations(&source)
+                .as_ref()
+                .to_owned(),
+        ),
+    }
+}
+
+fn normalize_openai_citation_markers(source: &str) -> Cow<'_, str> {
+    const OPEN: &str = "【";
+    const CLOSE: &str = "†source】";
+    let mut search_start = 0;
+    let mut copy_start = 0;
+    let mut output = None::<String>;
+
+    while let Some(relative_open) = source[search_start..].find(OPEN) {
+        let open = search_start + relative_open;
+        let content_start = open + OPEN.len();
+        let Some(relative_close) = source[content_start..].find(CLOSE) else {
+            break;
+        };
+        let close = content_start + relative_close;
+        let body = source[content_start..close].trim();
+        let locator = body
+            .strip_prefix(CHAT_CITATION_PREFIX)
+            .map_or_else(|| format!("{CHAT_CITATION_PREFIX}{body}"), str::to_owned);
+        let next = close + CLOSE.len();
+        if !is_internal_citation_locator(&locator) {
+            search_start = next;
+            continue;
+        }
+
+        let output = output.get_or_insert_with(|| String::with_capacity(source.len()));
+        output.push_str(&source[copy_start..open]);
+        output.push_str("[source](<");
+        output.push_str(&locator);
+        output.push_str(">)");
+        copy_start = next;
+        search_start = next;
+    }
+
+    output.map_or(Cow::Borrowed(source), |mut output| {
+        output.push_str(&source[copy_start..]);
+        Cow::Owned(output)
+    })
+}
+
+fn normalize_ref_citations(source: &str) -> Cow<'_, str> {
+    const OPEN: &str = "<ref>";
+    const CLOSE: &str = "</ref>";
+    let mut search_start = 0;
+    let mut copy_start = 0;
+    let mut output = None::<String>;
+
+    while let Some(relative_open) = source[search_start..].find(OPEN) {
+        let open = search_start + relative_open;
+        let content_start = open + OPEN.len();
+        let Some(relative_close) = source[content_start..].find(CLOSE) else {
+            break;
+        };
+        let close = content_start + relative_close;
+        let locator = source[content_start..close].trim();
+        let next = close + CLOSE.len();
+        if !is_internal_citation_locator(locator)
+            || locator
+                .chars()
+                .any(|character| character.is_whitespace() || matches!(character, '<' | '>'))
+        {
+            search_start = next;
+            continue;
+        }
+
+        let output = output.get_or_insert_with(|| String::with_capacity(source.len()));
+        output.push_str(&source[copy_start..open]);
+        output.push_str("[ref](<");
+        output.push_str(locator);
+        output.push_str(">)");
+        copy_start = next;
+        search_start = next;
+    }
+
+    output.map_or(Cow::Borrowed(source), |mut output| {
+        output.push_str(&source[copy_start..]);
+        Cow::Owned(output)
+    })
+}
+
+fn normalize_malformed_internal_citations(source: &str) -> Cow<'_, str> {
+    const LINK_OPEN: &str = "](link://j/";
+    let mut search_start = 0;
+    let mut copy_start = 0;
+    let mut output = None::<String>;
+    while let Some(relative_start) = source[search_start..].find(LINK_OPEN) {
+        let link_start = search_start + relative_start + 2;
+        let mut malformed_close = None;
+        for (offset, character) in source[link_start..].char_indices() {
+            match character {
+                ')' => break,
+                ']' => {
+                    malformed_close = Some(link_start + offset);
+                    break;
+                }
+                character if character.is_whitespace() || matches!(character, '(' | '<' | '>') => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = malformed_close else {
+            search_start = link_start;
+            continue;
+        };
+        let locator = &source[link_start..close];
+        if !is_internal_citation_locator(locator) {
+            search_start = close + 1;
+            continue;
+        }
+        let output = output.get_or_insert_with(|| String::with_capacity(source.len()));
+        output.push_str(&source[copy_start..close]);
+        output.push(')');
+        copy_start = close + 1;
+        search_start = copy_start;
+    }
+    output.map_or(Cow::Borrowed(source), |mut output| {
+        output.push_str(&source[copy_start..]);
+        Cow::Owned(output)
+    })
+}
+
+fn is_internal_citation_locator(locator: &str) -> bool {
+    let Some(remainder) = locator.strip_prefix(CHAT_CITATION_PREFIX) else {
+        return false;
+    };
+    let (section, node) = remainder
+        .split_once('/')
+        .map_or((remainder, None), |(section, node)| (section, Some(node)));
+    !section.is_empty()
+        && section.bytes().all(|byte| byte.is_ascii_digit())
+        && node.is_none_or(|node| !node.is_empty())
 }
 
 fn stable_hash<T: Hash + ?Sized>(value: &T) -> u64 {
@@ -1755,6 +1919,105 @@ flowchart LR
     }
 
     #[test]
+    fn ref_citation_protocol_is_iconized_and_clickable() {
+        let source = "First<ref>link://j/11/n17</ref><ref>link://j/11/n44</ref>";
+
+        assert_eq!(
+            citation_locators(source),
+            vec!["link://j/11/n17", "link://j/11/n44"]
+        );
+        assert_eq!(
+            citation_icon_markdown(source),
+            format!(
+                "First[{CITATION_ICON}](<link://j/11/n17>)[{CITATION_ICON}](<link://j/11/n44>)"
+            )
+        );
+    }
+
+    #[test]
+    fn openai_style_citation_markers_are_iconized_and_clickable() {
+        let source = "First【11/n17†source】【11/n44†source】";
+
+        assert_eq!(
+            citation_locators(source),
+            vec!["link://j/11/n17", "link://j/11/n44"]
+        );
+        assert_eq!(
+            citation_icon_markdown(source),
+            format!(
+                "First[{CITATION_ICON}](<link://j/11/n17>)[{CITATION_ICON}](<link://j/11/n44>)"
+            )
+        );
+    }
+
+    #[test]
+    fn incomplete_openai_style_marker_waits_for_the_streaming_suffix() {
+        assert!(matches!(
+            normalize_openai_citation_markers("Streaming 【11/n17†sour"),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            normalize_openai_citation_markers("Done 【11/n17†source】"),
+            "Done [source](<link://j/11/n17>)"
+        );
+    }
+
+    #[test]
+    fn incomplete_streaming_ref_is_ignored_until_the_closing_tag_arrives() {
+        assert!(matches!(
+            normalize_ref_citations("Streaming <ref>link://j/11/n17"),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            normalize_ref_citations("Done <ref> link://j/11/n17 </ref>"),
+            "Done [ref](<link://j/11/n17>)"
+        );
+    }
+
+    #[test]
+    fn malformed_internal_citation_closing_brackets_are_normalized() {
+        let source = "第一处[出处](link://j/56]，第二处[出处](link://j/57/n2]，网页[来源](https://example.com]。";
+        let normalized = normalize_malformed_internal_citations(source);
+
+        assert_eq!(
+            normalized,
+            "第一处[出处](link://j/56)，第二处[出处](link://j/57/n2)，网页[来源](https://example.com]。"
+        );
+        assert_eq!(
+            citation_locators(source),
+            vec!["link://j/56", "link://j/57/n2"]
+        );
+        let iconized = citation_icon_markdown(source);
+        assert_eq!(iconized.matches(CITATION_ICON).count(), 2);
+        assert!(!iconized.contains("[["));
+        assert!(iconized.contains("[来源](https://example.com]"));
+    }
+
+    #[test]
+    fn malformed_internal_citation_is_replaced_without_a_leftover_bracket() {
+        assert_eq!(
+            citation_icon_markdown("[source](link://j/56]"),
+            format!("[{CITATION_ICON}](<link://j/56>)")
+        );
+    }
+
+    #[test]
+    fn incomplete_streaming_citations_are_left_untouched_until_the_locator_is_complete() {
+        assert!(matches!(
+            normalize_malformed_internal_citations("生成中[出处](link://j/"),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            normalize_malformed_internal_citations("已完成[出处](link://j/56]"),
+            "已完成[出处](link://j/56)"
+        );
+        assert!(matches!(
+            normalize_malformed_internal_citations("标准[出处](link://j/56)"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
     fn internal_citation_labels_are_replaced_with_external_link_icons() {
         let source =
             "结论[中文引用](link://j/2/chapter%2Fparagraph-3)，另见[网页](https://example.com)。";
@@ -1872,6 +2135,14 @@ flowchart LR
         assert!(svg.contains("<text"));
         assert!(svg.contains("<line"));
         assert!(svg.contains("</svg>"));
+    }
+
+    #[test]
+    fn formula_renderer_supports_cjk_text_units_with_slashes() {
+        let svg = render_formula(r"4\text{千卡/克}", true).unwrap();
+
+        assert!(svg.contains("千卡/克"));
+        assert!(!svg.contains("PARSE ERROR"));
     }
 
     #[test]

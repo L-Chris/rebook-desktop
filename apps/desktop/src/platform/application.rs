@@ -1,6 +1,16 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
+use objc2::runtime::ProtocolObject;
+#[cfg(target_os = "macos")]
+use objc2::{ClassType, DeclaredClass, declare_class, msg_send_id, mutability};
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSApplication, NSApplicationDelegate};
+#[cfg(target_os = "macos")]
+use objc2_foundation::{MainThreadMarker, NSArray, NSObject, NSObjectProtocol, NSURL};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, StartCause, WindowEvent};
@@ -27,6 +37,8 @@ fn app_icon() -> Option<Icon> {
 pub(crate) fn run(app: DesktopApp) -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
+    #[cfg(target_os = "macos")]
+    let _open_file_delegate = install_open_file_delegate(proxy.clone())?;
     let runtime = tokio::runtime::Runtime::new()?;
     let mut application = Application::new(app, proxy, runtime);
     event_loop.run_app(&mut application)?;
@@ -34,6 +46,66 @@ pub(crate) fn run(app: DesktopApp) -> Result<(), Box<dyn std::error::Error>> {
         return Err(error.into());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct OpenFileDelegateIvars {
+    proxy: EventLoopProxy<UserEvent>,
+}
+
+#[cfg(target_os = "macos")]
+declare_class!(
+    struct OpenFileDelegate;
+
+    unsafe impl ClassType for OpenFileDelegate {
+        type Super = NSObject;
+        type Mutability = mutability::MainThreadOnly;
+        const NAME: &'static str = "TortoOpenFileDelegate";
+    }
+
+    impl DeclaredClass for OpenFileDelegate {
+        type Ivars = OpenFileDelegateIvars;
+    }
+
+    unsafe impl NSObjectProtocol for OpenFileDelegate {}
+
+    unsafe impl NSApplicationDelegate for OpenFileDelegate {
+        #[method(application:openURLs:)]
+        fn application_open_urls(&self, _application: &NSApplication, urls: &NSArray<NSURL>) {
+            for url in urls {
+                if !unsafe { url.isFileURL() } {
+                    continue;
+                }
+                let Some(path) = (unsafe { url.path() }) else {
+                    continue;
+                };
+                let _ = self
+                    .ivars()
+                    .proxy
+                    .send_event(UserEvent::OpenBook(path.to_string().into()));
+            }
+        }
+    }
+);
+
+#[cfg(target_os = "macos")]
+impl OpenFileDelegate {
+    fn new(proxy: EventLoopProxy<UserEvent>, mtm: MainThreadMarker) -> Retained<Self> {
+        let this = mtm.alloc().set_ivars(OpenFileDelegateIvars { proxy });
+        unsafe { msg_send_id![super(this), init] }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_open_file_delegate(
+    proxy: EventLoopProxy<UserEvent>,
+) -> Result<Retained<OpenFileDelegate>, std::io::Error> {
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| std::io::Error::other("macOS application must start on the main thread"))?;
+    let delegate = OpenFileDelegate::new(proxy, mtm);
+    let application = NSApplication::sharedApplication(mtm);
+    application.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    Ok(delegate)
 }
 
 fn clear_color() -> wgpu::Color {
@@ -186,6 +258,8 @@ impl ApplicationHandler<UserEvent> for Application {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::RepaintAfter(delay) => self.schedule_repaint(event_loop, delay),
+            #[cfg(target_os = "macos")]
+            UserEvent::OpenBook(path) => self.app.open_book(&path),
             #[cfg(target_os = "windows")]
             UserEvent::Update(message) => self.app.complete_update(message),
             UserEvent::ShelfSync(message) => self.app.complete_shelf_sync(message),
@@ -345,5 +419,44 @@ mod tests {
         assert!(wix.contains("Id='PreviousApplicationFolder'"));
         assert!(wix.contains("Value='[APPLICATIONFOLDER]'"));
         assert!(wix.contains("<ComponentRef Id='InstallLocationRegistry'/>"));
+    }
+
+    #[test]
+    fn installer_registers_supported_books_with_windows_default_apps() {
+        let wix = include_str!("../../wix/main.wxs");
+
+        assert!(wix.contains("Key='Software\\RegisteredApplications'"));
+        assert!(wix.contains("Value='Software\\L-Chris\\Torto\\Capabilities'"));
+        assert!(wix.contains("<ComponentRef Id='FileAssociations'/>"));
+        assert!(wix.contains("Value='&quot;[#exe0]&quot; &quot;%1&quot;'"));
+        for extension in ["epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "pdf"] {
+            assert!(
+                wix.contains(&format!(
+                    "Name='.{extension}' Type='string' Value='Torto.Book'"
+                )),
+                "missing default-app capability for .{extension}"
+            );
+            assert!(
+                wix.contains(&format!("Key='.{extension}\\OpenWithProgids'")),
+                "missing Open With registration for .{extension}"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_bundle_declares_supported_book_document_types() {
+        let manifest = include_str!("../../Cargo.toml");
+        let document_types = include_str!("../../../../assets/macos/document-types.plist");
+
+        assert!(manifest.contains("osx_info_plist_exts = [\"assets/macos/document-types.plist\"]"));
+        assert!(document_types.contains("<key>CFBundleDocumentTypes</key>"));
+        assert!(document_types.contains("<string>org.idpf.epub-container</string>"));
+        assert!(document_types.contains("<string>com.adobe.pdf</string>"));
+        for extension in ["mobi", "azw", "azw3", "fb2", "fbz", "cbz"] {
+            assert!(
+                document_types.contains(&format!("<string>{extension}</string>")),
+                "missing macOS document declaration for .{extension}"
+            );
+        }
     }
 }

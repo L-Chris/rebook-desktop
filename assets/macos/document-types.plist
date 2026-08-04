@@ -1,0 +1,89 @@
+<key>CFBundleDocumentTypes</key>
+<array>
+    <dict>
+        <key>CFBundleTypeName</key>
+        <string>EPUB e-book</string>
+        <key>CFBundleTypeRole</key>
+        <string>Viewer</string>
+        <key>LSHandlerRank</key>
+        <string>Default</string>
+        <key>LSItemContentTypes</key>
+        <array>
+            <string>org.idpf.epub-container</string>
+        </array>
+    </dict>
+    <dict>
+        <key>CFBundleTypeName</key>
+        <string>PDF document</string>
+        <key>CFBundleTypeRole</key>
+        <string>Viewer</string>
+        <key>LSHandlerRank</key>
+        <string>Alternate</string>
+        <key>LSItemContentTypes</key>
+        <array>
+            <string>com.adobe.pdf</string>
+        </array>
+    </dict>
+    <dict>
+        <key>CFBundleTypeName</key>
+        <string>Torto e-book</string>
+        <key>CFBundleTypeRole</key>
+        <string>Viewer</string>
+        <key>LSHandlerRank</key>
+        <string>Default</string>
+        <key>LSItemContentTypes</key>
+        <array>
+            <string>io.github.l-chris.torto.ebook</string>
+        </array>
+    </dict>
+</array>
+
+<key>UTImportedTypeDeclarations</key>
+<array>
+    <dict>
+        <key>UTTypeIdentifier</key>
+        <string>org.idpf.epub-container</string>
+        <key>UTTypeDescription</key>
+        <string>EPUB e-book</string>
+        <key>UTTypeConformsTo</key>
+        <array>
+            <string>public.data</string>
+            <string>public.archive</string>
+        </array>
+        <key>UTTypeTagSpecification</key>
+        <dict>
+            <key>public.filename-extension</key>
+            <array>
+                <string>epub</string>
+            </array>
+            <key>public.mime-type</key>
+            <string>application/epub+zip</string>
+        </dict>
+    </dict>
+</array>
+
+<key>UTExportedTypeDeclarations</key>
+<array>
+    <dict>
+        <key>UTTypeIdentifier</key>
+        <string>io.github.l-chris.torto.ebook</string>
+        <key>UTTypeDescription</key>
+        <string>Torto e-book</string>
+        <key>UTTypeConformsTo</key>
+        <array>
+            <string>public.data</string>
+        </array>
+        <key>UTTypeTagSpecification</key>
+        <dict>
+            <key>public.filename-extension</key>
+            <array>
+                <string>mobi</string>
+                <string>azw</string>
+                <string>azw3</string>
+                <string>fb2</string>
+                <string>fbz</string>
+                <string>cbz</string>
+            </array>
+        </dict>
+    </dict>
+</array>

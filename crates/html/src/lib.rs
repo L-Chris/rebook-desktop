@@ -103,6 +103,16 @@ impl ReadingIrParser {
                 self.parse_node(child)?;
                 continue;
             }
+            if child.is_element() && has_descendant_image(child) {
+                self.push_collected_text_block(
+                    TextBlockKind::Paragraph,
+                    style,
+                    std::mem::replace(&mut collector, InlineCollector::new(false)),
+                );
+                self.queue_node_anchors(child);
+                self.push_text_block(child, TextBlockKind::Paragraph, style)?;
+                continue;
+            }
             if child.is_element() {
                 self.queue_node_anchors(child);
                 self.queue_descendant_anchors(child);
@@ -498,6 +508,7 @@ fn is_generic_block_container(name: &str) -> bool {
             | "aside"
             | "center"
             | "dd"
+            | "dl"
             | "div"
             | "dt"
             | "figcaption"
@@ -508,6 +519,16 @@ fn is_generic_block_container(name: &str) -> bool {
             | "main"
             | "section"
     )
+}
+
+fn has_descendant_image(node: Node<'_, '_>) -> bool {
+    node.descendants().skip(1).any(|descendant| {
+        descendant.is_element()
+            && matches!(
+                descendant.tag_name().name().to_ascii_lowercase().as_str(),
+                "img" | "image"
+            )
+    })
 }
 
 fn is_block_boundary(name: &str) -> bool {
@@ -805,6 +826,25 @@ fn apply_block_properties(
     properties: &HashMap<String, String>,
     inherited_only: bool,
 ) {
+    // Reading IR flattens nested HTML boxes into blocks. Preserve the start-side
+    // offset contributed by every containing box so authored lists keep their
+    // visual hierarchy after flattening.
+    for property in [
+        properties
+            .get("margin-inline-start")
+            .or_else(|| properties.get("margin-left")),
+        properties
+            .get("padding-inline-start")
+            .or_else(|| properties.get("padding-left")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some((pixels, fraction)) = css_horizontal_length(property) {
+            style.margin_start += pixels;
+            style.margin_start_fraction += fraction;
+        }
+    }
     if let Some(value) = properties.get("text-align") {
         style.align = match value.as_str() {
             "center" => TextAlignment::Center,
@@ -878,9 +918,14 @@ fn insert_declarations(
 ) {
     for (name, value) in declarations {
         if name == "margin" {
-            if let Some((top, bottom)) = vertical_margins(&value) {
+            if let Some((top, _, bottom, left)) = box_sides(&value) {
                 properties.insert("margin-top".into(), top.to_owned());
                 properties.insert("margin-bottom".into(), bottom.to_owned());
+                properties.insert("margin-left".into(), left.to_owned());
+            }
+        } else if name == "padding" {
+            if let Some((_, _, _, left)) = box_sides(&value) {
+                properties.insert("padding-left".into(), left.to_owned());
             }
         } else {
             properties.insert(name, value);
@@ -929,11 +974,13 @@ fn matching_brace(css: &str, open: usize) -> Option<usize> {
     None
 }
 
-fn vertical_margins(value: &str) -> Option<(&str, &str)> {
+fn box_sides(value: &str) -> Option<(&str, &str, &str, &str)> {
     let values = value.split_ascii_whitespace().collect::<Vec<_>>();
     match values.as_slice() {
-        [all] | [all, _] => Some((all, all)),
-        [top, _, bottom] | [top, _, bottom, _] => Some((top, bottom)),
+        [all] => Some((all, all, all, all)),
+        [vertical, horizontal] => Some((vertical, horizontal, vertical, horizontal)),
+        [top, horizontal, bottom] => Some((top, horizontal, bottom, horizontal)),
+        [top, right, bottom, left] => Some((top, right, bottom, left)),
         _ => None,
     }
 }
@@ -967,6 +1014,20 @@ fn css_length(value: &str) -> Option<f32> {
         (value, 1.0)
     };
     number.trim().parse::<f32>().ok().map(|v| v * scale)
+}
+
+fn css_horizontal_length(value: &str) -> Option<(f32, f32)> {
+    if let Some(percent) = value.trim().strip_suffix('%') {
+        return percent
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(|value| (0.0, value / 100.0));
+    }
+    css_length(value)
+        .filter(|value| value.is_finite())
+        .map(|value| (value, 0.0))
 }
 
 fn css_scale(value: &str) -> Option<f32> {
@@ -1243,6 +1304,102 @@ mod tests {
         assert_eq!(anchors.get("item-link"), Some(&"n2"));
         assert_eq!(anchors.get("mixed"), Some(&"n3"));
         assert_eq!(anchors.get("paragraph"), Some(&"n4"));
+    }
+
+    #[test]
+    fn preserves_images_wrapped_by_inline_elements_in_block_containers() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("plates").unwrap(),
+            href: PublicationUrl::parse("OPS/text/plates.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><div>
+            <h3>Plates</h3>
+            <div><a id="plate-one"><img src="../images/one.jpeg"/></a></div>
+            <div><span><a id="plate-two"><img src="../images/two.jpeg"/></a></span></div>
+        </div></body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let images = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Image(image) => Some(image.href.path()),
+                Block::Text(_) | Block::Separator | Block::PageBreak => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(images, ["OPS/images/one.jpeg", "OPS/images/two.jpeg"]);
+        assert!(
+            section
+                .anchors
+                .iter()
+                .any(|anchor| anchor.fragment == "plate-one")
+        );
+        assert!(
+            section
+                .anchors
+                .iter()
+                .any(|anchor| anchor.fragment == "plate-two")
+        );
+    }
+
+    #[test]
+    fn keeps_definition_list_entries_as_separate_blocks() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("contents").unwrap(),
+            href: PublicationUrl::parse("OPS/text/contents.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><style>
+            dl { margin: 1em 0 1em 10%; }
+            dt { padding: 0 0 0 .5em; }
+            dd { margin: 0 0 .4em 2.75em; }
+        </style></head><body><div>
+            <h3>目录</h3>
+            <dl>
+                <dt><a href="chapter.xhtml#one">第一章</a></dt>
+                <dd><a href="chapter.xhtml#section">第一节</a></dd>
+                <dt><a href="chapter.xhtml#two">第二章</a></dt>
+            </dl>
+        </div></body></html>"#;
+
+        let section = parse_section(xml, &descriptor, |_| unreachable!()).unwrap();
+        let texts = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(
+                    block
+                        .content
+                        .iter()
+                        .filter_map(|inline| match inline {
+                            Inline::Text(run) => Some(run.text.as_str()),
+                            Inline::Break => None,
+                        })
+                        .collect::<String>(),
+                ),
+                Block::Image(_) | Block::Separator | Block::PageBreak => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts, ["目录", "第一章", "第一节", "第二章"]);
+        let styles = section
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Text(block) => Some(block.style),
+                Block::Image(_) | Block::Separator | Block::PageBreak => None,
+            })
+            .collect::<Vec<_>>();
+        assert_close(styles[1].margin_start, 8.0);
+        assert_close(styles[1].margin_start_fraction, 0.1);
+        assert_close(styles[2].margin_start, 44.0);
+        assert_close(styles[2].margin_start_fraction, 0.1);
     }
 
     fn assert_close(actual: f32, expected: f32) {

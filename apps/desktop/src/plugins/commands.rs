@@ -17,7 +17,15 @@ pub enum ChatCommandResolution {
     Resolved {
         display: String,
         prompt: String,
+        kind: ChatRequestKind,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChatRequestKind {
+    #[default]
+    Normal,
+    ChapterSummary,
 }
 
 pub const CHAT_COMMANDS: [ChatCommand; 4] = [
@@ -95,7 +103,7 @@ pub fn resolve_chat_command(input: &str) -> ChatCommandResolution {
     }
 
     let prompt = match command.name {
-        "/summary" => "请总结当前章节内容。要求：用中文回答；先给出一句话概括，再列出关键要点；如果章节中有重要术语，请单独解释。".into(),
+        "/summary" => "请总结当前章节内容。要求：用中文回答；先给出一句话概括，再列出关键要点；如果章节中有重要术语，请单独解释；每个主要结论都使用提供的 href 就近引用。".into(),
         "/search" => format!(
             "请在本书中搜索与“{args}”相关的信息，优先使用 searchBook；需要阅读完整章节时使用 getContent。请用中文回答，列出最相关的章节或段落，并简要解释上下文。"
         ),
@@ -115,6 +123,11 @@ pub fn resolve_chat_command(input: &str) -> ChatCommandResolution {
     ChatCommandResolution::Resolved {
         display: input.to_owned(),
         prompt,
+        kind: if command.name == "/summary" {
+            ChatRequestKind::ChapterSummary
+        } else {
+            ChatRequestKind::Normal
+        },
     }
 }
 
@@ -150,8 +163,9 @@ mod tests {
             resolve_chat_command("/search"),
             ChatCommandResolution::MissingArguments { .. }
         ));
-        let ChatCommandResolution::Resolved { display, prompt } =
-            resolve_chat_command("/SEARCH feedback loops")
+        let ChatCommandResolution::Resolved {
+            display, prompt, ..
+        } = resolve_chat_command("/SEARCH feedback loops")
         else {
             panic!("command should resolve");
         };
@@ -170,5 +184,16 @@ mod tests {
         assert!(prompt.contains("getContent"));
         assert!(prompt.contains("rewriteBlocks"));
         assert!(prompt.contains("保持英文"));
+    }
+
+    #[test]
+    fn summary_uses_the_direct_chapter_request_kind() {
+        let ChatCommandResolution::Resolved { prompt, kind, .. } = resolve_chat_command("/summary")
+        else {
+            panic!("command should resolve");
+        };
+        assert_eq!(kind, ChatRequestKind::ChapterSummary);
+        assert!(!prompt.contains("getVisualContent"));
+        assert!(prompt.contains("href"));
     }
 }
