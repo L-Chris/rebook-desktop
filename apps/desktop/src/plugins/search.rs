@@ -59,6 +59,35 @@ fn search_sections(
             .map_err(|error| format!("解析第 {} 节失败：{error}", section_index + 1))?;
         let section_title = section_title(source, section_index, &section.blocks);
         for block in &section.blocks {
+            if let Block::Table(table) = block {
+                for cell in table.rows.iter().flat_map(|row| &row.cells) {
+                    let Some(source_range) = &cell.text.source else {
+                        continue;
+                    };
+                    let text = text_block_text(&cell.text);
+                    for found in matcher.find_iter(&text) {
+                        let range =
+                            source_range_for_match(source_range, &text, found.start(), found.end());
+                        results.push(BookSearchResult {
+                            section_index,
+                            section_title: section_title.clone(),
+                            excerpt: excerpt(
+                                &text,
+                                found.start(),
+                                found.end(),
+                                DEFAULT_CONTEXT_CHARS,
+                            ),
+                            matched_text: found.as_str().to_owned(),
+                            block_kind: "table-cell".into(),
+                            range,
+                        });
+                        if results.len() >= max_results {
+                            return Ok(results);
+                        }
+                    }
+                }
+                continue;
+            }
             let (text, source_range, block_kind) = match block {
                 Block::Text(block) => {
                     let Some(source_range) = &block.source else {
@@ -77,7 +106,7 @@ fn search_sections(
                     };
                     (layer.text.clone(), source_range, "image-text".into())
                 }
-                Block::Separator | Block::PageBreak => continue,
+                Block::Table(_) | Block::Separator | Block::PageBreak => continue,
             };
             for found in matcher.find_iter(&text) {
                 let range = source_range_for_match(source_range, &text, found.start(), found.end());
@@ -114,6 +143,7 @@ pub(crate) fn text_block_text(block: &TextBlock) -> String {
         .iter()
         .map(|inline| match inline {
             Inline::Text(run) => run.text.as_str(),
+            Inline::Math(run) => run.latex.as_str(),
             Inline::Break => "\n",
         })
         .collect()

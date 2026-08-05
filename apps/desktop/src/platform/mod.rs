@@ -17,4 +17,5 @@ pub(crate) enum UserEvent {
     ReaderTranslation(crate::reader::TranslationTaskMessage),
     ReaderTocTranslation(crate::reader::TocTranslationTaskMessage),
     ReaderPdfToc(crate::reader::PdfTocTaskMessage),
+    ReaderPdfOcr(crate::reader::PdfOcrTaskMessage),
 }

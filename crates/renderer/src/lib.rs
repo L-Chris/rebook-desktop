@@ -9,7 +9,9 @@ use parley::editing::{Cursor, Selection};
 use parley::layout::{Affinity, Cluster, ClusterSide};
 use parley::{FontData, Layout, PositionedLayoutItem};
 use peniko::{Blob, Color, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
-use rebook_layout::{ImagePlacement, PageItem, PageLayout, TextBrush, TextPlacement};
+use rebook_layout::{
+    ImagePlacement, PageItem, PageLayout, TablePlacement, TextBrush, TextPlacement,
+};
 use rebook_publication::{Rgba, SourceAnchor, SourceRange};
 
 /// Pointer hit inside one retained text placement.
@@ -100,7 +102,9 @@ impl PageDisplayList {
             .iter()
             .rev()
             .find_map(|command| match command {
-                DisplayCommand::Image(command) if command.bounds.contains(point) => {
+                DisplayCommand::Image(command)
+                    if command.interactive && command.bounds.contains(point) =>
+                {
                     Some(PageImageHit {
                         bounds: command.bounds,
                         width: command.width,
@@ -944,6 +948,7 @@ struct ImageCommand {
     width: u32,
     height: u32,
     pixels: Arc<[u8]>,
+    interactive: bool,
 }
 
 struct FillRectCommand {
@@ -979,6 +984,9 @@ impl DisplayListCompiler {
                     }
                     compile_text_commands(&mut commands, text);
                 }
+                PageItem::Table(table) => {
+                    compile_table_commands(&mut commands, &mut text_regions, table);
+                }
                 PageItem::Image(image) => {
                     let data = ImageData {
                         data: Blob::new(Arc::new(image.image.pixels.clone())),
@@ -1004,6 +1012,7 @@ impl DisplayListCompiler {
                         width: image.image.width,
                         height: image.image.height,
                         pixels: Arc::clone(&image.image.pixels),
+                        interactive: true,
                     }));
                     if let Some(replacement) = &image.replacement {
                         for segment in &replacement.segments {
@@ -1050,6 +1059,54 @@ impl DisplayListCompiler {
     }
 }
 
+fn compile_table_commands(
+    commands: &mut Vec<DisplayCommand>,
+    text_regions: &mut Vec<TextRegion>,
+    table: &TablePlacement,
+) {
+    for cell in &table.cells {
+        if cell.header {
+            commands.push(DisplayCommand::FillRect(FillRectCommand {
+                rect: Rect::new(
+                    f64::from(cell.x),
+                    f64::from(cell.y),
+                    f64::from(cell.x + cell.width),
+                    f64::from(cell.y + cell.height),
+                ),
+                color: color(table.header_fill),
+            }));
+        }
+    }
+    for cell in &table.cells {
+        if let Some(text) = &cell.text {
+            if let Some(region) = text_region(text) {
+                text_regions.push(region);
+            }
+            compile_text_commands(commands, text);
+        }
+    }
+    for cell in &table.cells {
+        let left = f64::from(cell.x);
+        let top = f64::from(cell.y);
+        let right = f64::from(cell.x + cell.width);
+        let bottom = f64::from(cell.y + cell.height);
+        let border = color(table.border);
+        for (start, end) in [
+            ((left, top), (right, top)),
+            ((right, top), (right, bottom)),
+            ((right, bottom), (left, bottom)),
+            ((left, bottom), (left, top)),
+        ] {
+            commands.push(DisplayCommand::Rule(RuleCommand {
+                start,
+                end,
+                width: 1.0,
+                color: border,
+            }));
+        }
+    }
+}
+
 fn page_item_bottom(item: &PageItem) -> Option<f32> {
     match item {
         PageItem::Text(text) => text
@@ -1059,6 +1116,7 @@ fn page_item_bottom(item: &PageItem) -> Option<f32> {
             .and_then(|line| text.layout.get(line))
             .map(|line| text.origin_y + line.metrics().block_max_coord),
         PageItem::Image(image) => Some(image.y + image.height),
+        PageItem::Table(table) => Some(table.y + table.height),
         PageItem::Separator(separator) => Some(separator.y + 1.0),
     }
 }
@@ -1190,6 +1248,44 @@ fn compile_text_commands(commands: &mut Vec<DisplayCommand>, text: &TextPlacemen
     {
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                let PositionedLayoutItem::InlineBox(inline_box) = item else {
+                    continue;
+                };
+                let Some(image) = text
+                    .inline_images
+                    .iter()
+                    .find(|image| image.id == inline_box.id)
+                else {
+                    continue;
+                };
+                let x = text.origin_x + inline_box.x;
+                let y = text.origin_y + inline_box.y;
+                let image_transform = Affine::translate((f64::from(x), f64::from(y)))
+                    * Affine::scale_non_uniform(
+                        f64::from(image.width) / f64::from(image.image.width.max(1)),
+                        f64::from(image.height) / f64::from(image.image.height.max(1)),
+                    );
+                let data = ImageData {
+                    data: Blob::new(Arc::new(image.image.pixels.clone())),
+                    format: ImageFormat::Rgba8,
+                    alpha_type: ImageAlphaType::Alpha,
+                    width: image.image.width,
+                    height: image.image.height,
+                };
+                commands.push(DisplayCommand::Image(ImageCommand {
+                    image: ImageBrush::new(data),
+                    transform: image_transform,
+                    bounds: Rect::new(
+                        f64::from(x),
+                        f64::from(y),
+                        f64::from(x + image.width),
+                        f64::from(y + image.height),
+                    ),
+                    width: image.image.width,
+                    height: image.image.height,
+                    pixels: Arc::clone(&image.image.pixels),
+                    interactive: false,
+                }));
                 continue;
             };
             let run = glyph_run.run();
@@ -1309,6 +1405,7 @@ mod tests {
                 origin_x: 24.0,
                 origin_y: 24.0,
                 source: Some(source),
+                inline_images: Arc::from([]),
             })],
         };
         let list = DisplayListCompiler.compile(&page);
@@ -1407,6 +1504,7 @@ mod tests {
                 origin_x,
                 origin_y,
                 source: Some(source),
+                inline_images: Arc::from([]),
             })],
         };
 
@@ -1560,6 +1658,7 @@ mod tests {
                             origin_x: 64.0,
                             origin_y: 64.0,
                             source: Some(source.clone()),
+                            inline_images: Arc::from([]),
                         },
                     }],
                 }),

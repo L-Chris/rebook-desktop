@@ -1,6 +1,7 @@
 use crate::plugins::TranslationMode;
 use crate::settings::{AppliedSettings, ReaderSettingsChange};
 use rebook_formats::BookFormat;
+use rebook_publication::RenditionLayout;
 
 use super::{DesktopReader, FollowUp, SnapshotEffects};
 
@@ -31,7 +32,9 @@ impl DesktopReader {
 
     pub(crate) fn apply_global_settings(&mut self, settings: &AppliedSettings) {
         let mut plugin_settings = settings.plugin_settings.clone();
-        if self.format == BookFormat::Pdf {
+        if self.format == BookFormat::Pdf
+            && self.source.book().metadata.layout == RenditionLayout::PrePaginated
+        {
             plugin_settings.translation_mode = TranslationMode::Replace;
         }
         let language = settings.language;

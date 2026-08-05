@@ -14,7 +14,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.2.15"
+version = "0.2.16"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -26,7 +26,6 @@ authors = ["L-Chris"]
 anyrender = "0.11.1"
 atomicwrites = "0.4.4"
 base64 = "0.22.1"
-cosmic-text = "0.17.2"
 crc32fast = "1.5.0"
 directories = "6.0.0"
 egui = "0.35.0"
@@ -41,18 +40,19 @@ fontdb = "0.23.0"
 hayro = "0.7.1"
 image = { version = "=0.25.6", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 kurbo = "0.13.1"
-latex2mathml = "0.2.3"
-lru = "0.13.0"
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 parley = { version = "0.10.0", features = ["complex-scripts"] }
-parking_lot = "0.12.5"
 peniko = "0.6.1"
 percent-encoding = "2.3.2"
 pollster = "0.4.0"
 pulldown-cmark = "0.13.0"
 quick-xml = { version = "0.41.0", features = ["encoding"] }
+ratex-layout = "0.1.14"
+ratex-parser = "0.1.14"
+ratex-svg = { version = "0.1.14", features = ["embed-fonts"] }
+ratex-types = "0.1.14"
 regex = "1.12.2"
-reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 resvg = "0.47.0"
 rfd = "0.17.2"
 roxmltree = "0.21.1"

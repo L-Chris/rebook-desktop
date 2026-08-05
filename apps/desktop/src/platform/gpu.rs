@@ -20,7 +20,7 @@ struct PageTarget {
     texture_id: TextureId,
     size: [u32; 2],
     logical_size: egui::Vec2,
-    rendered_revision: Option<u64>,
+    rendered_scene: Option<(u64, u64)>,
 }
 
 pub(super) struct GpuState {
@@ -146,7 +146,7 @@ impl GpuState {
                 || self
                     .page_target
                     .as_ref()
-                    .is_some_and(|target| target.rendered_revision != Some(plan.scene_revision));
+                    .is_some_and(|target| reader_scene_needs_render(target.rendered_scene, plan));
             if needs_render && let Some(scene) = app.reader_scene() {
                 self.render_reader_scene(&scene, plan, pixels_per_point)?;
             }
@@ -281,7 +281,7 @@ impl GpuState {
             texture_id,
             size,
             logical_size: plan.rect.size(),
-            rendered_revision: None,
+            rendered_scene: None,
         });
         if let Some(previous) = previous {
             self.retired_page_textures.push(previous.texture_id);
@@ -314,9 +314,13 @@ impl GpuState {
                 },
             )
             .map_err(|error| error.to_string())?;
-        target.rendered_revision = Some(plan.scene_revision);
+        target.rendered_scene = Some((plan.scene_id, plan.scene_revision));
         Ok(())
     }
+}
+
+fn reader_scene_needs_render(rendered_scene: Option<(u64, u64)>, plan: ReaderFramePlan) -> bool {
+    rendered_scene != Some((plan.scene_id, plan.scene_revision))
 }
 
 #[allow(
@@ -330,4 +334,25 @@ fn physical_dimension(points: f32, pixels_per_point: f32) -> u32 {
         return 1;
     }
     pixels.min(u32::MAX as f32) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(scene_id: u64, scene_revision: u64) -> ReaderFramePlan {
+        ReaderFramePlan {
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(100.0)),
+            scene_id,
+            scene_revision,
+            background: peniko::Color::BLACK,
+        }
+    }
+
+    #[test]
+    fn a_new_reader_renders_even_when_its_revision_matches_the_previous_reader() {
+        assert!(reader_scene_needs_render(Some((7, 1)), plan(8, 1)));
+        assert!(!reader_scene_needs_render(Some((8, 1)), plan(8, 1)));
+        assert!(reader_scene_needs_render(Some((8, 1)), plan(8, 2)));
+    }
 }

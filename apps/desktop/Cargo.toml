@@ -54,6 +54,7 @@ pulldown-cmark.workspace = true
 quick-xml.workspace = true
 regex.workspace = true
 rebook-formats = { path = "../../crates/formats" }
+rebook-html = { path = "../../crates/html" }
 rebook-layout = { path = "../../crates/layout" }
 rebook-math = { path = "../../crates/math" }
 rebook-publication = { path = "../../crates/publication" }
@@ -72,12 +73,10 @@ uuid.workspace = true
 vello.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+zip.workspace = true
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-zip.workspace = true
 
 [build-dependencies]
 winresource = "0.1.31"

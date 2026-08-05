@@ -206,6 +206,7 @@ impl ApplicationHandler<UserEvent> for Application {
                 self.app.complete_reader_toc_translation(message);
             }
             UserEvent::ReaderPdfToc(message) => self.app.complete_reader_pdf_toc(message),
+            UserEvent::ReaderPdfOcr(message) => self.app.complete_reader_pdf_ocr(message),
         }
         if let Some(window) = &self.window {
             window.window.request_redraw();

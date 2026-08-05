@@ -8,7 +8,7 @@ use crate::library::LocalLibrary;
 use crate::platform::UserEvent;
 use crate::preferences::{AppTheme, InterfaceTypography};
 use crate::reader::{
-    ChatStreamMessage, ChatTaskMessage, PdfTocTaskMessage, SearchTaskMessage,
+    ChatStreamMessage, ChatTaskMessage, PdfOcrTaskMessage, PdfTocTaskMessage, SearchTaskMessage,
     TocTranslationTaskMessage, TranslationTaskMessage,
 };
 use crate::reader::{DesktopReader, ReaderFramePlan, ReaderPageTexture};
@@ -174,6 +174,12 @@ impl DesktopApp {
     pub(crate) fn complete_reader_pdf_toc(&mut self, message: PdfTocTaskMessage) {
         if let Some(reader) = self.reader.as_mut() {
             reader.complete_pdf_toc(message);
+        }
+    }
+
+    pub(crate) fn complete_reader_pdf_ocr(&mut self, message: PdfOcrTaskMessage) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.complete_pdf_ocr(message);
         }
     }
 

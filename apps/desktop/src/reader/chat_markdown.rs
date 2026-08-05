@@ -685,9 +685,7 @@ fn asset_display_size(
 fn render_formula(tex: &str, inline: bool) -> Result<String, String> {
     let font_size = if inline { 13.0 } else { 16.0 };
     let padding = if inline { 1.0 } else { 4.0 };
-    let mut measure = rebook_math::fonts::CosmicTextMeasure::new()?;
-    let rendered =
-        rebook_math::math::render_math(tex, font_size, "#262624", &mut measure, !inline)?;
+    let rendered = rebook_math::math::render_math(tex, font_size, "#262624", !inline)?;
     let width = (rendered.width + padding * 2.0).max(1.0);
     let height = (rendered.ascent + rendered.descent + padding * 2.0).max(1.0);
     let view_y = -rendered.ascent - padding;
@@ -2132,17 +2130,25 @@ flowchart LR
     fn formula_renderer_produces_a_standalone_svg() {
         let svg = render_formula(r"\frac{a}{b}", false).unwrap();
         assert!(svg.contains("<svg"));
-        assert!(svg.contains("<text"));
-        assert!(svg.contains("<line"));
         assert!(svg.contains("</svg>"));
+
+        let AssetStatus::Ready(asset) = ready_svg_asset(svg).unwrap() else {
+            panic!("expected a ready formula SVG asset");
+        };
+        assert!(asset.source_size[0] > 0.0);
+        assert!(asset.source_size[1] > 0.0);
     }
 
     #[test]
     fn formula_renderer_supports_cjk_text_units_with_slashes() {
         let svg = render_formula(r"4\text{千卡/克}", true).unwrap();
 
-        assert!(svg.contains("千卡/克"));
         assert!(!svg.contains("PARSE ERROR"));
+        let AssetStatus::Ready(asset) = ready_svg_asset(svg).unwrap() else {
+            panic!("expected a ready formula SVG asset");
+        };
+        assert!(asset.source_size[0] > 0.0);
+        assert!(asset.source_size[1] > 0.0);
     }
 
     #[test]

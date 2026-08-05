@@ -10,11 +10,10 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
-cosmic-text.workspace = true
-latex2mathml.workspace = true
-lru.workspace = true
-parking_lot.workspace = true
-quick-xml.workspace = true
+ratex-layout.workspace = true
+ratex-parser.workspace = true
+ratex-svg.workspace = true
+ratex-types.workspace = true
 
 [lints]
 workspace = true

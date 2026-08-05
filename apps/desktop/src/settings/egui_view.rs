@@ -4,8 +4,8 @@ use rebook_layout::{ReaderDefaultFont, SpreadMode};
 use super::{SettingsFeature, SettingsTab};
 use crate::plugins::{
     AiProviderKind, CHAT_HISTORY_TURNS_MAX, CHAT_HISTORY_TURNS_MIN, CHAT_TOOL_STEPS_MAX,
-    CHAT_TOOL_STEPS_MIN, PluginSettings, TARGET_LANGUAGE_ENGLISH, TARGET_LANGUAGE_INTERFACE,
-    TARGET_LANGUAGE_SIMPLIFIED_CHINESE, TranslationMode,
+    CHAT_TOOL_STEPS_MIN, PdfOcrProviderKind, PluginSettings, TARGET_LANGUAGE_ENGLISH,
+    TARGET_LANGUAGE_INTERFACE, TARGET_LANGUAGE_SIMPLIFIED_CHINESE, TranslationMode,
 };
 use crate::preferences::{AppLanguage, AppTheme};
 use crate::sync::{CloudProviderKind, SYNC_INTERVAL_OPTIONS};
@@ -712,6 +712,69 @@ fn ocr_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         ui.weak(language.text(
             "仅显示已在 AI 提供商中配置的模型；所选模型需要支持图片输入。",
             "Only configured AI provider models are shown; the selected model must support image input.",
+        ));
+    });
+    ui.add_space(12.0);
+    settings_card(ui, |ui| {
+        ui.checkbox(
+            &mut settings.pdf_ocr_enabled,
+            language.text("启用 PDF 正文 OCR", "Enable PDF document OCR"),
+        );
+        ui.add_space(8.0);
+        field_label(ui, language.text("OCR 服务", "OCR provider"));
+        egui::ComboBox::from_id_salt("pdf-ocr-provider")
+            .width(SETTINGS_MODEL_SELECT_WIDTH)
+            .selected_text(settings.pdf_ocr_provider.label())
+            .show_ui(ui, |ui| {
+                for provider in PdfOcrProviderKind::ALL {
+                    ui.selectable_value(&mut settings.pdf_ocr_provider, provider, provider.label());
+                }
+            });
+        ui.add_space(8.0);
+        match settings.pdf_ocr_provider {
+            PdfOcrProviderKind::PaddleOcr => {
+                field_label(ui, language.text("识别模型", "Recognition model"));
+                egui::ComboBox::from_id_salt("paddle-ocr-model")
+                    .width(SETTINGS_MODEL_SELECT_WIDTH)
+                    .selected_text(&settings.paddle_ocr_model)
+                    .show_ui(ui, |ui| {
+                        for model in [
+                            "PaddleOCR-VL-1.6",
+                            "PaddleOCR-VL-1.5",
+                            "PaddleOCR-VL",
+                            "PP-StructureV3",
+                        ] {
+                            ui.selectable_value(
+                                &mut settings.paddle_ocr_model,
+                                model.to_owned(),
+                                model,
+                            );
+                        }
+                    });
+                field_label(ui, "Access Token");
+                text_field(ui, &mut settings.paddle_ocr_token, true);
+            }
+            PdfOcrProviderKind::MinerU => {
+                field_label(ui, language.text("识别模型", "Recognition model"));
+                egui::ComboBox::from_id_salt("mineru-ocr-model")
+                    .width(SETTINGS_MODEL_SELECT_WIDTH)
+                    .selected_text(&settings.mineru_model)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut settings.mineru_model, "vlm".into(), "VLM");
+                        ui.selectable_value(
+                            &mut settings.mineru_model,
+                            "pipeline".into(),
+                            "Pipeline",
+                        );
+                    });
+                field_label(ui, "API Token");
+                text_field(ui, &mut settings.mineru_token, true);
+            }
+        }
+        ui.add_space(8.0);
+        ui.weak(language.text(
+            "凭据仅保存在系统凭据管理器中；OCR 结果会缓存在本机。",
+            "Credentials are stored only in the system credential manager; OCR results are cached locally.",
         ));
     });
 }

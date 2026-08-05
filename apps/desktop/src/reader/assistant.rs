@@ -7,9 +7,10 @@ use rebook_reader::ReaderVisibleTextFragment;
 use crate::platform::UserEvent;
 use crate::plugins::{
     BookSearchResult, ChatAnnotationAction, ChatCommand, ChatCommandResolution, ChatReadingContext,
-    ChatRequestKind, ChatResponse, ChatRole, ChatSelection, ChatTurn, TranslationBlockInput,
-    chat_citation_link, chat_with_book, generate_pdf_toc, resolve_chat_command, search_book,
-    section_title, translate_blocks, translate_blocks_incremental,
+    ChatRequestKind, ChatResponse, ChatRole, ChatSelection, ChatTurn, PdfOcrViewMode,
+    TranslationBlockInput, chat_citation_link, chat_with_book, generate_pdf_toc, recognize_pdf,
+    resolve_chat_command, search_book, section_title, set_pdf_ocr_view_mode, translate_blocks,
+    translate_blocks_incremental,
 };
 
 use super::chat_autocomplete::{
@@ -18,9 +19,9 @@ use super::chat_autocomplete::{
 };
 use super::{
     AssistantPanel, ChatStreamMessage, ChatStreamingState, ChatTask, ChatTaskMessage,
-    DesktopReader, FocusedMark, MarkRetention, PdfTocTask, PdfTocTaskMessage, SearchTask,
-    SearchTaskMessage, SidebarTab, SnapshotEffects, TocTranslationTask, TocTranslationTaskMessage,
-    TranslationTask, TranslationTaskMessage,
+    DesktopReader, FocusedMark, MarkRetention, PdfOcrTask, PdfOcrTaskMessage, PdfTocTask,
+    PdfTocTaskMessage, SearchTask, SearchTaskMessage, SidebarTab, SnapshotEffects,
+    TocTranslationTask, TocTranslationTaskMessage, TranslationTask, TranslationTaskMessage,
 };
 
 impl DesktopReader {
@@ -121,6 +122,37 @@ impl DesktopReader {
             });
         }
         self.spawn_pending_pdf_toc(runtime, proxy);
+        self.spawn_pending_pdf_ocr(runtime, proxy);
+    }
+
+    fn spawn_pending_pdf_ocr(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    ) {
+        if let Some(request) = self.pdf_ocr.task.take_pending() {
+            let proxy = proxy.clone();
+            let progress_proxy = proxy.clone();
+            runtime.spawn(async move {
+                let id = request.id;
+                let payload = request.payload;
+                let result = recognize_pdf(
+                    payload.path,
+                    payload.book_id,
+                    payload.page_count,
+                    payload.settings,
+                    move |message| {
+                        let _ = progress_proxy.send_event(UserEvent::ReaderPdfOcr(
+                            PdfOcrTaskMessage::Progress { id, message },
+                        ));
+                    },
+                )
+                .await;
+                let _ = proxy.send_event(UserEvent::ReaderPdfOcr(PdfOcrTaskMessage::Complete(
+                    crate::async_task::TaskResult { id, result },
+                )));
+            });
+        }
     }
 
     fn spawn_pending_pdf_toc(
@@ -162,6 +194,120 @@ impl DesktopReader {
             source: Arc::clone(&self.source),
             settings: self.plugin_settings.clone(),
         });
+    }
+
+    pub(super) fn start_pdf_ocr(&mut self) {
+        if self.pdf_ocr.task.is_pending()
+            || self.format != rebook_formats::BookFormat::Pdf
+            || !self.plugin_settings.pdf_ocr_enabled
+        {
+            return;
+        }
+        self.pdf_ocr.progress = self.language.text("正在准备 PDF…", "Preparing PDF…").into();
+        self.pdf_ocr.task.begin(PdfOcrTask {
+            path: self.source_path.clone(),
+            book_id: self.book_id.clone(),
+            page_count: self.source.book().sections.len(),
+            settings: self.plugin_settings.clone(),
+        });
+    }
+
+    pub(crate) fn complete_pdf_ocr(&mut self, message: PdfOcrTaskMessage) {
+        match message {
+            PdfOcrTaskMessage::Progress { id, message } => {
+                if self.pdf_ocr.task.in_flight(id).is_some() {
+                    self.pdf_ocr.progress = message;
+                }
+            }
+            PdfOcrTaskMessage::Complete(message) => {
+                let Some(_request) = self.pdf_ocr.task.complete(message.id) else {
+                    return;
+                };
+                self.pdf_ocr.progress.clear();
+                match message.result {
+                    Ok(()) => {
+                        self.pdf_ocr.available = true;
+                        self.pdf_ocr.mode = PdfOcrViewMode::Reflow;
+                        self.persist_progress();
+                        self.reopen_requested = Some(self.source_path.clone());
+                    }
+                    Err(error) => self
+                        .error_timer
+                        .show(&mut self.error, error, Instant::now()),
+                }
+            }
+        }
+    }
+
+    pub(super) fn toggle_pdf_ocr_view(&mut self) -> bool {
+        if !self.pdf_ocr.available || self.pdf_ocr.task.is_pending() {
+            return false;
+        }
+        let Some(controller) = self.pdf_ocr_controller.clone() else {
+            return false;
+        };
+        let previous_mode = self.pdf_ocr.mode;
+        let mode = match self.pdf_ocr.mode {
+            PdfOcrViewMode::Original => PdfOcrViewMode::Reflow,
+            PdfOcrViewMode::Reflow => PdfOcrViewMode::Original,
+        };
+        match set_pdf_ocr_view_mode(&self.book_id, mode) {
+            Ok(()) => {
+                self.persist_progress();
+                controller.set_mode(mode);
+                let fixed_page = mode == PdfOcrViewMode::Original;
+                self.translation_source
+                    .set_fixed_page_replacement_only(fixed_page);
+                let _ = self
+                    .translation_source
+                    .set_mode(self.plugin_settings.translation_mode);
+                let mut style = self.reader.style().clone();
+                style.column_gap = if fixed_page {
+                    0.0
+                } else {
+                    rebook_layout::ReaderStyle::default().column_gap
+                };
+                match self.reader.refresh_source_with_style(style) {
+                    Ok(snapshot) => {
+                        self.pdf_ocr.mode = mode;
+                        self.apply_snapshot(snapshot, SnapshotEffects::static_content_change());
+                        true
+                    }
+                    Err(error) => {
+                        controller.set_mode(previous_mode);
+                        let previous_fixed_page = previous_mode == PdfOcrViewMode::Original;
+                        self.translation_source
+                            .set_fixed_page_replacement_only(previous_fixed_page);
+                        let _ = self
+                            .translation_source
+                            .set_mode(self.plugin_settings.translation_mode);
+                        let _ = set_pdf_ocr_view_mode(&self.book_id, previous_mode);
+                        self.error_timer.show(
+                            &mut self.error,
+                            format!(
+                                "{}: {error}",
+                                self.language
+                                    .text("切换 PDF 版式失败", "Failed to switch PDF layout")
+                            ),
+                            Instant::now(),
+                        );
+                        false
+                    }
+                }
+            }
+            Err(error) => {
+                self.error_timer.show(
+                    &mut self.error,
+                    format!(
+                        "{}: {error}",
+                        self.language
+                            .text("切换 PDF 版式失败", "Failed to switch PDF layout")
+                    ),
+                    Instant::now(),
+                );
+                false
+            }
+        }
     }
 
     pub(crate) fn complete_pdf_toc(&mut self, message: PdfTocTaskMessage) {
@@ -1205,6 +1351,7 @@ fn source_range_for_node(
 fn block_source_range(block: &Block) -> Option<&SourceRange> {
     match block {
         Block::Text(block) => block.source.as_ref(),
+        Block::Table(block) => block.source.as_ref(),
         Block::Image(block) => block.source.as_ref(),
         Block::Separator | Block::PageBreak => None,
     }
@@ -1217,9 +1364,32 @@ fn block_text(block: &Block) -> String {
             .iter()
             .map(|inline| match inline {
                 Inline::Text(run) => run.text.as_str(),
+                Inline::Math(run) => run.latex.as_str(),
                 Inline::Break => "\n",
             })
             .collect(),
+        Block::Table(table) => table
+            .rows
+            .iter()
+            .map(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| {
+                        cell.text
+                            .content
+                            .iter()
+                            .map(|inline| match inline {
+                                Inline::Text(run) => run.text.as_str(),
+                                Inline::Math(run) => run.latex.as_str(),
+                                Inline::Break => "\n",
+                            })
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
         Block::Image(block) => block
             .text_layer
             .as_ref()

@@ -315,6 +315,8 @@ pub struct SectionAnchor {
 pub enum Block {
     /// Reflowable text content.
     Text(TextBlock),
+    /// Structured rows and cells from an authored table.
+    Table(TableBlock),
     /// Raster or vector image resource.
     Image(ImageBlock),
     /// Thematic separator.
@@ -356,13 +358,55 @@ pub struct TextBlock {
     pub source: Option<SourceRange>,
 }
 
+/// A structured table kept independent from HTML and renderer details.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableBlock {
+    /// Rows in authored order.
+    pub rows: Vec<TableRow>,
+    /// Stable source anchor for block-level navigation.
+    pub source: Option<SourceRange>,
+}
+
+/// One authored table row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableRow {
+    /// Cells in authored order. Grid coordinates are resolved from their spans by layout.
+    pub cells: Vec<TableCell>,
+}
+
+/// One table cell with styled inline content and safe span metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableCell {
+    /// Cell content represented by the same selectable text IR used by paragraphs.
+    pub text: TextBlock,
+    /// Number of grid columns occupied by this cell.
+    pub column_span: u16,
+    /// Number of grid rows occupied by this cell.
+    pub row_span: u16,
+    /// Whether this cell originated from a semantic table header.
+    pub header: bool,
+}
+
 /// Inline reading content.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Inline {
     /// Styled Unicode text.
     Text(TextRun),
+    /// LaTeX formula kept as semantic inline content for native layout.
+    Math(MathRun),
     /// Forced line break.
     Break,
+}
+
+/// A LaTeX formula embedded in a text block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MathRun {
+    /// LaTeX source without Markdown delimiters.
+    pub latex: String,
+    /// Whether the author requested display-style math.
+    pub display: bool,
+    /// Font-size multiplier inherited from the surrounding text.
+    pub size_scale: f32,
 }
 
 /// Styled text span with an optional link target.

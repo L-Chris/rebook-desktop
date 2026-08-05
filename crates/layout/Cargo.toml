@@ -9,7 +9,9 @@ license.workspace = true
 [dependencies]
 image.workspace = true
 parley.workspace = true
+rebook-math = { path = "../math" }
 rebook-publication = { path = "../publication" }
+resvg.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

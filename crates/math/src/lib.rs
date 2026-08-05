@@ -1,9 +1,7 @@
-//! Lightweight LaTeX-to-SVG rendering used by the desktop chat view.
+//! Native LaTeX-to-SVG rendering for reader and chat formulas.
 //!
-//! The implementation is derived from the MIT-licensed math and font modules
-//! in Markie 0.3.0. Keeping this focused crate avoids pulling Markie's unrelated
-//! CLI, PDF export, syntax-highlighting, HTTP, and rasterization dependencies.
+//! `RaTeX` owns parsing and TeX layout. This crate only adapts its display list to
+//! Torto's baseline-oriented SVG contract and normalizes a narrow set of OCR
+//! artifacts before parsing.
 
-pub mod fonts;
 pub mod math;
-mod xml;

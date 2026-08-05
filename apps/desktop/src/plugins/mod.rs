@@ -3,6 +3,7 @@
 
 mod ai;
 mod commands;
+mod pdf_ocr;
 mod pdf_toc;
 mod pdf_vision;
 mod rewrite;
@@ -32,6 +33,10 @@ pub use commands::{
     ChatCommand, ChatCommandResolution, ChatRequestKind, chat_command_suggestions,
     resolve_chat_command,
 };
+pub(crate) use pdf_ocr::{
+    PdfOcrSourceController, PdfOcrViewMode, load_pdf_ocr_source, recognize_pdf,
+    set_pdf_ocr_view_mode,
+};
 pub(crate) use pdf_toc::generate_pdf_toc;
 pub use rewrite::RewriteBookSource;
 pub(crate) use search::section_title;
@@ -40,6 +45,7 @@ pub use translation::{BlockTranslation, TranslationBlockInput, TranslationBookSo
 
 const SETTINGS_FILE: &str = "plugins.json";
 const AI_CREDENTIAL_SERVICE: &str = "Rebook AI";
+const PDF_OCR_CREDENTIAL_SERVICE: &str = "Rebook PDF OCR";
 const DEFAULT_PROVIDER_ID: &str = "openai";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_CHAT_MAX_TOOL_STEPS: u16 = 24;
@@ -53,6 +59,27 @@ pub(crate) const CHAT_HISTORY_TURNS_MAX: u16 = 50;
 pub(crate) const TARGET_LANGUAGE_INTERFACE: &str = "interface";
 pub(crate) const TARGET_LANGUAGE_SIMPLIFIED_CHINESE: &str = "zh-CN";
 pub(crate) const TARGET_LANGUAGE_ENGLISH: &str = "en";
+pub(crate) const PADDLE_OCR_JOBS_URL: &str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs";
+pub(crate) const MINERU_API_URL: &str = "https://mineru.net/api/v4";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PdfOcrProviderKind {
+    #[default]
+    PaddleOcr,
+    MinerU,
+}
+
+impl PdfOcrProviderKind {
+    pub(crate) const ALL: [Self; 2] = [Self::PaddleOcr, Self::MinerU];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::PaddleOcr => "PaddleOCR",
+            Self::MinerU => "MinerU",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -154,6 +181,14 @@ pub struct PluginSettings {
     pub ocr_enabled: bool,
     pub ocr_provider: String,
     pub ocr_model: String,
+    pub pdf_ocr_enabled: bool,
+    pub pdf_ocr_provider: PdfOcrProviderKind,
+    pub paddle_ocr_model: String,
+    #[serde(skip)]
+    pub paddle_ocr_token: String,
+    pub mineru_model: String,
+    #[serde(skip)]
+    pub mineru_token: String,
     pub translation_provider: String,
     pub translation_model: String,
     pub target_language: String,
@@ -180,6 +215,12 @@ impl Default for PluginSettings {
             ocr_enabled: true,
             ocr_provider: DEFAULT_PROVIDER_ID.into(),
             ocr_model: DEFAULT_MODEL.into(),
+            pdf_ocr_enabled: false,
+            pdf_ocr_provider: PdfOcrProviderKind::PaddleOcr,
+            paddle_ocr_model: "PaddleOCR-VL-1.6".into(),
+            paddle_ocr_token: String::new(),
+            mineru_model: "vlm".into(),
+            mineru_token: String::new(),
             translation_provider: DEFAULT_PROVIDER_ID.into(),
             translation_model: DEFAULT_MODEL.into(),
             target_language: TARGET_LANGUAGE_INTERFACE.into(),
@@ -205,6 +246,7 @@ impl PluginSettings {
         settings.migrate_legacy();
         settings.normalize();
         settings.load_api_keys()?;
+        settings.load_pdf_ocr_tokens()?;
         if let Ok(value) = env::var("REBOOK_AI_BASE_URL")
             && !value.trim().is_empty()
             && let Some(provider) = settings.providers.first_mut()
@@ -247,7 +289,8 @@ impl PluginSettings {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "插件设置路径没有父目录"))?;
         fs::create_dir_all(parent)?;
         write_json_atomic(&path, &settings)?;
-        settings.save_api_keys()
+        settings.save_api_keys()?;
+        settings.save_pdf_ocr_tokens()
     }
 
     pub fn normalize(&mut self) {
@@ -303,6 +346,13 @@ impl PluginSettings {
             .chat_history_turns
             .clamp(CHAT_HISTORY_TURNS_MIN, CHAT_HISTORY_TURNS_MAX);
         self.target_language = normalize_target_language(&self.target_language);
+        if self.paddle_ocr_model.trim().is_empty() {
+            self.paddle_ocr_model = "PaddleOCR-VL-1.6".into();
+        }
+        self.mineru_model = match self.mineru_model.trim() {
+            "pipeline" => "pipeline".into(),
+            _ => "vlm".into(),
+        };
     }
 
     pub fn add_provider(&mut self) {
@@ -477,6 +527,42 @@ impl PluginSettings {
         }
         Ok(())
     }
+
+    fn load_pdf_ocr_tokens(&mut self) -> io::Result<()> {
+        for (account, destination) in [
+            ("paddle-ocr", &mut self.paddle_ocr_token),
+            ("mineru", &mut self.mineru_token),
+        ] {
+            match Entry::new(PDF_OCR_CREDENTIAL_SERVICE, account)
+                .map_err(io::Error::other)?
+                .get_password()
+            {
+                Ok(token) => *destination = token,
+                Err(keyring::Error::NoEntry) => {}
+                Err(error) => return Err(io::Error::other(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn save_pdf_ocr_tokens(&self) -> io::Result<()> {
+        for (account, token) in [
+            ("paddle-ocr", self.paddle_ocr_token.trim()),
+            ("mineru", self.mineru_token.trim()),
+        ] {
+            let entry =
+                Entry::new(PDF_OCR_CREDENTIAL_SERVICE, account).map_err(io::Error::other)?;
+            if token.is_empty() {
+                match entry.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => {}
+                    Err(error) => return Err(io::Error::other(error)),
+                }
+            } else {
+                entry.set_password(token).map_err(io::Error::other)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn ai_credential_entry(provider_id: &str) -> io::Result<Entry> {
@@ -536,6 +622,8 @@ mod tests {
 
         assert!(!json.contains("top-secret"));
         assert!(!json.contains("api_key"));
+        assert!(!json.contains("paddle_ocr_url"));
+        assert!(!json.contains("mineru_url"));
     }
 
     #[test]

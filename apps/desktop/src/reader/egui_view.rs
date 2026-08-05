@@ -13,7 +13,7 @@ use super::{
     AnnotationDraft, AssistantPanel, DesktopReader, GeneratedTocDraft, ImagePointerState,
     ImagePressCandidate, ReaderOverlay, ScrollSectionLayout, SelectedImage, SidebarTab,
 };
-use crate::plugins::{ChatCommand, ChatRole, chat_command_suggestions};
+use crate::plugins::{ChatCommand, ChatRole, PdfOcrViewMode, chat_command_suggestions};
 use crate::preferences::{AppLanguage, AppTheme};
 use crate::settings::ReaderSettingsChange;
 use crate::ui::{
@@ -84,6 +84,7 @@ struct AssistantComposerRender {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReaderFramePlan {
     pub(crate) rect: Rect,
+    pub(crate) scene_id: u64,
     pub(crate) scene_revision: u64,
     pub(crate) background: peniko::Color,
 }
@@ -254,11 +255,11 @@ fn page_image_left(page: &rebook_renderer::PageDisplayList) -> Option<f32> {
 
 fn scroll_chapter_content_left(
     layout: &ScrollSectionLayout,
-    format: rebook_formats::BookFormat,
+    align_to_pdf_page: bool,
     viewport_width: f32,
     style: &ReaderStyle,
 ) -> f32 {
-    if format == rebook_formats::BookFormat::Pdf
+    if align_to_pdf_page
         && let Some(left) = layout
             .pages
             .first()
@@ -267,6 +268,10 @@ fn scroll_chapter_content_left(
         return left;
     }
     reading_content_left(viewport_width, style)
+}
+
+fn uses_pdf_page_alignment(format: rebook_formats::BookFormat, ocr_mode: PdfOcrViewMode) -> bool {
+    format == rebook_formats::BookFormat::Pdf && ocr_mode == PdfOcrViewMode::Original
 }
 
 impl DesktopReader {
@@ -366,6 +371,7 @@ impl DesktopReader {
 
         ReaderFramePlan {
             rect: page_rect,
+            scene_id: self.scene_id,
             scene_revision: self.scene_revision,
             background: peniko::Color::from_rgba8(
                 background.red,
@@ -444,7 +450,7 @@ impl DesktopReader {
                 let left = content_rect.left()
                     + scroll_chapter_content_left(
                         &layout,
-                        self.format,
+                        uses_pdf_page_alignment(self.format, self.pdf_ocr.mode),
                         viewport.width(),
                         &self.reader.style(),
                     );
@@ -704,7 +710,8 @@ impl DesktopReader {
                 ui.set_min_height(TOOLBAR_HEIGHT - f32::from(SIDEBAR_PADDING) * 2.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    let left_control_count = if self.ui.sidebar_open { 2.0 } else { 3.0 };
+                    let left_control_count = if self.ui.sidebar_open { 2.0 } else { 3.0 }
+                        + self.pdf_ocr_toolbar_control_count();
                     let left_controls_width = TOOLBAR_CONTROL_SIZE * left_control_count;
                     // Keep the first toolbar action clear of the sidebar divider.
                     // Only the spacer after the action group may collapse on narrow layouts.
@@ -734,6 +741,7 @@ impl DesktopReader {
                         {
                             self.toggle_translation();
                         }
+                        self.pdf_ocr_toolbar_controls(ui);
                     } else {
                         ui.allocate_space(Vec2::new(left_controls_width, TOOLBAR_CONTROL_SIZE));
                     }
@@ -780,9 +788,61 @@ impl DesktopReader {
         }
     }
 
+    fn pdf_ocr_toolbar_control_count(&self) -> f32 {
+        if self.format != rebook_formats::BookFormat::Pdf {
+            return 0.0;
+        }
+        let recognize = if self.plugin_settings.pdf_ocr_enabled {
+            1.0
+        } else {
+            0.0
+        };
+        let switch = if self.pdf_ocr.available { 1.0 } else { 0.0 };
+        recognize + switch
+    }
+
+    fn pdf_ocr_toolbar_controls(&mut self, ui: &mut egui::Ui) {
+        if self.format != rebook_formats::BookFormat::Pdf {
+            return;
+        }
+        if self.plugin_settings.pdf_ocr_enabled {
+            let label = if self.pdf_ocr.task.is_pending() {
+                self.pdf_ocr.progress.as_str()
+            } else if self.pdf_ocr.available {
+                self.language
+                    .text("重新识别 PDF 正文", "Recognize PDF text again")
+            } else {
+                self.language.text("识别 PDF 正文", "Recognize PDF text")
+            };
+            let recognize = ui
+                .add_enabled_ui(!self.pdf_ocr.task.is_pending(), |ui| {
+                    icon_button(ui, Icon::ScanText)
+                })
+                .inner
+                .on_hover_text(label);
+            if recognize.clicked() {
+                self.start_pdf_ocr();
+            }
+        }
+        if self.pdf_ocr.available
+            && selectable_icon_button(ui, Icon::Type, self.pdf_ocr.mode == PdfOcrViewMode::Reflow)
+                .on_hover_text(if self.pdf_ocr.mode == PdfOcrViewMode::Reflow {
+                    self.language.text("切换到原始 PDF", "Show original PDF")
+                } else {
+                    self.language.text("切换到 OCR 版式", "Show OCR reflow")
+                })
+                .clicked()
+            && self.toggle_pdf_ocr_view()
+        {
+            // The reopen request is consumed at the beginning of the next UI frame.
+            // Explicitly wake it so switching does not wait for another input event.
+            ui.ctx().request_repaint();
+        }
+    }
+
     fn toolbar_content_left(&mut self, toolbar_width: f32) -> f32 {
         let default = reading_content_left(toolbar_width, &self.reader.style());
-        if self.format != rebook_formats::BookFormat::Pdf {
+        if !uses_pdf_page_alignment(self.format, self.pdf_ocr.mode) {
             return default;
         }
         self.reader
@@ -2362,6 +2422,26 @@ impl DesktopReader {
                             ui.label(RichText::new(error).color(Color32::WHITE));
                         });
                 });
+        } else if self.pdf_ocr.task.is_pending() {
+            egui::Area::new("pdf-ocr-progress".into())
+                .order(egui::Order::Tooltip)
+                .anchor(egui::Align2::RIGHT_TOP, [-18.0, 62.0])
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .fill(palette().accent_soft)
+                        .stroke(egui::Stroke::new(1.0, palette().accent_border))
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(14, 11))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                ui.add(egui::Spinner::new().size(15.0));
+                                ui.label(
+                                    RichText::new(&self.pdf_ocr.progress).color(palette().accent),
+                                );
+                            });
+                        });
+                });
         } else if let Some(notice) = &self.notice {
             egui::Area::new("reader-notice".into())
                 .order(egui::Order::Tooltip)
@@ -3316,6 +3396,22 @@ mod reference_suggestion_label_tests {
 
         assert!((toolbar_title_x(toolbar, 140.0, false) - 160.0).abs() <= f32::EPSILON);
         assert!((toolbar_title_x(toolbar, 140.0, true) - 520.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn only_original_pdf_layout_tracks_the_page_image_left_edge() {
+        assert!(uses_pdf_page_alignment(
+            rebook_formats::BookFormat::Pdf,
+            PdfOcrViewMode::Original,
+        ));
+        assert!(!uses_pdf_page_alignment(
+            rebook_formats::BookFormat::Pdf,
+            PdfOcrViewMode::Reflow,
+        ));
+        assert!(!uses_pdf_page_alignment(
+            rebook_formats::BookFormat::Epub,
+            PdfOcrViewMode::Original,
+        ));
     }
 
     #[test]

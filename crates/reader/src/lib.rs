@@ -1359,6 +1359,16 @@ impl ReaderSession {
     /// active section. This is used by non-persistent document overlays such as
     /// AI-assisted block rewrites.
     pub fn refresh_source(&mut self) -> Result<ReaderSnapshot, ReaderError> {
+        self.refresh_source_with_style(self.style.clone())
+    }
+
+    /// Rebuilds the active source and applies pagination-affecting style changes
+    /// in one pass. This avoids compiling the current section twice when a
+    /// source mode and its page geometry change together.
+    pub fn refresh_source_with_style(
+        &mut self,
+        style: ReaderStyle,
+    ) -> Result<ReaderSnapshot, ReaderError> {
         let fraction = page_fraction(self.current_page, self.current_page_count());
         let repository = Arc::new(SectionRepository::new(Arc::clone(&self.source)));
         let section = repository.load(self.current_section)?;
@@ -1374,7 +1384,7 @@ impl ReaderSession {
             section,
             key,
             self.viewport,
-            &self.style,
+            &style,
             &mut self.layout_engine,
             &self.display_compiler,
         )?;
@@ -1390,6 +1400,7 @@ impl ReaderSession {
         self.prefetch_failures.clear();
         self.cache.clear();
         self.lru.clear();
+        self.style = style;
         self.current_segment = segment_index;
         self.cache.insert(key, Arc::new(segment));
         self.touch(key);
@@ -1975,13 +1986,22 @@ fn compile_segment(
                 .pages
                 .iter()
                 .position(|page| {
-                    page.items.iter().any(|item| {
-                        let source = match item {
-                            PageItem::Text(placement) => placement.source.as_ref(),
-                            PageItem::Image(placement) => placement.source.as_ref(),
-                            PageItem::Separator(_) => None,
-                        };
-                        source.is_some_and(|range| source_range_contains(range, &anchor.source))
+                    page.items.iter().any(|item| match item {
+                        PageItem::Text(placement) => placement
+                            .source
+                            .as_ref()
+                            .is_some_and(|range| source_range_contains(range, &anchor.source)),
+                        PageItem::Table(placement) => placement.cells.iter().any(|cell| {
+                            cell.text
+                                .as_ref()
+                                .and_then(|text| text.source.as_ref())
+                                .is_some_and(|range| source_range_contains(range, &anchor.source))
+                        }),
+                        PageItem::Image(placement) => placement
+                            .source
+                            .as_ref()
+                            .is_some_and(|range| source_range_contains(range, &anchor.source)),
+                        PageItem::Separator(_) => false,
                     })
                 })
                 .map(|page| (anchor.fragment.clone(), page))
@@ -2172,6 +2192,7 @@ fn split_inline_content(content: Vec<Inline>) -> Vec<(Vec<Inline>, usize)> {
                     remaining = rest;
                 }
             }
+            Inline::Math(run) => current.push(Inline::Math(run)),
         }
     }
     flush(&mut current, &mut current_len, &mut parts);
@@ -2215,6 +2236,7 @@ fn inline_content_len(content: &[Inline]) -> usize {
         .iter()
         .map(|inline| match inline {
             Inline::Text(run) => run.text.chars().count(),
+            Inline::Math(_) => 0,
             Inline::Break => 1,
         })
         .sum()
@@ -2223,6 +2245,12 @@ fn inline_content_len(content: &[Inline]) -> usize {
 fn block_text_len(block: &Block) -> usize {
     match block {
         Block::Text(block) => inline_content_len(&block.content),
+        Block::Table(table) => table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .map(|cell| inline_content_len(&cell.text.content))
+            .sum(),
         Block::Image(_) | Block::Separator | Block::PageBreak => 0,
     }
 }
@@ -2253,6 +2281,7 @@ fn append_visible_text_fragments(
 fn block_source(block: &Block) -> Option<&SourceRange> {
     match block {
         Block::Text(block) => block.source.as_ref(),
+        Block::Table(block) => block.source.as_ref(),
         Block::Image(block) => block.source.as_ref(),
         Block::Separator | Block::PageBreak => None,
     }
@@ -3547,7 +3576,7 @@ mod tests {
             .filter_map(|item| match item {
                 PageItem::Text(placement) => placement.source.as_ref(),
                 PageItem::Image(placement) => placement.source.as_ref(),
-                PageItem::Separator(_) => None,
+                PageItem::Table(_) | PageItem::Separator(_) => None,
             })
             .collect::<Vec<_>>();
         assert!(

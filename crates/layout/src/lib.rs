@@ -6,19 +6,21 @@ use std::sync::Arc;
 
 use image::ImageError;
 use parley::{
-    Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontWeight, Layout,
-    LayoutContext, LineHeight, StyleProperty,
+    Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontWeight,
+    InlineBox as ParleyInlineBox, InlineBoxKind, Layout, LayoutContext, LineHeight, StyleProperty,
 };
 use rebook_publication::{
-    Block, BookSource, FixedPageTextLayer, FixedPageTextRect, ImageStyle, Inline, PublicationError,
-    PublicationUrl, RenditionLayout, Rgba, Section, SourceRange, TextAlignment, TextBlock,
-    TextBlockKind, TextRun, TextStyle,
+    Block, BookSource, FixedPageTextLayer, FixedPageTextRect, ImageStyle, Inline, MathRun,
+    PublicationError, PublicationUrl, RenditionLayout, Rgba, Section, SourceRange, TableBlock,
+    TextAlignment, TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const DEFAULT_COLUMN_GAP: f32 = 36.0;
 const IMAGE_BLOCK_GAP: f32 = 14.0;
+const TABLE_BLOCK_GAP: f32 = 14.0;
+const TABLE_CELL_PADDING: f32 = 6.0;
 const MIN_COLUMN_WIDTH: f32 = 360.0;
 const MAX_COLUMN_WIDTH: f32 = 960.0;
 const DEFAULT_TOP_MARGIN: f32 = 0.0;
@@ -271,11 +273,13 @@ pub struct PageLayout {
 /// Positioned page content.
 pub enum PageItem {
     Text(TextPlacement),
+    Table(TablePlacement),
     Image(ImagePlacement),
     Separator(SeparatorPlacement),
 }
 
 /// A line slice from a shaped paragraph.
+#[derive(Clone)]
 pub struct TextPlacement {
     pub layout: Arc<Layout<TextBrush>>,
     /// UTF-8 text shaped by Parley. Kept alongside the layout so retained
@@ -288,6 +292,36 @@ pub struct TextPlacement {
     pub origin_x: f32,
     pub origin_y: f32,
     pub source: Option<SourceRange>,
+    /// Formula rasters positioned by Parley inline boxes in this text layout.
+    pub inline_images: Arc<[InlineImage]>,
+}
+
+/// One positioned table chunk. Large tables can produce one chunk per page.
+pub struct TablePlacement {
+    pub cells: Vec<TableCellPlacement>,
+    pub y: f32,
+    pub height: f32,
+    pub border: Rgba,
+    pub header_fill: Rgba,
+}
+
+/// One positioned table cell with selectable text content.
+pub struct TableCellPlacement {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub header: bool,
+    pub text: Option<TextPlacement>,
+}
+
+/// One raster painted at a matching Parley inline-box position.
+#[derive(Clone)]
+pub struct InlineImage {
+    pub id: u64,
+    pub image: RasterImage,
+    pub width: f32,
+    pub height: f32,
 }
 
 /// Decoded RGBA image ready for upload by the renderer.
@@ -332,6 +366,7 @@ pub struct SeparatorPlacement {
 pub struct LayoutEngine {
     font_context: FontContext,
     layout_context: LayoutContext<TextBrush>,
+    svg_options: resvg::usvg::Options<'static>,
 }
 
 impl Default for LayoutEngine {
@@ -342,9 +377,12 @@ impl Default for LayoutEngine {
 
 impl LayoutEngine {
     pub fn new() -> Self {
+        let mut svg_options = resvg::usvg::Options::default();
+        svg_options.fontdb_mut().load_system_fonts();
         Self {
             font_context: FontContext::new(),
             layout_context: LayoutContext::new(),
+            svg_options,
         }
     }
 
@@ -429,6 +467,10 @@ impl LayoutEngine {
                         let prepared = self.shape_text(block, reader_style, content_width);
                         paginator.push_text(&prepared, block)?;
                     }
+                    Block::Table(table) => {
+                        let prepared = self.shape_table(table, reader_style, content_width);
+                        paginator.push_table(&prepared);
+                    }
                     Block::Image(image) => {
                         let raster = if let Some(raster) = source.raster_resource(&image.href)? {
                             RasterImage {
@@ -479,6 +521,98 @@ impl LayoutEngine {
         self.shape_text_with_min_width(block, reader_style, content_width, 40.0)
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "table spans are clamped to 64 and publication rows are bounded by input limits"
+    )]
+    fn shape_table(
+        &mut self,
+        table: &TableBlock,
+        reader_style: &ReaderStyle,
+        content_width: f32,
+    ) -> PreparedTable {
+        let row_count = table.rows.len();
+        let mut occupied = vec![Vec::<bool>::new(); row_count];
+        let mut grid_cells = Vec::new();
+        let mut column_count = 0;
+        for (row_index, row) in table.rows.iter().enumerate() {
+            let mut column = 0;
+            for cell in &row.cells {
+                while occupied[row_index].get(column).copied().unwrap_or(false) {
+                    column += 1;
+                }
+                let column_span = usize::from(cell.column_span.max(1));
+                let row_span = usize::from(cell.row_span.max(1)).min(row_count - row_index);
+                let end_column = column.saturating_add(column_span);
+                for row in occupied.iter_mut().skip(row_index).take(row_span) {
+                    row.resize(row.len().max(end_column), false);
+                    row[column..end_column].fill(true);
+                }
+                column_count = column_count.max(end_column);
+                grid_cells.push((row_index, row_span, column, column_span, cell));
+                column = end_column;
+            }
+        }
+        if column_count == 0 || row_count == 0 {
+            return PreparedTable::default();
+        }
+        let column_width = content_width / column_count as f32;
+        let minimum_row_height = reader_style.typography.font_size.mul_add(1.3, 12.0);
+        let mut row_heights = vec![minimum_row_height; row_count];
+        let mut cells = Vec::with_capacity(grid_cells.len());
+        for (row, row_span, column, column_span, cell) in grid_cells {
+            let mut block = cell.text.clone();
+            if cell.header {
+                for inline in &mut block.content {
+                    if let Inline::Text(run) = inline {
+                        run.style.bold = true;
+                    }
+                }
+            }
+            let cell_width = column_width * column_span as f32;
+            let text_width = (cell_width - TABLE_CELL_PADDING * 2.0).max(20.0);
+            let text = self.shape_text_with_min_width(&block, reader_style, text_width, 8.0);
+            let required_height = prepared_text_height(&text) + TABLE_CELL_PADDING * 2.0;
+            if row_span == 1 {
+                row_heights[row] = row_heights[row].max(required_height);
+            }
+            cells.push(PreparedTableCell {
+                row,
+                row_span,
+                column,
+                column_span,
+                header: cell.header,
+                source: block.source,
+                text,
+                required_height,
+            });
+        }
+        for cell in cells.iter().filter(|cell| cell.row_span > 1) {
+            let current = row_heights[cell.row..cell.row + cell.row_span]
+                .iter()
+                .sum::<f32>();
+            if cell.required_height > current {
+                let addition = (cell.required_height - current) / cell.row_span as f32;
+                for height in &mut row_heights[cell.row..cell.row + cell.row_span] {
+                    *height += addition;
+                }
+            }
+        }
+        PreparedTable {
+            column_width,
+            row_heights,
+            cells,
+            border: Rgba {
+                alpha: 96,
+                ..reader_style.foreground
+            },
+            header_fill: Rgba {
+                alpha: 22,
+                ..reader_style.foreground
+            },
+        }
+    }
+
     fn shape_text_with_min_width(
         &mut self,
         block: &TextBlock,
@@ -486,13 +620,19 @@ impl LayoutEngine {
         content_width: f32,
         minimum_width: f32,
     ) -> PreparedText {
-        let (text, spans, source_text_start) = flatten_text(block, reader_style.foreground);
         let start_offset = (block.style.indent
             + block.style.margin_start
             + content_width * block.style.margin_start_fraction)
             .clamp(0.0, (content_width - minimum_width).max(0.0));
         let available_width = (content_width - start_offset).max(minimum_width);
         let typography = &reader_style.typography;
+        let (text, spans, inline_images, source_text_start) = prepare_inline_content(
+            block,
+            reader_style.foreground,
+            typography,
+            available_width,
+            &self.svg_options,
+        );
         let font_stack = if block.kind == TextBlockKind::Preformatted {
             typography.monospace_stack()
         } else {
@@ -546,6 +686,16 @@ impl LayoutEngine {
             }
         }
 
+        for image in &inline_images {
+            builder.push_inline_box(ParleyInlineBox {
+                id: image.id,
+                kind: InlineBoxKind::InFlow,
+                index: image.index,
+                width: image.width,
+                height: image.height,
+            });
+        }
+
         let mut layout = builder.build(&text);
         layout.break_all_lines(Some(available_width));
         let alignment = match block.style.align {
@@ -560,6 +710,16 @@ impl LayoutEngine {
             text: text.into(),
             source_text_start,
             start_offset,
+            inline_images: inline_images
+                .into_iter()
+                .map(|image| InlineImage {
+                    id: image.id,
+                    image: image.image,
+                    width: image.width,
+                    height: image.height,
+                })
+                .collect::<Vec<_>>()
+                .into(),
         }
     }
 
@@ -674,6 +834,63 @@ struct PreparedText {
     text: Arc<str>,
     source_text_start: usize,
     start_offset: f32,
+    inline_images: Arc<[InlineImage]>,
+}
+
+struct PreparedTable {
+    column_width: f32,
+    row_heights: Vec<f32>,
+    cells: Vec<PreparedTableCell>,
+    border: Rgba,
+    header_fill: Rgba,
+}
+
+impl Default for PreparedTable {
+    fn default() -> Self {
+        Self {
+            column_width: 0.0,
+            row_heights: Vec::new(),
+            cells: Vec::new(),
+            border: Rgba::BLACK,
+            header_fill: Rgba {
+                alpha: 0,
+                ..Rgba::BLACK
+            },
+        }
+    }
+}
+
+fn table_break_is_safe(table: &PreparedTable, row: usize) -> bool {
+    row == table.row_heights.len()
+        || !table
+            .cells
+            .iter()
+            .any(|cell| cell.row < row && cell.row + cell.row_span > row)
+}
+
+fn next_safe_table_break(table: &PreparedTable, row_start: usize) -> usize {
+    (row_start + 1..=table.row_heights.len())
+        .find(|row| table_break_is_safe(table, *row))
+        .unwrap_or(table.row_heights.len())
+}
+
+struct PreparedTableCell {
+    row: usize,
+    row_span: usize,
+    column: usize,
+    column_span: usize,
+    header: bool,
+    source: Option<SourceRange>,
+    text: PreparedText,
+    required_height: f32,
+}
+
+struct PreparedInlineImage {
+    id: u64,
+    index: usize,
+    image: RasterImage,
+    width: f32,
+    height: f32,
 }
 
 struct FixedPageReplacementRequest {
@@ -717,9 +934,16 @@ fn prepared_text_height(prepared: &PreparedText) -> f32 {
     (last.metrics().block_max_coord - first.metrics().block_min_coord).max(0.0)
 }
 
-fn flatten_text(block: &TextBlock, fallback_color: Rgba) -> (String, Vec<StyledRange>, usize) {
+fn prepare_inline_content(
+    block: &TextBlock,
+    fallback_color: Rgba,
+    typography: &ReaderTypography,
+    available_width: f32,
+    svg_options: &resvg::usvg::Options<'_>,
+) -> (String, Vec<StyledRange>, Vec<PreparedInlineImage>, usize) {
     let mut text = String::new();
     let mut spans = Vec::new();
+    let mut inline_images = Vec::new();
     let prefix = match block.kind {
         TextBlockKind::ListItem {
             ordered: true,
@@ -755,10 +979,105 @@ fn flatten_text(block: &TextBlock, fallback_color: Rgba) -> (String, Vec<StyledR
                     style,
                 });
             }
+            Inline::Math(run) => {
+                let id = u64::try_from(inline_images.len()).unwrap_or(u64::MAX);
+                if let Ok(image) = rasterize_formula(
+                    run,
+                    typography,
+                    fallback_color,
+                    available_width,
+                    svg_options,
+                ) {
+                    inline_images.push(PreparedInlineImage {
+                        id,
+                        index: text.len(),
+                        width: image.1,
+                        height: image.2,
+                        image: image.0,
+                    });
+                } else {
+                    let start = text.len();
+                    text.push('$');
+                    text.push_str(&run.latex);
+                    text.push('$');
+                    spans.push(StyledRange {
+                        range: start..text.len(),
+                        style: TextStyle {
+                            size_scale: run.size_scale,
+                            color: fallback_color,
+                            ..TextStyle::default()
+                        },
+                    });
+                }
+            }
             Inline::Break => text.push('\n'),
         }
     }
-    (text, spans, source_text_start)
+    (text, spans, inline_images, source_text_start)
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "formula dimensions are clamped to bounded reader viewport pixels"
+)]
+fn rasterize_formula(
+    run: &MathRun,
+    typography: &ReaderTypography,
+    color: Rgba,
+    available_width: f32,
+    svg_options: &resvg::usvg::Options<'_>,
+) -> Result<(RasterImage, f32, f32), String> {
+    use resvg::tiny_skia::Pixmap;
+    use resvg::usvg::{Transform, Tree};
+
+    const RASTER_SCALE: f32 = 2.0;
+    const PADDING: f32 = 1.5;
+    let semantic_scale = if run.display { 1.12 } else { 1.0 };
+    let font_size = (typography.font_size * run.size_scale.clamp(0.5, 3.0) * semantic_scale)
+        .max(typography.minimum_font_size);
+    let text_color = format!("#{:02x}{:02x}{:02x}", color.red, color.green, color.blue);
+    let rendered = rebook_math::math::render_math(&run.latex, font_size, &text_color, run.display)?;
+    let source_width = (rendered.width + PADDING * 2.0).max(1.0);
+    let source_height = (rendered.ascent + rendered.descent + PADDING * 2.0).max(1.0);
+    let width_scale = (available_width / source_width).min(1.0);
+    let display_width = (source_width * width_scale).max(1.0);
+    let display_height = (source_height * width_scale).max(1.0);
+    let view_y = -rendered.ascent - PADDING;
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{} {} {} {}" width="{}" height="{}"><g transform="translate({}, 0)">{}</g></svg>"#,
+        -PADDING,
+        view_y,
+        source_width,
+        source_height,
+        source_width,
+        source_height,
+        PADDING,
+        rendered.svg_fragment
+    );
+    let tree = Tree::from_data(svg.as_bytes(), svg_options).map_err(|error| error.to_string())?;
+    let pixel_width = (display_width * RASTER_SCALE).ceil().max(1.0) as u32;
+    let pixel_height = (display_height * RASTER_SCALE).ceil().max(1.0) as u32;
+    let mut pixmap = Pixmap::new(pixel_width, pixel_height)
+        .ok_or_else(|| format!("failed to allocate formula raster {pixel_width}x{pixel_height}"))?;
+    resvg::render(
+        &tree,
+        Transform::from_scale(
+            pixel_width as f32 / source_width,
+            pixel_height as f32 / source_height,
+        ),
+        &mut pixmap.as_mut(),
+    );
+    Ok((
+        RasterImage {
+            width: pixel_width,
+            height: pixel_height,
+            pixels: pixmap.data().to_vec().into(),
+        },
+        display_width,
+        display_height,
+    ))
 }
 
 struct Paginator {
@@ -846,6 +1165,7 @@ impl Paginator {
                 origin_x: self.column_left() + prepared.start_offset,
                 origin_y: self.cursor_y - first_top,
                 source: block.source.clone(),
+                inline_images: Arc::clone(&prepared.inline_images),
             }));
             self.column_has_content = true;
             self.cursor_y += slice_height;
@@ -856,6 +1176,114 @@ impl Paginator {
         }
         self.add_spacing(block.style.margin_after);
         Ok(())
+    }
+
+    fn push_table(&mut self, table: &PreparedTable) {
+        if table.row_heights.is_empty() || table.column_width <= 0.0 {
+            return;
+        }
+        self.ensure_minimum_spacing(TABLE_BLOCK_GAP);
+        let mut row_start = 0;
+        while row_start < table.row_heights.len() {
+            let remaining = self.bottom - self.cursor_y;
+            let mut height = 0.0;
+            let mut last_safe_break = None;
+            for row_end in row_start + 1..=table.row_heights.len() {
+                let candidate = height + table.row_heights[row_end - 1];
+                if candidate > remaining && row_end > row_start + 1 {
+                    break;
+                }
+                height = candidate;
+                if table_break_is_safe(table, row_end) {
+                    last_safe_break = Some((row_end, height));
+                }
+                if candidate > remaining {
+                    break;
+                }
+            }
+            let Some((row_end, chunk_height)) = last_safe_break else {
+                if self.column_has_content {
+                    self.advance_column();
+                    continue;
+                }
+                let row_end = next_safe_table_break(table, row_start);
+                let chunk_height = table.row_heights[row_start..row_end].iter().sum();
+                self.push_table_chunk(table, row_start, row_end, chunk_height);
+                row_start = row_end;
+                if row_start < table.row_heights.len() {
+                    self.advance_column();
+                }
+                continue;
+            };
+            if chunk_height > remaining && self.column_has_content {
+                self.advance_column();
+                continue;
+            }
+            self.push_table_chunk(table, row_start, row_end, chunk_height);
+            row_start = row_end;
+            if row_start < table.row_heights.len() {
+                self.advance_column();
+            }
+        }
+        self.add_spacing(TABLE_BLOCK_GAP);
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "resolved grid coordinates come from bounded table spans and row content"
+    )]
+    fn push_table_chunk(
+        &mut self,
+        table: &PreparedTable,
+        row_start: usize,
+        row_end: usize,
+        height: f32,
+    ) {
+        let table_y = self.cursor_y;
+        let mut row_offsets = Vec::with_capacity(row_end - row_start + 1);
+        row_offsets.push(0.0);
+        for row_height in &table.row_heights[row_start..row_end] {
+            row_offsets.push(row_offsets.last().copied().unwrap_or(0.0) + row_height);
+        }
+        let cells = table
+            .cells
+            .iter()
+            .filter(|cell| cell.row >= row_start && cell.row + cell.row_span <= row_end)
+            .map(|cell| {
+                let local_row = cell.row - row_start;
+                let cell_x = self.column_left() + table.column_width * cell.column as f32;
+                let cell_y = table_y + row_offsets[local_row];
+                let cell_width = table.column_width * cell.column_span as f32;
+                let cell_height = row_offsets[local_row + cell.row_span] - row_offsets[local_row];
+                let text = cell.text.layout.get(0).map(|first| TextPlacement {
+                    layout: Arc::clone(&cell.text.layout),
+                    text: Arc::clone(&cell.text.text),
+                    source_text_start: cell.text.source_text_start,
+                    lines: 0..cell.text.layout.len(),
+                    origin_x: cell_x + TABLE_CELL_PADDING + cell.text.start_offset,
+                    origin_y: cell_y + TABLE_CELL_PADDING - first.metrics().block_min_coord,
+                    source: cell.source.clone(),
+                    inline_images: Arc::clone(&cell.text.inline_images),
+                });
+                TableCellPlacement {
+                    x: cell_x,
+                    y: cell_y,
+                    width: cell_width,
+                    height: cell_height,
+                    header: cell.header,
+                    text,
+                }
+            })
+            .collect();
+        self.items.push(PageItem::Table(TablePlacement {
+            cells,
+            y: table_y,
+            height,
+            border: table.border,
+            header_fill: table.header_fill,
+        }));
+        self.column_has_content = true;
+        self.cursor_y += height;
     }
 
     #[allow(
@@ -962,6 +1390,7 @@ impl Paginator {
                 origin_x: request.rect.x + padding,
                 origin_y: request.rect.y + padding - first.metrics().block_min_coord,
                 source: request.source,
+                inline_images: Arc::clone(&prepared.inline_images),
             },
         };
         image
@@ -983,6 +1412,7 @@ impl Paginator {
                 .and_then(|line| text.layout.get(line))
                 .map(|line| text.origin_y + line.metrics().block_max_coord),
             PageItem::Image(image) => Some(image.y + image.height),
+            PageItem::Table(table) => Some(table.y + table.height),
             PageItem::Separator(separator) => Some(separator.y + 1.0),
         }) else {
             return;
@@ -1225,7 +1655,7 @@ mod tests {
     use rebook_publication::{
         Book, FixedPageTextReplacement, FixedPageTextReplacementSegment, FixedPageTextSpan,
         ImageBlock, ImageLength, Metadata, PublicationId, PublicationUrl, RasterResource,
-        RenditionLayout, Resource, SourceAnchor, SpineItemId, TocEntry,
+        RenditionLayout, Resource, SourceAnchor, SpineItemId, TableCell, TableRow, TocEntry,
     };
 
     struct EmptySource {
@@ -1295,6 +1725,171 @@ mod tests {
     }
 
     #[test]
+    fn inline_math_is_laid_out_as_a_non_text_raster_box() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("math-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![Block::Text(TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![
+                    Inline::Text(TextRun {
+                        text: "Energy ".into(),
+                        style: TextStyle::default(),
+                        link: None,
+                    }),
+                    Inline::Math(MathRun {
+                        latex: r"E=mc^2".into(),
+                        display: false,
+                        size_scale: 1.0,
+                    }),
+                ],
+                style: rebook_publication::BlockStyle::default(),
+                source: None,
+            })],
+            anchors: Vec::new(),
+        };
+
+        let layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                LayoutViewport::new(600, 400).unwrap(),
+                &ReaderStyle::default(),
+            )
+            .unwrap();
+        let formula_count = layout
+            .pages
+            .iter()
+            .flat_map(|page| page.items.iter())
+            .filter_map(|item| match item {
+                PageItem::Text(text) => Some(text.inline_images.len()),
+                PageItem::Table(_) | PageItem::Image(_) | PageItem::Separator(_) => None,
+            })
+            .sum::<usize>();
+        assert_eq!(formula_count, 1);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the table fixture verifies spans, formula layout, and pagination together"
+    )]
+    fn structured_tables_keep_spans_formulas_and_safe_page_breaks() {
+        let source = EmptySource {
+            book: Book {
+                id: PublicationId::new("table-test").unwrap(),
+                metadata: Metadata::default(),
+                cover: None,
+                sections: Vec::new(),
+                table_of_contents: Vec::new(),
+            },
+        };
+        let cell = |text: &str, column_span, row_span, header| TableCell {
+            text: TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun {
+                    text: text.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: rebook_publication::BlockStyle::default(),
+                source: None,
+            },
+            column_span,
+            row_span,
+            header,
+        };
+        let mut rows = vec![TableRow {
+            cells: vec![cell("Header", 2, 1, true)],
+        }];
+        rows.push(TableRow {
+            cells: vec![cell("Merged", 1, 2, false), cell("$", 1, 1, false)],
+        });
+        rows.push(TableRow {
+            cells: vec![TableCell {
+                text: TextBlock {
+                    kind: TextBlockKind::Paragraph,
+                    content: vec![Inline::Math(MathRun {
+                        latex: "E=mc^2".into(),
+                        display: false,
+                        size_scale: 1.0,
+                    })],
+                    style: rebook_publication::BlockStyle::default(),
+                    source: None,
+                },
+                column_span: 1,
+                row_span: 1,
+                header: false,
+            }],
+        });
+        rows.extend((0..12).map(|index| TableRow {
+            cells: vec![
+                cell(&format!("row {index}"), 1, 1, false),
+                cell("value", 1, 1, false),
+            ],
+        }));
+        let section = Section {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            blocks: vec![Block::Table(TableBlock { rows, source: None })],
+            anchors: Vec::new(),
+        };
+
+        let layout = LayoutEngine::new()
+            .layout_section(
+                &source,
+                &section,
+                LayoutViewport::new(600, 240).unwrap(),
+                &ReaderStyle::default(),
+            )
+            .unwrap();
+        let tables = layout
+            .pages
+            .iter()
+            .flat_map(|page| page.items.iter())
+            .filter_map(|item| match item {
+                PageItem::Table(table) => Some(table),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(tables.len() > 1, "long table should paginate");
+        let header = tables[0]
+            .cells
+            .iter()
+            .find(|cell| cell.header)
+            .expect("header cell should be retained");
+        let regular = tables
+            .iter()
+            .flat_map(|table| &table.cells)
+            .find(|cell| !cell.header && cell.width < header.width)
+            .expect("regular-width cell should exist");
+        assert!((header.width - regular.width * 2.0).abs() < 0.1);
+        assert!(tables.iter().any(|table| {
+            table.cells.iter().any(|cell| {
+                cell.text
+                    .as_ref()
+                    .is_some_and(|text| !text.inline_images.is_empty())
+            })
+        }));
+        assert!(tables.iter().all(|table| {
+            table
+                .cells
+                .iter()
+                .all(|cell| cell.y + cell.height <= table.y + table.height + 0.1)
+        }));
+    }
+
+    #[test]
     fn block_start_fraction_tracks_the_available_content_width() {
         let source = EmptySource {
             book: Book {
@@ -1344,7 +1939,7 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 PageItem::Text(text) => Some(text.origin_x),
-                PageItem::Image(_) | PageItem::Separator(_) => None,
+                PageItem::Table(_) | PageItem::Image(_) | PageItem::Separator(_) => None,
             })
             .collect::<Vec<_>>();
 

@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use peniko::{Blob, Color};
 use rebook_formats::{BookFormat, open_file as open_publication_file};
 use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode};
-use rebook_publication::{BookSource, Rgba, SourceRange};
+use rebook_publication::{BookSource, RenditionLayout, Rgba, SourceRange};
 use rebook_reader::{
     PageDirection, ReaderPosition, ReaderSectionPage, ReaderSelection, ReaderSession,
     ReaderSnapshot, ReaderTextHit, SelectionGranularity,
@@ -18,8 +19,8 @@ use crate::highlights::{HighlightStore, StoredHighlight};
 use crate::library::LibraryBook;
 use crate::plugins::{
     BlockTranslation, BookSearchResult, ChatReadingContext, ChatRequestKind, ChatResponse,
-    ChatTurn, PluginSettings, RewriteBookSource, TranslationBlockInput, TranslationBookSource,
-    TranslationMode,
+    ChatTurn, PdfOcrSourceController, PdfOcrViewMode, PluginSettings, RewriteBookSource,
+    TranslationBlockInput, TranslationBookSource, load_pdf_ocr_source,
 };
 use crate::preferences::{self, AppLanguage, AppTheme, ReaderPreferences};
 use crate::settings::ReaderSettingsChange;
@@ -37,6 +38,7 @@ const ASSISTANT_MARK_COLOR: Color = Color::from_rgba8(245, 158, 11, 56);
 const SCROLL_PAGE_GAP: f32 = 24.0;
 const SCROLL_PREVIOUS_REGION_HEIGHT: f32 = 56.0;
 const SCROLL_NEXT_REGION_HEIGHT: f32 = 88.0;
+static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
 
 mod assistant;
 mod chat_autocomplete;
@@ -96,6 +98,10 @@ fn apply_theme_colors(style: &mut ReaderStyle, theme: AppTheme) {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "reader construction keeps source wrappers and persisted state restoration together"
+)]
 pub(super) fn open_reader(
     path: &Path,
     reader_fonts: Arc<[Blob<u8>]>,
@@ -121,15 +127,30 @@ pub(super) fn open_reader(
     } else {
         canonical_source
     };
+    let (canonical_source, pdf_ocr_controller, pdf_ocr_available, pdf_ocr_mode) =
+        if format == BookFormat::Pdf {
+            match load_pdf_ocr_source(Arc::clone(&canonical_source)) {
+                Ok(loaded) => (
+                    loaded.source,
+                    loaded.controller,
+                    loaded.available,
+                    loaded.mode,
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to load cached PDF OCR result");
+                    (canonical_source, None, false, PdfOcrViewMode::Original)
+                }
+            }
+        } else {
+            (canonical_source, None, false, PdfOcrViewMode::Original)
+        };
+    let fixed_page = canonical_source.book().metadata.layout == RenditionLayout::PrePaginated;
     let rewrite_source = Arc::new(RewriteBookSource::new(canonical_source));
-    let mut plugin_settings = PluginSettings::load_default().unwrap_or_else(|error| {
+    let plugin_settings = PluginSettings::load_default().unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to load plugin settings; using defaults");
         PluginSettings::default()
     });
-    if format == BookFormat::Pdf {
-        plugin_settings.translation_mode = TranslationMode::Replace;
-    }
-    let translation_source = Arc::new(if format == BookFormat::Pdf {
+    let translation_source = Arc::new(if fixed_page {
         TranslationBookSource::new_fixed_page(
             rewrite_source.clone(),
             plugin_settings.translation_mode,
@@ -150,7 +171,7 @@ pub(super) fn open_reader(
         typography: reader_preferences.typography.clone(),
         ..ReaderStyle::default()
     };
-    if format == BookFormat::Pdf {
+    if fixed_page {
         style.column_gap = 0.0;
     }
     apply_theme_colors(&mut style, reader_preferences.theme);
@@ -181,6 +202,9 @@ pub(super) fn open_reader(
             source,
             rewrite_source,
             translation_source,
+            pdf_ocr_controller,
+            pdf_ocr_available,
+            pdf_ocr_mode,
             cover,
             format,
             book_id,
@@ -229,6 +253,7 @@ pub(super) struct DesktopReader {
     source: Arc<dyn BookSource>,
     rewrite_source: Arc<RewriteBookSource>,
     translation_source: Arc<TranslationBookSource>,
+    pdf_ocr_controller: Option<Arc<PdfOcrSourceController>>,
     snapshot: ReaderSnapshot,
     cover: Option<Vec<u8>>,
     cover_texture: Option<egui::TextureHandle>,
@@ -257,8 +282,10 @@ pub(super) struct DesktopReader {
     chat_markdown: chat_markdown::ChatMarkdownState,
     translation: TranslationUiState,
     pdf_toc: PdfTocUiState,
+    pdf_ocr: PdfOcrUiState,
     ui: ReaderUiState,
     canvas_size: Option<(u32, u32)>,
+    scene_id: u64,
     scene_revision: u64,
     page_scenes: HashMap<PageSceneKey, Arc<PageSceneLayers>>,
     page_scene_lru: VecDeque<PageSceneKey>,
@@ -516,6 +543,9 @@ struct DesktopReaderResources {
     source: Arc<dyn BookSource>,
     rewrite_source: Arc<RewriteBookSource>,
     translation_source: Arc<TranslationBookSource>,
+    pdf_ocr_controller: Option<Arc<PdfOcrSourceController>>,
+    pdf_ocr_available: bool,
+    pdf_ocr_mode: PdfOcrViewMode,
     cover: Option<Vec<u8>>,
     format: BookFormat,
     book_id: String,
@@ -670,6 +700,37 @@ struct PdfTocUiState {
     draft: Option<GeneratedTocDraft>,
     editing: bool,
     task: TaskSlot<PdfTocTask>,
+}
+
+#[derive(Clone)]
+struct PdfOcrTask {
+    path: PathBuf,
+    book_id: String,
+    page_count: usize,
+    settings: PluginSettings,
+}
+
+pub(crate) enum PdfOcrTaskMessage {
+    Progress { id: u64, message: String },
+    Complete(TaskResult<()>),
+}
+
+struct PdfOcrUiState {
+    available: bool,
+    mode: PdfOcrViewMode,
+    progress: String,
+    task: TaskSlot<PdfOcrTask>,
+}
+
+impl PdfOcrUiState {
+    fn new(available: bool, mode: PdfOcrViewMode) -> Self {
+        Self {
+            available,
+            mode,
+            progress: String::new(),
+            task: TaskSlot::default(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -985,6 +1046,9 @@ impl DesktopReader {
             source,
             rewrite_source,
             translation_source,
+            pdf_ocr_controller,
+            pdf_ocr_available,
+            pdf_ocr_mode,
             cover,
             format,
             book_id,
@@ -1016,6 +1080,7 @@ impl DesktopReader {
             source,
             rewrite_source,
             translation_source,
+            pdf_ocr_controller,
             snapshot,
             cover,
             cover_texture: None,
@@ -1040,6 +1105,7 @@ impl DesktopReader {
             chat_markdown: chat_markdown::ChatMarkdownState::default(),
             translation: TranslationUiState::default(),
             pdf_toc: PdfTocUiState::default(),
+            pdf_ocr: PdfOcrUiState::new(pdf_ocr_available, pdf_ocr_mode),
             ui: ReaderUiState {
                 sidebar_open: true,
                 sidebar_pinned: true,
@@ -1065,6 +1131,7 @@ impl DesktopReader {
             sync_settings,
             sync_password,
             canvas_size: None,
+            scene_id: NEXT_SCENE_ID.fetch_add(1, Ordering::Relaxed),
             scene_revision: 0,
             page_scenes: HashMap::new(),
             page_scene_lru: VecDeque::new(),

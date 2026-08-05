@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use rebook_publication::{
     Block, BlockStyle, Book, BookSource, FixedPageTextLayer, FixedPageTextRect,
     FixedPageTextReplacement, FixedPageTextReplacementSegment, Inline, PublicationError,
-    PublicationUrl, RasterResource, Resource, Section, SectionAnchor, SourceRange, TextBlock,
-    TextBlockKind, TextRun, TextStyle,
+    PublicationUrl, RasterResource, RenditionLayout, Resource, Section, SectionAnchor, SourceRange,
+    TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 
 use super::TranslationMode;
@@ -43,13 +44,14 @@ struct TranslationState {
 /// without reopening the book.
 pub struct TranslationBookSource {
     inner: Arc<dyn BookSource>,
-    fixed_page_replacement_only: bool,
+    fixed_page_replacement_only: AtomicBool,
     state: RwLock<TranslationState>,
 }
 
 impl TranslationBookSource {
     pub fn new(inner: Arc<dyn BookSource>, mode: TranslationMode) -> Self {
-        let fixed_page_replacement_only = is_pdf_book(inner.book());
+        let fixed_page_replacement_only =
+            inner.book().metadata.layout == RenditionLayout::PrePaginated;
         Self::with_fixed_page_policy(inner, mode, fixed_page_replacement_only)
     }
 
@@ -65,7 +67,7 @@ impl TranslationBookSource {
         let mode = normalized_translation_mode(fixed_page_replacement_only, mode);
         Self {
             inner,
-            fixed_page_replacement_only,
+            fixed_page_replacement_only: AtomicBool::new(fixed_page_replacement_only),
             state: RwLock::new(TranslationState {
                 mode,
                 ..TranslationState::default()
@@ -82,12 +84,21 @@ impl TranslationBookSource {
     }
 
     pub fn set_mode(&self, mode: TranslationMode) -> Result<(), String> {
-        let mode = normalized_translation_mode(self.fixed_page_replacement_only, mode);
+        let mode = normalized_translation_mode(self.fixed_page_replacement_only(), mode);
         self.state
             .write()
             .map_err(|_| "正文翻译状态已损坏".to_owned())?
             .mode = mode;
         Ok(())
+    }
+
+    pub fn set_fixed_page_replacement_only(&self, fixed_page: bool) {
+        self.fixed_page_replacement_only
+            .store(fixed_page, Ordering::Release);
+    }
+
+    fn fixed_page_replacement_only(&self) -> bool {
+        self.fixed_page_replacement_only.load(Ordering::Acquire)
     }
 
     pub fn clear(&self) -> Result<(), String> {
@@ -110,7 +121,7 @@ impl TranslationBookSource {
             .map_err(|error| format!("解析第 {} 节失败：{error}", section_index + 1))?;
         Ok(translatable_blocks(
             &section,
-            self.fixed_page_replacement_only,
+            self.fixed_page_replacement_only(),
         ))
     }
 
@@ -129,7 +140,7 @@ impl TranslationBookSource {
             .map_err(|_| "正文翻译状态已损坏".to_owned())?;
         let stored = state.sections.get(&section_index);
         Ok(
-            translatable_blocks(&section, self.fixed_page_replacement_only)
+            translatable_blocks(&section, self.fixed_page_replacement_only())
                 .into_iter()
                 .filter(|input| {
                     section
@@ -230,7 +241,7 @@ fn translatable_blocks(section: &Section, is_pdf: bool) -> Vec<TranslationBlockI
                     });
                 }
             }
-            Block::Separator | Block::PageBreak => {}
+            Block::Table(_) | Block::Separator | Block::PageBreak => {}
         }
     }
     blocks
@@ -258,6 +269,7 @@ fn merge_translations(
 fn block_source_range(block: &Block) -> Option<&SourceRange> {
     match block {
         Block::Text(block) => block.source.as_ref(),
+        Block::Table(block) => block.source.as_ref(),
         Block::Image(block) => block.source.as_ref(),
         Block::Separator | Block::PageBreak => None,
     }
@@ -282,7 +294,7 @@ impl BookSource for TranslationBookSource {
 
     fn parse_section(&self, index: usize) -> Result<Section, PublicationError> {
         let mut section = self.inner.parse_section(index)?;
-        let is_pdf = self.fixed_page_replacement_only;
+        let is_pdf = self.fixed_page_replacement_only();
         let state = self
             .state
             .read()
@@ -316,7 +328,7 @@ impl BookSource for TranslationBookSource {
                         .iter()
                         .find_map(|inline| match inline {
                             Inline::Text(run) => Some(run.style),
-                            Inline::Break => None,
+                            Inline::Math(_) | Inline::Break => None,
                         })
                         .unwrap_or_default();
                     match mode {
@@ -402,12 +414,6 @@ fn normalized_translation_mode(
     } else {
         mode
     }
-}
-
-fn is_pdf_book(book: &Book) -> bool {
-    book.sections
-        .iter()
-        .any(|section| section.media_type.eq_ignore_ascii_case("application/pdf"))
 }
 
 fn apply_fixed_page_translation(

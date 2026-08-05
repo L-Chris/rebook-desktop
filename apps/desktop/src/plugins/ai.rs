@@ -200,7 +200,9 @@ pub async fn chat_with_book(
     response_language: String,
     mut on_stream: impl FnMut(String) + Send,
 ) -> Result<ChatResponse, String> {
-    let direct_pdf_summary = format == BookFormat::Pdf && kind == ChatRequestKind::ChapterSummary;
+    let direct_pdf_summary = format == BookFormat::Pdf
+        && source.book().metadata.layout == RenditionLayout::PrePaginated
+        && kind == ChatRequestKind::ChapterSummary;
     let (provider, model) = settings.chat_endpoint()?;
     let max_tool_steps = usize::from(
         settings
@@ -2015,6 +2017,22 @@ fn ai_block_content(block: &Block, is_pdf: bool) -> Option<(&SourceRange, String
             block.source.as_ref()?,
             text_block_text(block),
             text_block_kind(block),
+        )),
+        Block::Table(table) => Some((
+            table.source.as_ref()?,
+            table
+                .rows
+                .iter()
+                .map(|row| {
+                    row.cells
+                        .iter()
+                        .map(|cell| text_block_text(&cell.text))
+                        .collect::<Vec<_>>()
+                        .join("\t")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "table",
         )),
         Block::Image(image) => {
             let source = image.source.as_ref()?;

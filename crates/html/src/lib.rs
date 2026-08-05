@@ -3,9 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use rebook_publication::{
-    Block, BlockStyle, ImageBlock, ImageLength, ImageStyle, Inline, PublicationUrl, Rgba, Section,
-    SectionAnchor, SourceAnchor, SourceRange, SpineItem, SpineItemId, TextAlignment, TextBlock,
-    TextBlockKind, TextRun, TextStyle,
+    Block, BlockStyle, ImageBlock, ImageLength, ImageStyle, Inline, MathRun, PublicationUrl, Rgba,
+    Section, SectionAnchor, SourceAnchor, SourceRange, SpineItem, SpineItemId, TableBlock,
+    TableCell, TableRow, TextAlignment, TextBlock, TextBlockKind, TextRun, TextStyle,
 };
 use roxmltree::{Document, Node};
 use thiserror::Error;
@@ -155,6 +155,11 @@ impl ReadingIrParser {
             "p" => {
                 let mut style = self.styles.block_style(node, BlockStyle::default());
                 style.indent = 0.0;
+                if contains_display_math(node) && has_only_math_content(node) {
+                    style.align = TextAlignment::Center;
+                    style.margin_before = style.margin_before.max(12.0);
+                    style.margin_after = style.margin_after.max(12.0);
+                }
                 self.push_text_block(node, TextBlockKind::Paragraph, style)?;
             }
             "blockquote" => {
@@ -172,6 +177,7 @@ impl ReadingIrParser {
                 );
                 self.push_text_block(node, TextBlockKind::Preformatted, style)?;
             }
+            "table" => self.parse_table(node),
             name if is_generic_block_container(name) => self.parse_block_container(node)?,
             "ul" => self.parse_list(node, false)?,
             "ol" => self.parse_list(node, true)?,
@@ -198,6 +204,86 @@ impl ReadingIrParser {
         Ok(())
     }
 
+    fn parse_table(&mut self, table: Node<'_, '_>) {
+        let table_node = self.allocate_node();
+        let table_source = self.source_range(&table_node, 0);
+        self.bind_pending_anchors(&table_source.start);
+        let mut rows = Vec::new();
+        for row in table.descendants().filter(|node| {
+            node.is_element()
+                && node.tag_name().name().eq_ignore_ascii_case("tr")
+                && node.ancestors().skip(1).find(|ancestor| {
+                    ancestor.is_element()
+                        && ancestor.tag_name().name().eq_ignore_ascii_case("table")
+                }) == Some(table)
+        }) {
+            let mut cells = Vec::new();
+            for cell in row.children().filter(|node| {
+                node.is_element()
+                    && matches!(
+                        node.tag_name().name().to_ascii_lowercase().as_str(),
+                        "td" | "th"
+                    )
+            }) {
+                self.queue_node_anchors(cell);
+                let header = cell.tag_name().name().eq_ignore_ascii_case("th");
+                let mut style = self.styles.block_style(cell, BlockStyle::default());
+                style.indent = 0.0;
+                style.margin_before = 0.0;
+                style.margin_after = 0.0;
+                style.line_height = style.line_height.clamp(1.0, 1.5);
+                let mut text_style = self
+                    .styles
+                    .text_style_for_block(cell, TextBlockKind::Paragraph);
+                if header {
+                    text_style.bold = true;
+                }
+                let mut collector = InlineCollector::new(false);
+                collect_inline(
+                    cell,
+                    text_style,
+                    None,
+                    &self.section_href,
+                    &self.styles,
+                    &mut collector,
+                );
+                collector.finish();
+                let text_len = collector
+                    .content
+                    .iter()
+                    .map(|inline| match inline {
+                        Inline::Text(run) => run.text.chars().count() as u64,
+                        Inline::Math(_) => 0,
+                        Inline::Break => 1,
+                    })
+                    .sum();
+                let node_id = self.allocate_node();
+                let source = self.source_range(&node_id, text_len);
+                self.bind_pending_anchors(&source.start);
+                cells.push(TableCell {
+                    text: TextBlock {
+                        kind: TextBlockKind::Paragraph,
+                        content: collector.content,
+                        style,
+                        source: Some(source),
+                    },
+                    column_span: table_span(cell, "colspan"),
+                    row_span: table_span(cell, "rowspan"),
+                    header,
+                });
+            }
+            if !cells.is_empty() {
+                rows.push(TableRow { cells });
+            }
+        }
+        if !rows.is_empty() {
+            self.blocks.push(Block::Table(TableBlock {
+                rows,
+                source: Some(table_source),
+            }));
+        }
+    }
+
     fn push_text_block(
         &mut self,
         node: Node<'_, '_>,
@@ -221,10 +307,11 @@ impl ReadingIrParser {
             .iter()
             .map(|inline| match inline {
                 Inline::Text(run) => run.text.chars().count() as u64,
+                Inline::Math(_) => 0,
                 Inline::Break => 1,
             })
             .sum();
-        if text_len > 0 {
+        if !collector.content.is_empty() {
             let source = self.source_range(&node_id, text_len);
             self.bind_pending_anchors(&source.start);
             self.blocks.push(Block::Text(TextBlock {
@@ -273,10 +360,11 @@ impl ReadingIrParser {
             .iter()
             .map(|inline| match inline {
                 Inline::Text(run) => run.text.chars().count() as u64,
+                Inline::Math(_) => 0,
                 Inline::Break => 1,
             })
             .sum();
-        if text_len == 0 {
+        if collector.content.is_empty() {
             return;
         }
         let node_id = self.allocate_node();
@@ -427,6 +515,19 @@ impl InlineCollector {
         self.last_was_space = true;
     }
 
+    fn push_math(&mut self, latex: &str, display: bool, size_scale: f32) {
+        let latex = latex.trim().to_owned();
+        if latex.is_empty() {
+            return;
+        }
+        self.content.push(Inline::Math(MathRun {
+            latex,
+            display,
+            size_scale,
+        }));
+        self.last_was_space = false;
+    }
+
     fn finish(&mut self) {
         if let Some(Inline::Text(run)) = self.content.last_mut() {
             while run.text.ends_with(' ') {
@@ -485,6 +586,24 @@ fn collect_inline_node(
         _ => {}
     }
     styles.apply_text_node(node, &mut style, inherited.size_scale);
+    if name == "span" {
+        let classes = attribute_local(node, "class").unwrap_or_default();
+        let is_math = classes
+            .split_ascii_whitespace()
+            .any(|class| class == "math");
+        if is_math {
+            let display = classes
+                .split_ascii_whitespace()
+                .any(|class| class == "math-display");
+            let latex = node
+                .descendants()
+                .filter(Node::is_text)
+                .filter_map(|text| text.text())
+                .collect::<String>();
+            collector.push_math(&latex, display, style.size_scale);
+            return;
+        }
+    }
     if name == "a" {
         let resolved = attribute_local(node, "href").and_then(|href| base.resolve(href).ok());
         collect_inline(
@@ -521,6 +640,13 @@ fn is_generic_block_container(name: &str) -> bool {
     )
 }
 
+fn table_span(node: Node<'_, '_>, name: &str) -> u16 {
+    attribute_local(node, name)
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(1)
+        .clamp(1, 64)
+}
+
 fn has_descendant_image(node: Node<'_, '_>) -> bool {
     node.descendants().skip(1).any(|descendant| {
         descendant.is_element()
@@ -528,6 +654,40 @@ fn has_descendant_image(node: Node<'_, '_>) -> bool {
                 descendant.tag_name().name().to_ascii_lowercase().as_str(),
                 "img" | "image"
             )
+    })
+}
+
+fn contains_display_math(node: Node<'_, '_>) -> bool {
+    node.descendants().skip(1).any(|descendant| {
+        descendant.is_element()
+            && descendant.tag_name().name().eq_ignore_ascii_case("span")
+            && attribute_local(descendant, "class").is_some_and(|classes| {
+                classes
+                    .split_ascii_whitespace()
+                    .any(|class| class == "math-display")
+            })
+    })
+}
+
+fn has_only_math_content(node: Node<'_, '_>) -> bool {
+    node.descendants().skip(1).all(|descendant| {
+        if descendant.is_text() {
+            return descendant.text().is_none_or(|text| text.trim().is_empty())
+                || descendant.parent().is_some_and(|parent| {
+                    attribute_local(parent, "class").is_some_and(|classes| {
+                        classes
+                            .split_ascii_whitespace()
+                            .any(|class| class == "math-display")
+                    })
+                });
+        }
+        !descendant.is_element()
+            || (descendant.tag_name().name().eq_ignore_ascii_case("span")
+                && attribute_local(descendant, "class").is_some_and(|classes| {
+                    classes
+                        .split_ascii_whitespace()
+                        .any(|class| matches!(class, "math" | "math-display"))
+                }))
     })
 }
 
@@ -549,6 +709,7 @@ fn is_block_boundary(name: &str) -> bool {
                 | "ol"
                 | "p"
                 | "pre"
+                | "table"
                 | "ul"
         )
 }
@@ -1280,11 +1441,11 @@ mod tests {
                         .iter()
                         .filter_map(|inline| match inline {
                             Inline::Text(run) => Some(run.text.as_str()),
-                            Inline::Break => None,
+                            Inline::Math(_) | Inline::Break => None,
                         })
                         .collect::<String>(),
                 ),
-                Block::Image(_) | Block::Separator | Block::PageBreak => None,
+                Block::Table(_) | Block::Image(_) | Block::Separator | Block::PageBreak => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1327,7 +1488,7 @@ mod tests {
             .iter()
             .filter_map(|block| match block {
                 Block::Image(image) => Some(image.href.path()),
-                Block::Text(_) | Block::Separator | Block::PageBreak => None,
+                Block::Text(_) | Block::Table(_) | Block::Separator | Block::PageBreak => None,
             })
             .collect::<Vec<_>>();
 
@@ -1379,11 +1540,11 @@ mod tests {
                         .iter()
                         .filter_map(|inline| match inline {
                             Inline::Text(run) => Some(run.text.as_str()),
-                            Inline::Break => None,
+                            Inline::Math(_) | Inline::Break => None,
                         })
                         .collect::<String>(),
                 ),
-                Block::Image(_) | Block::Separator | Block::PageBreak => None,
+                Block::Table(_) | Block::Image(_) | Block::Separator | Block::PageBreak => None,
             })
             .collect::<Vec<_>>();
 
@@ -1393,7 +1554,7 @@ mod tests {
             .iter()
             .filter_map(|block| match block {
                 Block::Text(block) => Some(block.style),
-                Block::Image(_) | Block::Separator | Block::PageBreak => None,
+                Block::Table(_) | Block::Image(_) | Block::Separator | Block::PageBreak => None,
             })
             .collect::<Vec<_>>();
         assert_close(styles[1].margin_start, 8.0);
