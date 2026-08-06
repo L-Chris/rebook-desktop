@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Cursor, Read};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -1434,12 +1434,18 @@ fn escape_xml_attribute(value: &str) -> String {
 }
 
 fn safe_archive_name(name: &str) -> bool {
-    !Path::new(name).components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    })
+    let normalized = name.replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.contains(':')
+        || normalized.contains('\0')
+    {
+        return false;
+    }
+
+    normalized
+        .split('/')
+        .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 fn image_media_type(path: &str) -> Option<&'static str> {
@@ -1670,7 +1676,12 @@ mod tests {
     fn archive_paths_cannot_escape_the_ocr_directory() {
         assert!(safe_archive_name("images/figure.png"));
         assert!(!safe_archive_name("../document.json"));
+        assert!(!safe_archive_name(r"..\document.json"));
         assert!(!safe_archive_name("C:/document.json"));
+        assert!(!safe_archive_name(r"C:\document.json"));
+        assert!(!safe_archive_name("C:document.json"));
+        assert!(!safe_archive_name("/document.json"));
+        assert!(!safe_archive_name(r"\\server\share\document.json"));
     }
 
     #[test]
