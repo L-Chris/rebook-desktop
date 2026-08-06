@@ -1798,7 +1798,7 @@ flowchart LR
         ctx.set_fonts(egui::FontDefinitions::default());
         let mut short_height = 0.0;
         let mut wrapped_height = 0.0;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let short = vec!["Short".to_owned(), "Cell".to_owned()];
             let wrapped = vec![
                 "Short".to_owned(),
@@ -1807,7 +1807,8 @@ flowchart LR
 
             short_height = markdown_table_row_height(ui, &short, 2, 100.0);
             wrapped_height = markdown_table_row_height(ui, &wrapped, 2, 100.0);
-        });
+        })
+        .drop_without_applying_deltas();
         assert!(
             wrapped_height > short_height,
             "wrapped={wrapped_height}, short={short_height}"

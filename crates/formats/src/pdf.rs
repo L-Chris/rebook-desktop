@@ -11,7 +11,7 @@ use hayro::hayro_interpret::{
     BlendMode, ClipPath, Context, Device, GlyphDrawMode, Image, InterpreterCache,
     InterpreterSettings, Paint, PathDrawMode, SoftMask, interpret_page,
 };
-use hayro::hayro_syntax::Pdf;
+use hayro::hayro_syntax::{Pdf, PdfData};
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{RenderCache, RenderSettings};
 use kurbo::{Affine, BezPath, Point, Rect, Shape};
@@ -54,10 +54,46 @@ struct PdfResourceCache {
     text_layers: HashMap<usize, FixedPageTextLayer>,
 }
 
-pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<PdfPublication, FormatError> {
-    let bytes = Arc::new(bytes.to_vec());
+pub(crate) fn open(bytes: Vec<u8>, file_name: &str) -> Result<PdfPublication, FormatError> {
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    open_data(PdfData::from(bytes), digest, file_name)
+}
+
+pub(crate) fn open_with_id(
+    bytes: Vec<u8>,
+    file_name: &str,
+    publication_id: &str,
+) -> Result<PdfPublication, FormatError> {
+    open_data(PdfData::from(bytes), publication_id.to_owned(), file_name)
+}
+
+pub(crate) fn open_shared(
+    bytes: Arc<[u8]>,
+    file_name: &str,
+) -> Result<PdfPublication, FormatError> {
+    let digest = format!("{:x}", Sha256::digest(bytes.as_ref()));
+    open_data(
+        PdfData::from(Arc::new(SharedPdfBytes(bytes))),
+        digest,
+        file_name,
+    )
+}
+
+struct SharedPdfBytes(Arc<[u8]>);
+
+impl AsRef<[u8]> for SharedPdfBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+fn open_data(
+    bytes: PdfData,
+    digest: String,
+    file_name: &str,
+) -> Result<PdfPublication, FormatError> {
     let pdf = Arc::new(
-        Pdf::new(Arc::clone(&bytes))
+        Pdf::new(bytes)
             .map_err(|error| conversion_error(BookFormat::Pdf, format_args!("{error:?}")))?,
     );
     let page_count = pdf.pages().len();
@@ -91,7 +127,7 @@ pub(crate) fn open(bytes: &[u8], file_name: &str) -> Result<PdfPublication, Form
         .collect();
     let descriptor = DirectBookSource::open(
         SourceBook {
-            id: format!("{:x}", Sha256::digest(bytes.as_ref())),
+            id: digest,
             metadata: Metadata {
                 title,
                 authors,
@@ -656,7 +692,7 @@ mod tests {
     #[test]
     fn opens_and_renders_a_pdf_as_lazy_fixed_pages() {
         let bytes = minimal_pdf();
-        let publication = open(&bytes, "fallback.pdf").unwrap();
+        let publication = open(bytes, "fallback.pdf").unwrap();
         assert_eq!(publication.book().metadata.title, "Test PDF");
         assert_eq!(publication.book().metadata.authors, ["Rebook"]);
         assert_eq!(

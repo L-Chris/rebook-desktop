@@ -47,7 +47,7 @@ Unlike browser-based readers, Torto parses, lays out, paginates, and renders boo
 | **Page and scroll modes** | Switch between single-page, two-page, and chapter-based vertical scrolling layouts. | ✅ |
 | **Library management** | Import books in bulk, display metadata and covers, search by title or author, and detect duplicates. | ✅ |
 | **Navigation and search** | Use a hierarchical table of contents, chapter tracking, full-book search, keyboard navigation, mouse-wheel paging, and `F11` fullscreen. | ✅ |
-| **Typography and themes** | Customize reading and interface fonts, font sizes, weight, layout, and Light, Dark, or Glass themes. | ✅ |
+| **Typography and themes** | Customize reading and interface fonts, font sizes, weight, layout, and Light or Dark themes. | ✅ |
 | **Selection and annotations** | Select freely or by word, sentence, or paragraph; copy text, create highlights and notes, and return to durable source locations. | ✅ |
 | **Image preview** | Open book images in an overlay, zoom with the wheel, pan when enlarged, and copy images to the clipboard. | ✅ |
 | **Translation** | Translate book content in replacement or bilingual mode and translate the table of contents. | ✅ |

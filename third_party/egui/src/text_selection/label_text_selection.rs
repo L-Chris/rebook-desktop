@@ -779,7 +779,7 @@ mod tests {
             .or_default()
             .selection = Some(test_selection());
 
-        let _ = ctx.run_ui(RawInput::default(), |_| {});
+        let output = ctx.run_ui(RawInput::default(), |_| {});
         assert!(
             plugin
                 .lock()
@@ -788,12 +788,14 @@ mod tests {
                 .is_some_and(ViewportLabelSelectionState::has_selection),
             "a pass in another viewport must not clear the child viewport selection"
         );
+        output.drop_without_applying_deltas();
 
-        let _ = ctx.run_ui(child_viewport_input(child_viewport_id), |_| {});
+        let output = ctx.run_ui(child_viewport_input(child_viewport_id), |_| {});
         assert!(
             !plugin.lock().has_selection(),
             "the selection must be cleared when its labels disappear from the same viewport"
         );
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -802,12 +804,13 @@ mod tests {
         let mut endpoint_ids = None;
         let mut layer_id = None;
 
-        let _ = ctx.run_ui(RawInput::default(), |ui| {
+        let output = ctx.run_ui(RawInput::default(), |ui| {
             let primary = ui.label("primary endpoint");
             let secondary = ui.label("secondary endpoint");
             endpoint_ids = Some((primary.id, secondary.id));
             layer_id = Some(primary.layer_id);
         });
+        output.drop_without_applying_deltas();
 
         let (primary_id, secondary_id) = endpoint_ids.unwrap();
         let cursor = |widget_id| WidgetTextCursor {
@@ -826,7 +829,7 @@ mod tests {
             secondary: cursor(secondary_id),
         });
 
-        let _ = ctx.run_ui(RawInput::default(), |ui| {
+        let output = ctx.run_ui(RawInput::default(), |ui| {
             ui.set_clip_rect(Rect::from_min_max(
                 Pos2::new(-100.0, -100.0),
                 Pos2::new(-90.0, -90.0),
@@ -834,6 +837,7 @@ mod tests {
             assert_eq!(ui.label("primary endpoint").id, primary_id);
             assert_eq!(ui.label("secondary endpoint").id, secondary_id);
         });
+        output.drop_without_applying_deltas();
 
         assert!(
             ctx.plugin::<LabelSelectionState>()

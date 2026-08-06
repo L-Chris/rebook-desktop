@@ -52,8 +52,6 @@ pub(crate) enum AppTheme {
     Light,
     #[serde(rename = "dark")]
     Dark,
-    #[serde(rename = "glass")]
-    Glass,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -117,7 +115,7 @@ struct StoredReaderPreferences {
     #[serde(default)]
     language: AppLanguage,
     #[serde(default)]
-    theme: AppTheme,
+    theme: StoredAppTheme,
     #[serde(default = "default_spread")]
     spread: StoredSpreadMode,
     #[serde(default)]
@@ -141,6 +139,33 @@ enum StoredSelectionGranularity {
     Word,
     Sentence,
     Paragraph,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum StoredAppTheme {
+    #[default]
+    Light,
+    Dark,
+    Glass,
+}
+
+impl From<StoredAppTheme> for AppTheme {
+    fn from(value: StoredAppTheme) -> Self {
+        match value {
+            StoredAppTheme::Light | StoredAppTheme::Glass => Self::Light,
+            StoredAppTheme::Dark => Self::Dark,
+        }
+    }
+}
+
+impl From<AppTheme> for StoredAppTheme {
+    fn from(value: AppTheme) -> Self {
+        match value {
+            AppTheme::Light => Self::Light,
+            AppTheme::Dark => Self::Dark,
+        }
+    }
 }
 
 impl From<StoredSelectionGranularity> for SelectionGranularity {
@@ -228,7 +253,7 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
         typography,
         language: stored.language,
         spread: stored.spread.into(),
-        theme: stored.theme,
+        theme: stored.theme.into(),
         selection_granularity: stored.selection_granularity.into(),
     })
 }
@@ -248,7 +273,7 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
         typography,
         language: preferences.language,
         spread: preferences.spread.into(),
-        theme: preferences.theme,
+        theme: preferences.theme.into(),
         selection_granularity: preferences.selection_granularity.into(),
     };
     write_json_atomic(path, &stored)?;
@@ -313,11 +338,19 @@ mod tests {
         assert_eq!(stored.language, AppLanguage::SimplifiedChinese);
         assert_eq!(stored.interface_typography, InterfaceTypography::default());
         assert!(matches!(stored.spread, StoredSpreadMode::Double));
-        assert_eq!(stored.theme, AppTheme::Light);
+        assert!(matches!(stored.theme, StoredAppTheme::Light));
         assert!(matches!(
             stored.selection_granularity,
             StoredSelectionGranularity::Free
         ));
+    }
+
+    #[test]
+    fn legacy_glass_theme_migrates_to_light() {
+        let json = r#"{"version":1,"theme":"glass"}"#;
+        let stored: StoredReaderPreferences = serde_json::from_str(json).unwrap();
+
+        assert_eq!(AppTheme::from(stored.theme), AppTheme::Light);
     }
 
     #[test]

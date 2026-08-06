@@ -239,7 +239,7 @@ impl DesktopApp {
         let applied = self.settings.applied().clone();
         crate::ui::apply_interface_typography(ctx, &applied.interface_typography);
         if applied.theme != crate::ui::theme() {
-            crate::ui::set_theme(applied.theme);
+            crate::ui::set_theme(ctx, applied.theme);
             crate::ui::apply_visuals(ctx, &crate::ui::palette());
             ctx.request_repaint();
         }

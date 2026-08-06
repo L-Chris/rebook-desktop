@@ -918,9 +918,9 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "ecolor"
-version = "0.35.0"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6758be723a3f298bbfda4db75748bc2ba0abafe096b6383c7c32da264764fbc3"
+checksum = "30429559efada7bd06098ced68e90f1f745acb9a25b51caf158741493c5b94bb"
 dependencies = [
  "bytemuck",
  "emath",
@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "egui"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "accesskit",
  "ahash",
@@ -941,13 +941,12 @@ dependencies = [
  "profiling",
  "smallvec",
  "unicode-segmentation",
+ "web-sys",
 ]
 
 [[package]]
 name = "egui-wgpu"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2e6cfac0725563555fa4f91e9f799b9d7c6c5dd831fca6abc8234afc64b7a34"
+version = "0.36.0"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -963,9 +962,9 @@ dependencies = [
 
 [[package]]
 name = "egui-winit"
-version = "0.35.0"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ea6bf3608db949588b95b8b341ee358d0c3f95cf4dc3f53d8d76717edee87db"
+checksum = "bcc5ff243c9d41a665caeeb1e2b18258904524eb9f7c6840e00e9055017f0ade"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -985,8 +984,6 @@ dependencies = [
 [[package]]
 name = "egui_commonmark"
 version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c833127228cc61cef806166adadc23572431fe2ea4cf753e60f654f82a2b3270"
 dependencies = [
  "egui",
  "egui_commonmark_backend",
@@ -1006,9 +1003,9 @@ dependencies = [
 
 [[package]]
 name = "egui_extras"
-version = "0.35.0"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2bd33be7338367bf21f54d62e069d58a5fb3ae033fa8bc6df7a77b9ef4cf957"
+checksum = "b2cb8e069ccbb4b9f49e9c8f52637a088dc520b1d20f4071fdcb801ec4606fc4"
 dependencies = [
  "ahash",
  "egui",
@@ -1028,9 +1025,9 @@ checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
 name = "emath"
-version = "0.35.0"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd4ec073c9898516584d8c6cfdcee95b530b3d941cd5031ef4050aa36812308b"
+checksum = "60b4d19daeb47a1e42e9e67fdc8dd003364b4d3e6c6bc4df865a2b5ad2c920e0"
 dependencies = [
  "bytemuck",
 ]
@@ -1093,34 +1090,34 @@ dependencies = [
 
 [[package]]
 name = "epaint"
-version = "0.35.0"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e60a8888b51da911df23918fd7301359b1d43a406a0ff3b8863af093dd7fc6c"
+checksum = "84a7cb8f831a5a43423e4838101ac4a3264910f2f326670c24f4f4b7ee43d9c8"
 dependencies = [
  "ahash",
  "bytemuck",
  "ecolor",
  "emath",
  "epaint_default_fonts",
- "font-types",
- "harfrust 0.7.0",
+ "font-types 0.12.2",
+ "harfrust 0.12.0",
  "log",
  "nohash-hasher",
  "parking_lot",
  "profiling",
  "self_cell",
- "skrifa",
+ "skrifa 0.44.0",
  "smallvec",
  "unicode-general-category",
  "unicode-segmentation",
- "vello_cpu 0.0.9",
+ "vello_cpu 0.1.0",
 ]
 
 [[package]]
 name = "epaint_default_fonts"
-version = "0.35.0"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13ee4e1f553a3584c301f3a56ff1a775f1384781396cea301c8d952e9b93f560"
+checksum = "d16e23bfeaa81d590306ae25da24269a0686d240c623013badbda44d3f5fab46"
 
 [[package]]
 name = "equivalent"
@@ -1262,6 +1259,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "font-types"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a7299a780854a6d391be2ae1c8521c9368471b559dbfd6a8dbd9f407eaff100"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "fontconfig-parser"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1298,7 +1304,7 @@ dependencies = [
  "objc2-core-text",
  "objc2-foundation 0.3.2",
  "parlance",
- "read-fonts",
+ "read-fonts 0.39.2",
  "roxmltree 0.21.1",
  "smallvec",
  "windows",
@@ -1528,9 +1534,25 @@ dependencies = [
  "log",
  "peniko",
  "png 0.18.1",
- "skrifa",
+ "skrifa 0.42.1",
  "smallvec",
  "vello_common 0.0.9",
+]
+
+[[package]]
+name = "glifo"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed4a1bb24121291d27230c1b1b44e07d6a9b28cefdb32fe1581dfb84e14f940a"
+dependencies = [
+ "bytemuck",
+ "foldhash 0.2.0",
+ "hashbrown 0.17.1",
+ "log",
+ "peniko",
+ "skrifa 0.44.0",
+ "smallvec",
+ "vello_common 0.1.0",
 ]
 
 [[package]]
@@ -1612,25 +1634,25 @@ dependencies = [
 
 [[package]]
 name = "harfrust"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0431e8e389aa0f1e72bb9d1c2db8957a1a7a3580e8ed97db819c14837aac9b3e"
-dependencies = [
- "bitflags 2.13.1",
- "bytemuck",
- "read-fonts",
- "smallvec",
-]
-
-[[package]]
-name = "harfrust"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d12c7c642d4ce8c2e784b4751a6634bd89583912265add4a679a8882d123fbcd"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
- "read-fonts",
+ "read-fonts 0.39.2",
+ "smallvec",
+]
+
+[[package]]
+name = "harfrust"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c03d949a14aa089bbb282f7dd76a498a7f684428e4257202efc119ec010376f9"
+dependencies = [
+ "bitflags 2.13.1",
+ "bytemuck",
+ "read-fonts 0.41.0",
  "smallvec",
 ]
 
@@ -1716,7 +1738,7 @@ dependencies = [
  "phf 0.13.1",
  "rustc-hash 2.1.3",
  "siphasher",
- "skrifa",
+ "skrifa 0.42.1",
  "smallvec",
  "yoke",
 ]
@@ -2115,9 +2137,9 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "itertools"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
 dependencies = [
  "either",
 ]
@@ -2676,10 +2698,8 @@ dependencies = [
  "bitflags 2.13.1",
  "block2 0.6.2",
  "objc2 0.6.4",
- "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
- "objc2-quartz-core 0.3.2",
 ]
 
 [[package]]
@@ -3046,7 +3066,7 @@ dependencies = [
  "linebender_resource_handle",
  "parlance",
  "parley_data",
- "skrifa",
+ "skrifa 0.42.1",
 ]
 
 [[package]]
@@ -3637,12 +3657,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4ed38b89c2c77ff968c524145ad65fb010f38af5c7a224b53b81d47ac2daa81"
 dependencies = [
  "bytemuck",
- "font-types",
+ "font-types 0.11.3",
+]
+
+[[package]]
+name = "read-fonts"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "046a7d674daf459825b32f5062056d6882db0d2f5a479fbd76ccfc870ac18709"
+dependencies = [
+ "bytemuck",
+ "font-types 0.12.2",
+ "once_cell",
 ]
 
 [[package]]
 name = "rebook-desktop"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyrender",
  "atomicwrites",
@@ -3685,7 +3716,6 @@ dependencies = [
  "uuid",
  "vello",
  "wgpu",
- "window-vibrancy",
  "winit",
  "winresource",
  "zip",
@@ -3693,7 +3723,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-formats"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "base64",
  "crc32fast",
@@ -3712,7 +3742,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-html"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rebook-publication",
  "roxmltree 0.21.1",
@@ -3721,7 +3751,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-inspect"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rebook-formats",
  "rebook-publication",
@@ -3732,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-layout"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "image",
  "parley",
@@ -3745,7 +3775,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-macos-open-file"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
@@ -3754,7 +3784,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-math"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "ratex-layout",
  "ratex-parser",
@@ -3764,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-publication"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "percent-encoding",
  "serde",
@@ -3773,7 +3803,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-reader"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rebook-layout",
  "rebook-publication",
@@ -3784,7 +3814,7 @@ dependencies = [
 
 [[package]]
 name = "rebook-renderer"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyrender",
  "kurbo",
@@ -4412,7 +4442,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c34617370ae968efb7161bb2beb517d9084659aae19e24b89e3db25b46e4564"
 dependencies = [
  "bytemuck",
- "read-fonts",
+ "read-fonts 0.39.2",
+]
+
+[[package]]
+name = "skrifa"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
+dependencies = [
+ "bytemuck",
+ "read-fonts 0.41.0",
 ]
 
 [[package]]
@@ -5146,7 +5186,7 @@ dependencies = [
  "log",
  "peniko",
  "png 0.18.1",
- "skrifa",
+ "skrifa 0.42.1",
  "static_assertions",
  "thiserror 2.0.19",
  "vello_encoding",
@@ -5189,13 +5229,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "vello_common"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2e9aed918117e8152c9eddfd8362d73c465c23f26c44786aa331707b8a64fa2"
+dependencies = [
+ "bytemuck",
+ "fearless_simd",
+ "guillotiere",
+ "log",
+ "peniko",
+ "smallvec",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "vello_cpu"
 version = "0.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d8ded630e8316bb94a55881256506d1f3b9947b5f66db8a7d32ca7ba02decd0"
 dependencies = [
  "bytemuck",
- "glifo",
+ "glifo 0.1.1",
  "hashbrown 0.17.1",
  "png 0.18.1",
  "vello_common 0.0.8",
@@ -5203,14 +5258,14 @@ dependencies = [
 
 [[package]]
 name = "vello_cpu"
-version = "0.0.9"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "588691169aed86b5c8fb487266afee01323234e6fd0a3f2aaec0eaa8e4007f23"
+checksum = "ac7349e1f55f6b801c7c277958df4ea53e7f20f21e8014910ad888b2ecda93ea"
 dependencies = [
  "bytemuck",
- "glifo",
+ "glifo 0.2.0",
  "hashbrown 0.17.1",
- "vello_common 0.0.9",
+ "vello_common 0.1.0",
 ]
 
 [[package]]
@@ -5222,7 +5277,7 @@ dependencies = [
  "bytemuck",
  "guillotiere",
  "peniko",
- "skrifa",
+ "skrifa 0.42.1",
  "smallvec",
 ]
 
@@ -5697,22 +5752,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "window-vibrancy"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe6461139557c2245c3b9b34de2092e7af39460bf97ef4723bc5feb0cf66f831"
-dependencies = [
- "objc2 0.6.4",
- "objc2-app-kit 0.3.2",
- "objc2-core-foundation",
- "objc2-foundation 0.3.2",
- "objc2-quartz-core 0.3.2",
- "raw-window-handle",
- "windows-sys 0.60.2",
- "windows-version",
-]
-
-[[package]]
 name = "windows"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5900,15 +5939,6 @@ name = "windows-threading"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
-dependencies = [
- "windows-link",
-]
-
-[[package]]
-name = "windows-version"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4060a1da109b9d0326b7262c8e12c84df67cc0dbc9e33cf49e01ccc2eb63631"
 dependencies = [
  "windows-link",
 ]

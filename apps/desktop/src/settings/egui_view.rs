@@ -391,12 +391,6 @@ fn reading_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     {
                         state.draft_theme = AppTheme::Dark;
                     }
-                    let glass = state.draft_theme == AppTheme::Glass;
-                    if choice_button(ui, state.draft_language.text("玻璃", "Glass"), glass, 72.0)
-                        .clicked()
-                    {
-                        state.draft_theme = AppTheme::Glass;
-                    }
                 });
                 ui.end_row();
 
@@ -708,11 +702,6 @@ fn ocr_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             &mut settings.ocr_model,
             language,
         );
-        ui.add_space(8.0);
-        ui.weak(language.text(
-            "仅显示已在 AI 提供商中配置的模型；所选模型需要支持图片输入。",
-            "Only configured AI provider models are shown; the selected model must support image input.",
-        ));
     });
     ui.add_space(12.0);
     settings_card(ui, |ui| {
@@ -771,11 +760,6 @@ fn ocr_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 text_field(ui, &mut settings.mineru_token, true);
             }
         }
-        ui.add_space(8.0);
-        ui.weak(language.text(
-            "凭据仅保存在系统凭据管理器中；OCR 结果会缓存在本机。",
-            "Credentials are stored only in the system credential manager; OCR results are cached locally.",
-        ));
     });
 }
 

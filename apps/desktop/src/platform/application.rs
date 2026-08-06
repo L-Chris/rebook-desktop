@@ -6,11 +6,10 @@ use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Fullscreen, Icon, Window, WindowId};
+use winit::window::{Fullscreen, Icon, Theme, Window, WindowId};
 
 use super::UserEvent;
 use super::gpu::GpuState;
-use super::window_appearance;
 use crate::app::DesktopApp;
 use crate::preferences::AppTheme;
 
@@ -66,11 +65,17 @@ fn toggle_fullscreen(window: &Window) {
     window.request_redraw();
 }
 
+const fn native_window_theme(theme: AppTheme) -> Theme {
+    match theme {
+        AppTheme::Light => Theme::Light,
+        AppTheme::Dark => Theme::Dark,
+    }
+}
+
 struct WindowState {
     window: Arc<Window>,
     gpu: GpuState,
     egui_state: egui_winit::State,
-    applied_theme: AppTheme,
 }
 
 struct Application {
@@ -91,7 +96,7 @@ impl Application {
     ) -> Self {
         let egui_ctx = egui::Context::default();
         crate::ui::configure(&egui_ctx, app.interface_typography(), runtime.handle());
-        crate::ui::set_theme(app.theme());
+        crate::ui::set_theme(&egui_ctx, app.theme());
         crate::ui::apply_visuals(&egui_ctx, &crate::ui::palette());
         let repaint_proxy = proxy.clone();
         egui_ctx.set_request_repaint_callback(move |request| {
@@ -132,6 +137,7 @@ impl ApplicationHandler<UserEvent> for Application {
         let attributes = Window::default_attributes()
             .with_title("Torto")
             .with_window_icon(app_icon())
+            .with_theme(Some(native_window_theme(self.app.theme())))
             .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
             .with_min_inner_size(LogicalSize::new(720_u32, 520_u32));
         #[cfg(target_os = "windows")]
@@ -148,8 +154,6 @@ impl ApplicationHandler<UserEvent> for Application {
                 return;
             }
         };
-        let applied_theme = self.app.theme();
-        window_appearance::apply(&window, applied_theme);
         let egui_state = egui_winit::State::new(
             self.egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -173,7 +177,6 @@ impl ApplicationHandler<UserEvent> for Application {
             window,
             gpu,
             egui_state,
-            applied_theme,
         });
     }
 
@@ -291,11 +294,6 @@ impl ApplicationHandler<UserEvent> for Application {
                     // A theme switch lands during render; keep the surface
                     // clear color in step for the next frame.
                     state.gpu.set_clear_color(clear_color());
-                    let theme = crate::ui::theme();
-                    if state.applied_theme != theme {
-                        window_appearance::apply(&state.window, theme);
-                        state.applied_theme = theme;
-                    }
                     self.app.spawn_pending_tasks(&self.runtime, &self.proxy);
                     #[cfg(target_os = "windows")]
                     if let Some(request) = self.app.take_update_install_request() {
@@ -345,6 +343,12 @@ mod tests {
             false,
             &Key::Named(NamedKey::F10),
         ));
+    }
+
+    #[test]
+    fn initial_window_theme_matches_the_app_theme() {
+        assert_eq!(native_window_theme(AppTheme::Light), Theme::Light);
+        assert_eq!(native_window_theme(AppTheme::Dark), Theme::Dark);
     }
 
     #[test]

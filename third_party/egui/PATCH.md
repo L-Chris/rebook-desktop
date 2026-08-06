@@ -1,6 +1,6 @@
 # Local egui patch
 
-This directory vendors `egui 0.35.0` from crates.io.
+This directory vendors `egui 0.36.0` from crates.io.
 
 Torto's AI Chat allows a text selection to autoscroll beyond the visible viewport. Upstream
 `Label::ui` skips labels outside the clip rect, while `LabelSelectionState::on_end_pass` clears a

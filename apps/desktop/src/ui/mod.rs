@@ -3,7 +3,7 @@ mod icons;
 mod svg_loader;
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use egui::emath::GuiRounding;
 use egui::{
@@ -18,6 +18,7 @@ use crate::preferences::{
 };
 
 const EGUI_BASE_FONT_SIZE: f32 = 13.0;
+const EGUI_BASE_EXTRA_TEXT_LINE_SPACING: f32 = 1.0;
 static INTERFACE_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(DEFAULT_INTERFACE_FONT_SIZE.to_bits());
 
 /// Theme-dependent color set. Chrome reads colors through `palette()` so a
@@ -112,56 +113,27 @@ impl Palette {
             pill_stroke: Color32::from_rgb(72, 70, 64),
         }
     }
+}
 
-    // Glassmorphism approximation: egui has no backdrop blur, so frosted
-    // surfaces are translucent white layers over a cool slate background.
-    fn glass() -> Self {
-        Self {
-            dark: false,
-            background: Color32::from_rgb(219, 227, 238),
-            surface: Color32::from_rgba_unmultiplied(255, 255, 255, 168),
-            surface_muted: Color32::from_rgba_unmultiplied(255, 255, 255, 108),
-            text: Color32::from_rgb(30, 41, 59),
-            muted: Color32::from_rgb(100, 116, 139),
-            border: Color32::from_rgba_unmultiplied(255, 255, 255, 150),
-            accent: Color32::from_rgb(79, 70, 229),
-            accent_soft: Color32::from_rgba_unmultiplied(99, 102, 241, 42),
-            hovered_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 150),
-            hovered_weak_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 96),
-            hovered_stroke: Color32::from_rgba_unmultiplied(148, 163, 184, 140),
-            active_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 176),
-            active_weak_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 128),
-            open_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 96),
-            selection_fill: Color32::from_rgba_unmultiplied(99, 102, 241, 72),
-            error: Color32::from_rgb(220, 38, 38),
-            error_fill: Color32::from_rgba_unmultiplied(254, 226, 226, 200),
-            error_stroke: Color32::from_rgba_unmultiplied(252, 165, 165, 200),
-            error_text: Color32::from_rgb(185, 28, 28),
-            toast_error_fill: Color32::from_rgb(78, 39, 39),
-            card_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 140),
-            accent_border: Color32::from_rgba_unmultiplied(99, 102, 241, 128),
-            pill_fill: Color32::from_rgba_unmultiplied(255, 255, 255, 120),
-            pill_stroke: Color32::from_rgba_unmultiplied(148, 163, 184, 110),
-        }
+static DARK_THEME: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_theme(ctx: &egui::Context, theme: AppTheme) {
+    DARK_THEME.store(theme == AppTheme::Dark, Ordering::Relaxed);
+    ctx.set_theme(egui_theme(theme));
+}
+
+const fn egui_theme(theme: AppTheme) -> egui::Theme {
+    match theme {
+        AppTheme::Dark => egui::Theme::Dark,
+        AppTheme::Light => egui::Theme::Light,
     }
 }
 
-static CURRENT_THEME: AtomicU8 = AtomicU8::new(0);
-
-pub(crate) fn set_theme(theme: AppTheme) {
-    let value = match theme {
-        AppTheme::Light => 0,
-        AppTheme::Dark => 1,
-        AppTheme::Glass => 2,
-    };
-    CURRENT_THEME.store(value, Ordering::Relaxed);
-}
-
 pub(crate) fn theme() -> AppTheme {
-    match CURRENT_THEME.load(Ordering::Relaxed) {
-        1 => AppTheme::Dark,
-        2 => AppTheme::Glass,
-        _ => AppTheme::Light,
+    if DARK_THEME.load(Ordering::Relaxed) {
+        AppTheme::Dark
+    } else {
+        AppTheme::Light
     }
 }
 
@@ -169,7 +141,6 @@ pub(crate) fn palette() -> Palette {
     match theme() {
         AppTheme::Light => Palette::light(),
         AppTheme::Dark => Palette::dark(),
-        AppTheme::Glass => Palette::glass(),
     }
 }
 
@@ -184,7 +155,10 @@ pub(crate) fn configure(
     // Application state is mutated while building a frame. A single pass keeps
     // keyboard and pointer actions exactly-once; the retained reader layout
     // performs its own explicit invalidation when geometry changes.
-    ctx.options_mut(|options| options.max_passes = 1.try_into().expect("one is non-zero"));
+    ctx.options_mut(|options| {
+        options.max_passes = 1.try_into().expect("one is non-zero");
+        options.sync_window_theme = true;
+    });
     configure_tessellation(ctx);
     apply_interface_typography(ctx, interface_typography);
 
@@ -193,7 +167,7 @@ pub(crate) fn configure(
         // Application chrome should not behave like selectable document text.
         // Reader text selection is handled by the Vello-backed reader itself.
         style.interaction.selectable_labels = false;
-        // egui 0.35's debug-only rect/id diagnostic has known false positives for
+        // egui 0.36's debug-only rect/id diagnostic has known false positives for
         // right-to-left child layouts and virtualized/animated regions (#8343,
         // #8092), painting bright red boxes into otherwise valid frames.
         #[cfg(debug_assertions)]
@@ -235,6 +209,7 @@ pub(crate) fn apply_interface_typography(
     let mut interface_typography = interface_typography.clone();
     interface_typography.normalize();
     INTERFACE_FONT_SIZE_BITS.store(interface_typography.font_size.to_bits(), Ordering::Relaxed);
+    let extra_text_line_spacing = interface_extra_text_line_spacing(interface_typography.font_size);
 
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert(
@@ -283,6 +258,7 @@ pub(crate) fn apply_interface_typography(
         for font_id in style.text_styles.values_mut() {
             font_id.size = scaled_font_size(font_id.size);
         }
+        style.spacing.extra_text_line_spacing = extra_text_line_spacing;
     });
     ctx.request_repaint();
 }
@@ -290,6 +266,10 @@ pub(crate) fn apply_interface_typography(
 pub(crate) fn scaled_font_size(nominal_size: f32) -> f32 {
     let configured = f32::from_bits(INTERFACE_FONT_SIZE_BITS.load(Ordering::Relaxed));
     nominal_size * configured / EGUI_BASE_FONT_SIZE
+}
+
+fn interface_extra_text_line_spacing(font_size: f32) -> f32 {
+    EGUI_BASE_EXTRA_TEXT_LINE_SPACING * font_size / EGUI_BASE_FONT_SIZE
 }
 
 pub(crate) fn available_interface_font_families() -> Vec<String> {
@@ -595,8 +575,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn app_themes_select_the_matching_egui_theme() {
+        assert_eq!(egui_theme(AppTheme::Light), egui::Theme::Light);
+        assert_eq!(egui_theme(AppTheme::Dark), egui::Theme::Dark);
+    }
+
+    #[test]
+    fn egui_emits_a_native_theme_command_when_the_theme_changes() {
+        let ctx = egui::Context::default();
+        ctx.options_mut(|options| options.sync_window_theme = true);
+        ctx.set_theme(egui::Theme::Dark);
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let commands = &output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .commands;
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark)
+        )));
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn interface_line_spacing_scales_with_the_configured_font() {
+        assert!(
+            (interface_extra_text_line_spacing(EGUI_BASE_FONT_SIZE)
+                - EGUI_BASE_EXTRA_TEXT_LINE_SPACING)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!(
+            interface_extra_text_line_spacing(24.0)
+                > interface_extra_text_line_spacing(EGUI_BASE_FONT_SIZE)
+        );
+    }
+
+    #[test]
     fn active_open_and_focus_outlines_are_crisp_theme_strokes() {
-        for palette in [Palette::light(), Palette::dark(), Palette::glass()] {
+        for palette in [Palette::light(), Palette::dark()] {
             let ctx = egui::Context::default();
             apply_visuals(&ctx, &palette);
             let style = ctx.style_of(ctx.theme());
@@ -652,10 +671,11 @@ mod tests {
         let ctx = egui::Context::default();
         let mut primary = Rect::NOTHING;
         let mut secondary = Rect::NOTHING;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             primary = dialog_action_button(ui, "Update", true).rect;
             secondary = dialog_action_button(ui, "Later", false).rect;
-        });
+        })
+        .drop_without_applying_deltas();
 
         assert_eq!(primary.size(), Vec2::new(68.0, 32.0));
         assert_eq!(secondary.size(), Vec2::new(68.0, 32.0));

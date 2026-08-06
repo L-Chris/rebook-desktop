@@ -274,6 +274,10 @@ fn uses_pdf_page_alignment(format: rebook_formats::BookFormat, ocr_mode: PdfOcrV
     format == rebook_formats::BookFormat::Pdf && ocr_mode == PdfOcrViewMode::Original
 }
 
+fn supports_image_preview(format: rebook_formats::BookFormat, ocr_mode: PdfOcrViewMode) -> bool {
+    !uses_pdf_page_alignment(format, ocr_mode)
+}
+
 impl DesktopReader {
     pub(crate) fn ui(
         &mut self,
@@ -626,13 +630,15 @@ impl DesktopReader {
     }
 
     fn wheel_interaction(&mut self, response: &egui::Response, interaction_blocked: bool) {
-        if interaction_blocked
-            || !response.hovered()
+        let pointer_over_page = response
+            .ctx
+            .pointer_hover_pos()
+            .is_some_and(|position| response.rect.contains(position));
+        let blocked = interaction_blocked
             || self.ui.overlay_visible()
             || self.image_preview.is_some()
-            || self.selection.is_some()
-            || self.pending_page_turn.is_some()
-        {
+            || self.pending_page_turn.is_some();
+        if !page_wheel_input_allowed(pointer_over_page, blocked) {
             self.ui.wheel_accumulator = 0.0;
             return;
         }
@@ -1732,19 +1738,13 @@ impl DesktopReader {
                     "询问这本书，输入 / 使用技能或 @ 引用…",
                     "Ask this book, type / for skills or @ to reference…",
                 );
-                let (mut output, input_rect) =
-                    centered_assistant_text_edit(ui, &mut self.chat.input, input_id, input_width);
-                if self.chat.input.is_empty() {
-                    // egui 0.35 forces its built-in hint atom to LEFT_TOP, so
-                    // paint the placeholder ourselves to honor vertical centering.
-                    ui.painter().with_clip_rect(input_rect).text(
-                        input_rect.left_center() + Vec2::new(4.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        hint_text,
-                        egui::TextStyle::Body.resolve(ui.style()),
-                        ui.visuals().weak_text_color(),
-                    );
-                }
+                let (mut output, _) = centered_assistant_text_edit(
+                    ui,
+                    &mut self.chat.input,
+                    input_id,
+                    input_width,
+                    hint_text,
+                );
                 if output.response.changed() {
                     self.chat.suggestion_index = 0;
                 }
@@ -2190,7 +2190,7 @@ impl DesktopReader {
         reason = "decoded image dimensions are GPU-bounded and egui geometry uses f32"
     )]
     fn try_open_image_preview(&mut self, ctx: &egui::Context, x: f32, y: f32) -> bool {
-        if self.format == rebook_formats::BookFormat::Pdf {
+        if !supports_image_preview(self.format, self.pdf_ocr.mode) {
             return false;
         }
         let image = match self.image_at_canvas(x, y) {
@@ -2814,6 +2814,7 @@ fn centered_assistant_text_edit(
     input: &mut String,
     input_id: egui::Id,
     width: f32,
+    hint_text: &str,
 ) -> (egui::text_edit::TextEditOutput, Rect) {
     let mut input_rect = Rect::NOTHING;
     let output = ui.allocate_ui_with_layout(
@@ -2826,6 +2827,7 @@ fn centered_assistant_text_edit(
                 .desired_width(width)
                 .frame(egui::Frame::NONE)
                 .vertical_align(egui::Align::Center)
+                .hint_text(hint_text)
                 .show(ui)
         },
     );
@@ -3332,6 +3334,10 @@ fn last_visible_selection_rect(
         .copied()
 }
 
+fn page_wheel_input_allowed(pointer_over_page: bool, blocked: bool) -> bool {
+    pointer_over_page && !blocked
+}
+
 #[cfg(test)]
 mod reference_suggestion_label_tests {
     use super::*;
@@ -3415,6 +3421,22 @@ mod reference_suggestion_label_tests {
     }
 
     #[test]
+    fn ocr_reflow_images_support_preview_without_treating_pdf_pages_as_images() {
+        assert!(!supports_image_preview(
+            rebook_formats::BookFormat::Pdf,
+            PdfOcrViewMode::Original,
+        ));
+        assert!(supports_image_preview(
+            rebook_formats::BookFormat::Pdf,
+            PdfOcrViewMode::Reflow,
+        ));
+        assert!(supports_image_preview(
+            rebook_formats::BookFormat::Epub,
+            PdfOcrViewMode::Original,
+        ));
+    }
+
+    #[test]
     fn selection_toolbar_anchors_to_the_last_rect_on_the_visible_spread() {
         let position = |page_index| rebook_reader::ReaderPosition {
             section_index: 0,
@@ -3434,6 +3456,19 @@ mod reference_suggestion_label_tests {
             last_visible_selection_rect(&rects, &[position(0), position(1)]),
             Some(rects[1])
         );
+    }
+
+    #[test]
+    fn page_wheel_remains_available_when_a_selection_toolbar_overlays_the_page() {
+        // The toolbar lives in a foreground Area, so the page response itself is
+        // no longer `hovered`. Physical containment is the relevant condition.
+        assert!(page_wheel_input_allowed(true, false));
+    }
+
+    #[test]
+    fn page_wheel_stays_blocked_by_modal_reader_interactions() {
+        assert!(!page_wheel_input_allowed(false, false));
+        assert!(!page_wheel_input_allowed(true, true));
     }
 
     #[test]
@@ -3472,7 +3507,7 @@ mod reference_suggestion_label_tests {
             let mut input = String::new();
             let input_id = ui.make_persistent_id("centered-input-test");
             let (output, input_rect) =
-                centered_assistant_text_edit(ui, &mut input, input_id, 240.0);
+                centered_assistant_text_edit(ui, &mut input, input_id, 240.0, "Ask this book");
             let galley_center = output.galley_pos.y + output.galley.size().y / 2.0;
 
             assert!((output.response.rect.height() - ASSISTANT_INPUT_HEIGHT).abs() < 0.01);

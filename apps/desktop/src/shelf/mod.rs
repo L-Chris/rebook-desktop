@@ -164,6 +164,7 @@ impl ShelfFeature {
             &book.path,
             Arc::clone(&self.reader_fonts),
             metadata,
+            book.cover_bytes.clone(),
             local_store,
         ) {
             Ok(reader) => {

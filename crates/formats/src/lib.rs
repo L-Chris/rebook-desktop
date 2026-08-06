@@ -121,12 +121,40 @@ impl OpenedPublication {
 
 /// Opens a supported local e-book file.
 pub fn open_file(path: impl AsRef<Path>) -> Result<OpenedPublication, FormatError> {
+    open_file_with_options(path, true, None)
+}
+
+/// Opens a shelf-managed book without reloading its cover or recomputing the
+/// content-derived PDF identity established during import.
+pub fn open_file_for_reading(
+    path: impl AsRef<Path>,
+    known_publication_id: Option<&str>,
+) -> Result<OpenedPublication, FormatError> {
+    open_file_with_options(path, false, known_publication_id)
+}
+
+fn open_file_with_options(
+    path: impl AsRef<Path>,
+    load_cover: bool,
+    known_publication_id: Option<&str>,
+) -> Result<OpenedPublication, FormatError> {
     let path = path.as_ref();
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| FormatError::UnsupportedFormat(path.display().to_string()))?;
-    open_bytes(fs::read(path)?, file_name)
+    let format = BookFormat::from_file_name(file_name)
+        .ok_or_else(|| FormatError::UnsupportedFormat(file_name.to_owned()))?;
+    let bytes = fs::read(path)?;
+    let source: Arc<dyn BookSource> = match format {
+        BookFormat::Pdf => Arc::new(if let Some(publication_id) = known_publication_id {
+            pdf::open_with_id(bytes, file_name, publication_id)?
+        } else {
+            pdf::open(bytes, file_name)?
+        }),
+        _ => open_shared_source(bytes.into(), file_name, format)?,
+    };
+    Ok(finish_open(format, source, load_cover))
 }
 
 /// Opens immutable source bytes using a file name for format detection.
@@ -137,6 +165,18 @@ pub fn open_bytes(
     let format = BookFormat::from_file_name(file_name)
         .ok_or_else(|| FormatError::UnsupportedFormat(file_name.to_owned()))?;
     let bytes = bytes.into();
+    let source = match format {
+        BookFormat::Pdf => Arc::new(pdf::open_shared(bytes, file_name)?) as Arc<dyn BookSource>,
+        _ => open_shared_source(bytes, file_name, format)?,
+    };
+    Ok(finish_open(format, source, true))
+}
+
+fn open_shared_source(
+    bytes: Arc<[u8]>,
+    file_name: &str,
+    format: BookFormat,
+) -> Result<Arc<dyn BookSource>, FormatError> {
     let source: Arc<dyn BookSource> = match format {
         BookFormat::Epub => Arc::new(EpubPublication::open_bytes(bytes)?),
         BookFormat::Mobi | BookFormat::Azw | BookFormat::Azw3 => {
@@ -144,19 +184,28 @@ pub fn open_bytes(
         }
         BookFormat::Fb2 | BookFormat::Fbz => Arc::new(fb2::open(bytes.as_ref(), file_name)?),
         BookFormat::Cbz => Arc::new(cbz::open(bytes.as_ref(), file_name)?),
-        BookFormat::Pdf => Arc::new(pdf::open(bytes.as_ref(), file_name)?),
+        BookFormat::Pdf => unreachable!("PDF bytes use the zero-copy owned/shared paths"),
     };
+    Ok(source)
+}
+
+fn finish_open(
+    format: BookFormat,
+    source: Arc<dyn BookSource>,
+    load_cover: bool,
+) -> OpenedPublication {
     let cover_bytes = source
         .book()
         .cover
         .as_ref()
+        .filter(|_| load_cover)
         .and_then(|href| source.resource(href).ok())
         .map(|resource| resource.bytes.to_vec());
-    Ok(OpenedPublication {
+    OpenedPublication {
         format,
         source,
         cover_bytes,
-    })
+    }
 }
 
 #[derive(Debug, Error)]

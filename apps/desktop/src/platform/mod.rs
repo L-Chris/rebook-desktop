@@ -1,6 +1,5 @@
 mod application;
 mod gpu;
-mod window_appearance;
 
 pub(crate) use application::run;
 

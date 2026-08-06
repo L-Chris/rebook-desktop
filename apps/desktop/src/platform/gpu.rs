@@ -131,12 +131,14 @@ impl GpuState {
         egui_state: &mut egui_winit::State,
     ) -> Result<(), String> {
         let raw_input = self.take_egui_input(window, egui_state);
+        let mut viewport_info = root_viewport_info(&raw_input);
         let pixels_per_point = egui_ctx.pixels_per_point();
         let mut plan = None;
-        let output = egui_ctx.run_ui(raw_input, |ui| {
+        let mut output = egui_ctx.run_ui(raw_input, |ui| {
             plan = app.ui(ui, self.page_texture());
         });
-        egui_state.handle_platform_output(window, output.platform_output);
+        egui_state.handle_platform_output(window, std::mem::take(&mut output.platform_output));
+        process_root_viewport_commands(window, egui_ctx, &mut viewport_info, &mut output);
 
         let mut page_target_recreated = false;
         if let Some(plan) = plan {
@@ -162,9 +164,11 @@ impl GpuState {
             size_in_pixels: [self.surface_config.width, self.surface_config.height],
             pixels_per_point,
         };
-        for (id, delta) in &output.textures_delta.set {
-            self.egui_renderer
-                .update_texture(&self.device, &self.queue, *id, delta);
+        for (id, image_deltas) in output.textures_delta.set.drain() {
+            for image_delta in image_deltas {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, id, &image_delta);
+            }
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -176,12 +180,15 @@ impl GpuState {
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
                 window.request_redraw();
+                self.free_egui_textures(&mut output.textures_delta);
                 return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                self.free_egui_textures(&mut output.textures_delta);
                 return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Validation => {
+                self.free_egui_textures(&mut output.textures_delta);
                 return Err("Surface validation failed".into());
             }
         };
@@ -226,10 +233,14 @@ impl GpuState {
         for id in self.retired_page_textures.drain(..) {
             self.egui_renderer.free_texture(&id);
         }
-        for id in &output.textures_delta.free {
-            self.egui_renderer.free_texture(id);
-        }
+        self.free_egui_textures(&mut output.textures_delta);
         Ok(())
+    }
+
+    fn free_egui_textures(&mut self, textures_delta: &mut egui::TexturesDelta) {
+        for id in textures_delta.free.drain() {
+            self.egui_renderer.free_texture(&id);
+        }
     }
 
     fn page_texture(&self) -> Option<ReaderPageTexture> {
@@ -316,6 +327,42 @@ impl GpuState {
             .map_err(|error| error.to_string())?;
         target.rendered_scene = Some((plan.scene_id, plan.scene_revision));
         Ok(())
+    }
+}
+
+fn root_viewport_info(input: &egui::RawInput) -> egui::ViewportInfo {
+    input
+        .viewports
+        .get(&egui::ViewportId::ROOT)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn process_root_viewport_commands(
+    window: &Window,
+    egui_ctx: &egui::Context,
+    viewport_info: &mut egui::ViewportInfo,
+    output: &mut egui::FullOutput,
+) {
+    let Some(root_output) = output.viewport_output.get_mut(&egui::ViewportId::ROOT) else {
+        return;
+    };
+    let mut actions_requested = Vec::new();
+    egui_winit::process_viewport_commands(
+        egui_ctx,
+        viewport_info,
+        root_output.commands.drain(..),
+        window,
+        &mut actions_requested,
+    );
+    if !actions_requested.is_empty() {
+        crate::diagnostics::log(
+            "viewport.actions.unsupported",
+            &[crate::diagnostics::Field::Usize(
+                "count",
+                actions_requested.len(),
+            )],
+        );
     }
 }
 

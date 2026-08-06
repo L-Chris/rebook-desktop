@@ -1,6 +1,6 @@
 # 核心依赖已知问题
 
-- 最近更新：2026-08-03
+- 最近更新：2026-08-05
 - 记录范围：已经在 Torto 中复现、确认存在上游问题，并需要本地兼容代码的问题
 
 依赖升级时应逐项检查本文。只有在上游修复已经进入当前版本，并且移除本地兼容代码后相关回归测试仍能通过，才删除对应兼容代码和本文条目。
@@ -35,8 +35,8 @@ Parley 会把两端对齐产生的额外空白宽度加入字簇 advance，但 `
 
 ## egui/epaint：全局羽化导致紧凑圆角控件出现角线
 
-- 影响版本：`egui 0.35.0`
-- 上游状态：截至 2026-08-01，相关问题仍为 Open；上游尚无与 Torto 紧凑图标按钮完全相同的最小复现
+- 影响版本：`egui 0.36.0`
+- 上游状态：截至 2026-08-05，相关问题仍为 Open；上游尚无与 Torto 紧凑图标按钮完全相同的最小复现
 - 相关上游问题：[emilk/egui#2735](https://github.com/emilk/egui/issues/2735)、[emilk/egui#7424](https://github.com/emilk/egui/issues/7424)
 - 本地位置：`apps/desktop/src/ui/mod.rs` 中的 `configure_tessellation`、`painted_icon_button` 和 `paint_compact_rounded_background`
 - 回归测试：`rounded_controls_keep_pixel_snapping_and_antialiasing`、`compact_rounding_contains_the_feathering_fringe`
@@ -63,8 +63,8 @@ epaint 的羽化由全局 tessellation 选项控制，当前不能针对单个 s
 
 ## egui_commonmark/egui：跨组件多行选区覆盖行首内容
 
-- 影响版本：`egui_commonmark 0.24.0`、`egui 0.35.0`
-- 上游状态：截至 2026-08-02 仍为 Open
+- 影响版本：`egui_commonmark 0.24.0`、`egui 0.36.0`
+- 上游状态：截至 2026-08-05 仍为 Open；`egui_commonmark 0.24.0` 仍以 `egui 0.35` 发布，Torto 暂时在本地适配到 `egui 0.36`
 - 上游问题：[lampsitter/egui_commonmark#80](https://github.com/lampsitter/egui_commonmark/issues/80)；布局限制另见 [emilk/egui#4378](https://github.com/emilk/egui/issues/4378)
 - 本地位置：`third_party/egui_commonmark_backend/src/elements.rs` 中的 `newline`，以及 `apps/desktop/src/reader/chat_markdown.rs` 中的 `show_markdown_table`
 - 回归测试：`markdown_table_row_height_follows_the_tallest_wrapped_cell`；列表选区需人工检查
@@ -91,9 +91,9 @@ egui 的多组件文字选择按各个 `Label` 独立生成选区网格，无法
 
 ## egui：滚动时离屏端点导致跨组件文字选区被清空
 
-- 影响版本：`egui 0.35.0`
-- 上游状态：截至 2026-08-02，上游当前源码仍包含该清理逻辑，尚未找到专门跟踪此行为的 issue
-- 上游代码：[`LabelSelectionState::on_end_pass`](https://github.com/emilk/egui/blob/4471969a16a130bc07f65eb747d5e2c3bfcf1d88/crates/egui/src/text_selection/label_text_selection.rs)
+- 影响版本：`egui 0.36.0`
+- 上游状态：截至 2026-08-05，上游当前源码仍包含该清理逻辑，尚未找到专门跟踪此行为的 issue
+- 上游代码：[`LabelSelectionState::on_end_pass`](https://github.com/emilk/egui/blob/0.36.0/crates/egui/src/text_selection/label_text_selection.rs)
 - 本地位置：`third_party/egui/src/widgets/label.rs` 中的 `Label::ui`
 
 ### 表现
@@ -106,7 +106,7 @@ egui 的多组件文字选择按各个 `Label` 独立生成选区网格，无法
 
 ### 当前规避方案
 
-本地接管 `egui 0.35.0`：只要仍存在跨标签选区，`Label::ui` 就继续将裁剪区外的可选择标签提交给选区状态。标签和高亮仍受原有 painter 裁剪，不会绘制到滚动视口之外；已完成的选区在松开鼠标后也能保留并复制。
+本地接管 `egui 0.36.0`：只要仍存在跨标签选区，`Label::ui` 就继续将裁剪区外的可选择标签提交给选区状态。标签和高亮仍受原有 painter 裁剪，不会绘制到滚动视口之外；已完成的选区在松开鼠标后也能保留并复制。
 
 ### 升级检查
 
@@ -118,8 +118,8 @@ egui 的多组件文字选择按各个 `Label` 独立生成选区网格，无法
 
 ## egui：`ScrollArea::show_rows` 在列表底部抖动
 
-- 影响版本：`egui 0.35.0`
-- 上游状态：截至 2026-08-01 仍为 Open
+- 影响版本：`egui 0.36.0`
+- 上游状态：截至 2026-08-05 仍为 Open
 - 上游问题：[emilk/egui#1787](https://github.com/emilk/egui/issues/1787)；程序化定位限制另见 [emilk/egui#3268](https://github.com/emilk/egui/issues/3268)
 - 本地位置：`apps/desktop/src/reader/egui_view.rs` 中的 `stable_virtual_row_range` 和 `DesktopReader::toc`
 - 回归测试：`virtual_toc_range_does_not_backfill_rows_at_the_bottom_boundary`
@@ -146,8 +146,8 @@ egui 的多组件文字选择按各个 `Label` 独立生成选区网格，无法
 
 ## egui：合法布局触发控件 ID/矩形变化误报
 
-- 影响版本：`egui 0.35.0`
-- 上游状态：截至 2026-08-01 两项问题仍为 Open
+- 影响版本：`egui 0.36.0`
+- 上游状态：截至 2026-08-05 两项问题仍为 Open
 - 上游问题：[emilk/egui#8343](https://github.com/emilk/egui/issues/8343)、[emilk/egui#8092](https://github.com/emilk/egui/issues/8092)
 - 本地位置：`apps/desktop/src/ui/mod.rs` 中的 `configure`
 
@@ -173,9 +173,9 @@ egui 的调试检查只看到相同屏幕矩形在不同 pass 或帧中对应了
 
 ## egui：显式高度 `TextEdit` 的垂直对齐与感知区域问题
 
-- 影响版本：`egui 0.35.0`
-- 上游状态：默认顶部对齐属于当前 API 行为；相关感知区域 bug 已由上游修复
-- 上游问题：[emilk/egui#7433](https://github.com/emilk/egui/issues/7433)、修复 [emilk/egui#7436](https://github.com/emilk/egui/pull/7436)
+- 影响版本：`egui 0.36.0`
+- 上游状态：默认顶部对齐仍属于当前 API 行为；相关感知区域 bug 已由上游修复，0.36 另行修复了 hint 文本未遵循水平/垂直对齐的问题
+- 上游问题：[emilk/egui#7433](https://github.com/emilk/egui/issues/7433)、修复 [emilk/egui#7436](https://github.com/emilk/egui/pull/7436)；hint 对齐修复 [emilk/egui#8332](https://github.com/emilk/egui/pull/8332)
 - 本地位置：`apps/desktop/src/reader/egui_view.rs` 中的 `pdf_toc_editor_table`、`centered_assistant_text_edit` 和搜索输入框，以及 `apps/desktop/src/shelf/mod.rs` 中的 `shelf_search_field`
 
 ### 表现
@@ -188,7 +188,7 @@ egui 的调试检查只看到相同屏幕矩形在不同 pass 或帧中对应了
 
 ### 当前规避方案
 
-所有放入显式高度容器、且设计上要求居中的单行输入框都显式调用 `.vertical_align(egui::Align::Center)`。不要只依赖外层 `horizontal_centered` 或 `add_sized`，它们只控制控件矩形，不改变 `TextEdit` 内部文字对齐。
+所有放入显式高度容器、且设计上要求居中的单行输入框都显式调用 `.vertical_align(egui::Align::Center)`。不要只依赖外层 `horizontal_centered` 或 `add_sized`，它们只控制控件矩形，不改变 `TextEdit` 内部文字对齐。AI 输入框在升级到 0.36 后恢复使用原生 `hint_text`，其提示文字现在会遵循同一个垂直对齐设置。
 
 ### 升级检查
 

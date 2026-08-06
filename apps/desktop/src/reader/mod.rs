@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use peniko::{Blob, Color};
-use rebook_formats::{BookFormat, open_file as open_publication_file};
+use rebook_formats::{BookFormat, open_file_for_reading as open_publication_file_for_reading};
 use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode};
 use rebook_publication::{BookSource, RenditionLayout, Rgba, SourceRange};
 use rebook_reader::{
@@ -81,20 +81,6 @@ fn apply_theme_colors(style: &mut ReaderStyle, theme: AppTheme) {
                 alpha: 255,
             };
         }
-        AppTheme::Glass => {
-            style.foreground = Rgba {
-                red: 30,
-                green: 41,
-                blue: 59,
-                alpha: 255,
-            };
-            style.background = Rgba {
-                red: 232,
-                green: 238,
-                blue: 246,
-                alpha: 255,
-            };
-        }
     }
 }
 
@@ -106,16 +92,21 @@ pub(super) fn open_reader(
     path: &Path,
     reader_fonts: Arc<[Blob<u8>]>,
     shelf_metadata: Option<BookDisplayMetadata>,
+    shelf_cover: Option<Vec<u8>>,
     local_store: SyncStore,
 ) -> Result<DesktopReader, Box<dyn std::error::Error + Send + Sync>> {
     let started = Instant::now();
-    let publication = open_publication_file(path)?;
+    let publication_started = Instant::now();
+    let known_publication_id = shelf_metadata.as_ref().map(|metadata| metadata.id.as_str());
+    let publication = open_publication_file_for_reading(path, known_publication_id)?;
+    let publication_ms = publication_started.elapsed().as_secs_f32() * 1_000.0;
     let format = publication.format();
-    let cover = publication.cover_bytes().map(<[u8]>::to_vec);
+    let cover = shelf_cover.or_else(|| publication.cover_bytes().map(<[u8]>::to_vec));
     let canonical_source = publication.source();
     let book_id = canonical_source.book().id.to_string();
     let display_metadata = resolve_book_display_metadata(
         shelf_metadata,
+        &book_id,
         &canonical_source.book().metadata.title,
         &canonical_source.book().metadata.authors,
     );
@@ -127,6 +118,7 @@ pub(super) fn open_reader(
     } else {
         canonical_source
     };
+    let source_wrappers_started = Instant::now();
     let (canonical_source, pdf_ocr_controller, pdf_ocr_available, pdf_ocr_mode) =
         if format == BookFormat::Pdf {
             match load_pdf_ocr_source(Arc::clone(&canonical_source)) {
@@ -144,6 +136,7 @@ pub(super) fn open_reader(
         } else {
             (canonical_source, None, false, PdfOcrViewMode::Original)
         };
+    let source_wrappers_ms = source_wrappers_started.elapsed().as_secs_f32() * 1_000.0;
     let fixed_page = canonical_source.book().metadata.layout == RenditionLayout::PrePaginated;
     let rewrite_source = Arc::new(RewriteBookSource::new(canonical_source));
     let plugin_settings = PluginSettings::load_default().unwrap_or_else(|error| {
@@ -183,15 +176,51 @@ pub(super) fn open_reader(
         tracing::warn!(%error, "failed to load WebDAV credential");
         String::new()
     });
-    let mut reader =
-        ReaderSession::open_with_fonts(Arc::clone(&source), viewport, style, reader_fonts)?;
     let progress_store = Some(local_store);
-    if let Some(store) = &progress_store
-        && let Some(progress) = store.load_progress(&book_id)?
-        && let Err(error) = reader.restore_locator(&progress.locator)
-    {
-        tracing::warn!(%error, "failed to restore durable reading locator");
-    }
+    let progress_started = Instant::now();
+    let stored_progress = progress_store
+        .as_ref()
+        .map(|store| store.load_progress(&book_id))
+        .transpose()?
+        .flatten();
+    let progress_ms = progress_started.elapsed().as_secs_f32() * 1_000.0;
+    let resumed = stored_progress.is_some();
+    let initial_layout_started = Instant::now();
+    let reader = if let Some(progress) = stored_progress {
+        match ReaderSession::open_with_fonts_at_locator(
+            Arc::clone(&source),
+            viewport,
+            style.clone(),
+            Arc::clone(&reader_fonts),
+            &progress.locator,
+        ) {
+            Ok(reader) => reader,
+            Err(error) => {
+                tracing::warn!(%error, "failed to open at durable reading locator");
+                ReaderSession::open_with_fonts(Arc::clone(&source), viewport, style, reader_fonts)?
+            }
+        }
+    } else {
+        ReaderSession::open_with_fonts(Arc::clone(&source), viewport, style, reader_fonts)?
+    };
+    let initial_layout_ms = initial_layout_started.elapsed().as_secs_f32() * 1_000.0;
+    let initial_location = reader.location();
+    crate::diagnostics::log(
+        "reader.open",
+        &[
+            crate::diagnostics::Field::Text("format", format.label()),
+            crate::diagnostics::Field::F32("publication_ms", publication_ms),
+            crate::diagnostics::Field::F32("source_wrappers_ms", source_wrappers_ms),
+            crate::diagnostics::Field::F32("progress_ms", progress_ms),
+            crate::diagnostics::Field::Bool("resumed", resumed),
+            crate::diagnostics::Field::F32("initial_layout_ms", initial_layout_ms),
+            crate::diagnostics::Field::Usize("section", initial_location.section_index),
+            crate::diagnostics::Field::Usize("segment", initial_location.segment_index),
+            crate::diagnostics::Field::Usize("page", initial_location.page_index),
+            crate::diagnostics::Field::Usize("page_count", initial_location.page_count),
+            crate::diagnostics::Field::F32("total_ms", started.elapsed().as_secs_f32() * 1_000.0),
+        ],
+    );
     tracing::debug!(
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         "opened book"
@@ -224,6 +253,7 @@ pub(super) fn open_reader(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BookDisplayMetadata {
+    pub(super) id: String,
     pub(super) title: String,
     pub(super) authors: Vec<String>,
 }
@@ -231,6 +261,7 @@ pub(super) struct BookDisplayMetadata {
 impl From<&LibraryBook> for BookDisplayMetadata {
     fn from(book: &LibraryBook) -> Self {
         Self {
+            id: book.id.clone(),
             title: book.title.clone(),
             authors: book.authors.clone(),
         }
@@ -239,10 +270,12 @@ impl From<&LibraryBook> for BookDisplayMetadata {
 
 fn resolve_book_display_metadata(
     shelf_metadata: Option<BookDisplayMetadata>,
+    parsed_id: &str,
     parsed_title: &str,
     parsed_authors: &[String],
 ) -> BookDisplayMetadata {
     shelf_metadata.unwrap_or_else(|| BookDisplayMetadata {
+        id: parsed_id.to_owned(),
         title: parsed_title.to_owned(),
         authors: parsed_authors.to_vec(),
     })
@@ -1282,12 +1315,14 @@ mod tests {
     #[test]
     fn shelf_metadata_overrides_a_hash_based_parser_title() {
         let shelf_metadata = BookDisplayMetadata {
+            id: "shelf-id".into(),
             title: "情景学习".into(),
             authors: Vec::new(),
         };
 
         let resolved = resolve_book_display_metadata(
             Some(shelf_metadata.clone()),
+            "parsed-id",
             "21f76642e79935732871e58d99d4e7eb4e890a8ae1ed93f859097b655a37e434",
             &[],
         );
@@ -1298,8 +1333,9 @@ mod tests {
     #[test]
     fn parsed_metadata_remains_the_fallback_for_external_files() {
         let authors = vec!["作者".to_owned()];
-        let resolved = resolve_book_display_metadata(None, "外部文件", &authors);
+        let resolved = resolve_book_display_metadata(None, "parsed-id", "外部文件", &authors);
 
+        assert_eq!(resolved.id, "parsed-id");
         assert_eq!(resolved.title, "外部文件");
         assert_eq!(resolved.authors, authors);
     }

@@ -16,6 +16,7 @@ use crate::ui::{dialog_action_button, palette};
 
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/L-Chris/torto/releases/latest";
 const RELEASE_DOWNLOAD_PREFIX: &str = "/L-Chris/torto/releases/download/";
+const CHINESE_RELEASE_NOTES_SUMMARY: &str = "中文更新说明";
 const MAX_INSTALLER_BYTES: u64 = 256 * 1024 * 1024;
 const WINDOWS_INSTALL_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
@@ -249,11 +250,8 @@ impl WindowsUpdater {
                     .max_height(220.0)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        show_release_notes(
-                            ui,
-                            &mut self.release_notes_cache,
-                            &view.release().notes,
-                        );
+                        let notes = localized_release_notes(&view.release().notes, language);
+                        show_release_notes(ui, &mut self.release_notes_cache, notes);
                     });
                 if let Some(message) = view.message() {
                     ui.add_space(10.0);
@@ -427,6 +425,35 @@ fn show_release_notes(ui: &mut egui::Ui, cache: &mut CommonMarkCache, markdown: 
             .indentation_spaces(2)
             .show(ui, cache, markdown);
     });
+}
+
+fn localized_release_notes(markdown: &str, language: AppLanguage) -> &str {
+    let Some((english, details)) = markdown.split_once("<details>") else {
+        return markdown;
+    };
+    let details = details.trim_start();
+    let Some(summary_and_rest) = details.strip_prefix("<summary>") else {
+        return markdown;
+    };
+    let Some((summary, chinese_and_rest)) = summary_and_rest.split_once("</summary>") else {
+        return markdown;
+    };
+    if summary.trim() != CHINESE_RELEASE_NOTES_SUMMARY {
+        return markdown;
+    }
+    let Some((chinese, _)) = chinese_and_rest.split_once("</details>") else {
+        return markdown;
+    };
+
+    let localized = match language {
+        AppLanguage::SimplifiedChinese => chinese.trim(),
+        AppLanguage::English => english.trim(),
+    };
+    if localized.is_empty() {
+        markdown
+    } else {
+        localized
+    }
 }
 
 fn automatic_check_enabled() -> bool {
@@ -739,18 +766,48 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut cache = CommonMarkCache::default();
-        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             show_release_notes(ui, &mut cache, "## Feature\n\n- Update support");
         });
         let mut painted_text = String::new();
         for shape in &output.shapes {
             collect_text(&shape.shape, &mut painted_text);
         }
+        output.textures_delta.clear();
 
         assert!(painted_text.contains("Feature"));
         assert!(painted_text.contains("Update support"));
         assert!(!painted_text.contains("## Feature"));
         assert!(!painted_text.contains("- Update support"));
+    }
+
+    #[test]
+    fn release_notes_follow_the_interface_language() {
+        let notes = "## Feature\n\n- Faster opening\n\n<details>\n<summary>中文更新说明</summary>\n\n## 功能\n\n- 更快地打开书籍\n\n</details>";
+
+        assert_eq!(
+            localized_release_notes(notes, AppLanguage::English),
+            "## Feature\n\n- Faster opening"
+        );
+        assert_eq!(
+            localized_release_notes(notes, AppLanguage::SimplifiedChinese),
+            "## 功能\n\n- 更快地打开书籍"
+        );
+    }
+
+    #[test]
+    fn release_notes_fall_back_to_the_original_body() {
+        let legacy = "## Feature\n\n- Update support";
+        let incomplete = "English\n\n<details>\n<summary>中文更新说明</summary>\n中文";
+
+        assert_eq!(
+            localized_release_notes(legacy, AppLanguage::SimplifiedChinese),
+            legacy
+        );
+        assert_eq!(
+            localized_release_notes(incomplete, AppLanguage::English),
+            incomplete
+        );
     }
 
     #[test]
