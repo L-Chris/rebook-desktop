@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/L-Chris/torto/releases/latest"><img src="https://img.shields.io/github/v/release/L-Chris/torto?display_name=tag&sort=semver" alt="Latest release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/L-Chris/torto" alt="MIT License"></a>
+  <a href="https://github.com/TortoTech/torto/releases/latest"><img src="https://img.shields.io/github/v/release/TortoTech/torto?display_name=tag&sort=semver" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/TortoTech/torto" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-5b6ee1" alt="Windows and macOS">
   <img src="https://img.shields.io/badge/UI-egui-7c3aed" alt="Built with egui">
 </p>
@@ -71,7 +71,7 @@ Keep the table of contents, reading surface, translation tools, and AI assistant
 
 ## Download
 
-Download the latest build from [GitHub Releases](https://github.com/L-Chris/torto/releases/latest).
+Download the latest build from [GitHub Releases](https://github.com/TortoTech/torto/releases/latest).
 
 | **Platform** | **Package** | **Requirements** |
 | --- | --- | --- |
@@ -105,7 +105,7 @@ The core reading path is `parser → Reading IR → layout → renderer`. See th
 
 Torto is under active development. DRM-protected books are not supported. The native renderer intentionally does not aim for full browser-level HTML/CSS compatibility, so complex fixed layouts, vertical writing, Ruby annotations, and some interactive book content may not render completely yet.
 
-Please report reproducible problems in [Issues](https://github.com/L-Chris/torto/issues). Include the book format, screenshots, and reproduction steps, but do not upload complete copyrighted books.
+Please report reproducible problems in [Issues](https://github.com/TortoTech/torto/issues). Include the book format, screenshots, and reproduction steps, but do not upload complete copyrighted books.
 
 ## License
 

@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/L-Chris/torto/releases/latest"><img src="https://img.shields.io/github/v/release/L-Chris/torto?display_name=tag&sort=semver" alt="最新版本"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/L-Chris/torto" alt="MIT 许可证"></a>
+  <a href="https://github.com/TortoTech/torto/releases/latest"><img src="https://img.shields.io/github/v/release/TortoTech/torto?display_name=tag&sort=semver" alt="最新版本"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/TortoTech/torto" alt="MIT 许可证"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-5b6ee1" alt="支持 Windows 与 macOS">
   <img src="https://img.shields.io/badge/UI-egui-7c3aed" alt="使用 egui 构建">
   <a href="https://linux.do"><img src="https://img.shields.io/badge/LINUX-DO-FFB003.svg" alt="LINUX DO"></a>
@@ -72,7 +72,7 @@ Torto（中文名“小龟阅读”）是一款开源的 Windows 与 macOS 桌�
 
 ## 下载与使用
 
-前往 [GitHub Releases](https://github.com/L-Chris/torto/releases/latest) 下载最新安装包。
+前往 [GitHub Releases](https://github.com/TortoTech/torto/releases/latest) 下载最新安装包。
 
 | **平台** | **安装包** | **系统要求** |
 | --- | --- | --- |
@@ -99,7 +99,7 @@ Torto（中文名“小龟阅读”）是一款开源的 Windows 与 macOS 桌�
 
 Torto 仍在持续开发中。当前不支持带 DRM 的电子书，也不追求完整浏览器级 HTML/CSS 兼容；复杂固定版式、竖排、Ruby 注音以及部分书内交互内容仍可能无法完整显示。
 
-如果遇到解析、排版或安装问题，欢迎在 [Issues](https://github.com/L-Chris/torto/issues) 中反馈，并附上电子书格式、问题截图和可复现步骤。请勿上传受版权保护的完整书籍。
+如果遇到解析、排版或安装问题，欢迎在 [Issues](https://github.com/TortoTech/torto/issues) 中反馈，并附上电子书格式、问题截图和可复现步骤。请勿上传受版权保护的完整书籍。
 
 ## 开发者信息
 

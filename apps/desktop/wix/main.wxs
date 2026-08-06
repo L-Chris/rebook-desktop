@@ -62,7 +62,7 @@
         Id='*'
         Name='Torto'
         UpgradeCode='83A42DF6-BC2D-4904-8037-A11AB047015D'
-        Manufacturer='L-Chris'
+        Manufacturer='TortoTech'
         Language='1033'
         Codepage='1252'
         Version='$(var.Version)'>
@@ -70,7 +70,7 @@
         <Package Id='*'
             Keywords='Installer'
             Description='Torto native e-book reader'
-            Manufacturer='L-Chris'
+            Manufacturer='TortoTech'
             InstallerVersion='450'
             Languages='1033'
             Compressed='yes'
@@ -80,17 +80,27 @@
 
         <MajorUpgrade
             Schedule='afterInstallInitialize'
+            MigrateFeatures='yes'
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
 
         <!-- Reuse the directory recorded by the previous version during both
              interactive and unattended major upgrades. A command-line
              APPLICATIONFOLDER supplied by the built-in updater remains the
              source of truth for the first upgrade from older installers. -->
+        <Property Id='LEGACYAPPLICATIONFOLDER' Secure='yes'>
+            <RegistrySearch
+                Id='LegacyApplicationFolder'
+                Root='HKLM'
+                Key='Software\L-Chris\Torto'
+                Name='InstallLocation'
+                Type='raw'
+                Win64='yes'/>
+        </Property>
         <Property Id='APPLICATIONFOLDER' Secure='yes'>
             <RegistrySearch
                 Id='PreviousApplicationFolder'
                 Root='HKLM'
-                Key='Software\L-Chris\Torto'
+                Key='Software\TortoTech\Torto'
                 Name='InstallLocation'
                 Type='raw'
                 Win64='yes'/>
@@ -132,15 +142,6 @@
                                 Icon='ProductIcon.exe'
                                 IconIndex='0'
                                 Advertise='yes'/>
-                            <Shortcut
-                                Id='DesktopShortcut'
-                                Directory='DesktopFolder'
-                                Name='Torto'
-                                Description='Torto e-book reader'
-                                WorkingDirectory='APPLICATIONFOLDER'
-                                Icon='ProductIcon.exe'
-                                IconIndex='0'
-                                Advertise='yes'/>
                         </File>
                     </Component>
                     <Component
@@ -149,7 +150,7 @@
                         Win64='yes'>
                         <RegistryValue
                             Root='HKLM'
-                            Key='Software\L-Chris\Torto'
+                            Key='Software\TortoTech\Torto'
                             Name='InstallLocation'
                             Type='string'
                             Value='[APPLICATIONFOLDER]'
@@ -161,23 +162,23 @@
                             Key='Software\RegisteredApplications'
                             Name='Torto'
                             Type='string'
-                            Value='Software\L-Chris\Torto\Capabilities'
+                            Value='Software\TortoTech\Torto\Capabilities'
                             KeyPath='yes'/>
-                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities' Name='ApplicationName' Type='string' Value='Torto'/>
-                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities' Name='ApplicationDescription' Type='string' Value='Torto e-book reader'/>
-                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.epub' Type='string' Value='Torto.Book'/>
-                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.mobi' Type='string' Value='Torto.Book'/>
-                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.azw' Type='string' Value='Torto.Book'/>
-                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.azw3' Type='string' Value='Torto.Book'/>
-                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.fb2' Type='string' Value='Torto.Book'/>
-                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.fbz' Type='string' Value='Torto.Book'/>
-                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.cbz' Type='string' Value='Torto.Book'/>
-                        <RegistryValue Root='HKLM' Key='Software\L-Chris\Torto\Capabilities\FileAssociations' Name='.pdf' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities' Name='ApplicationName' Type='string' Value='Torto'/>
+                        <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities' Name='ApplicationDescription' Type='string' Value='Torto e-book reader'/>
+                        <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities\FileAssociations' Name='.epub' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities\FileAssociations' Name='.mobi' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities\FileAssociations' Name='.azw' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities\FileAssociations' Name='.azw3' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities\FileAssociations' Name='.fb2' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities\FileAssociations' Name='.fbz' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities\FileAssociations' Name='.cbz' Type='string' Value='Torto.Book'/>
+                        <RegistryValue Root='HKLM' Key='Software\TortoTech\Torto\Capabilities\FileAssociations' Name='.pdf' Type='string' Value='Torto.Book'/>
 
                         <RegistryValue Root='HKCR' Key='Torto.Book' Type='string' Value='Torto e-book'/>
                         <RegistryValue Root='HKCR' Key='Torto.Book' Name='FriendlyTypeName' Type='string' Value='Torto e-book'/>
-                        <RegistryValue Root='HKCR' Key='Torto.Book\DefaultIcon' Type='string' Value='[#exe0],0'/>
-                        <RegistryValue Root='HKCR' Key='Torto.Book\shell\open\command' Type='string' Value='&quot;[#exe0]&quot; &quot;%1&quot;'/>
+                        <RegistryValue Root='HKCR' Key='Torto.Book\DefaultIcon' Type='string' Value='[APPLICATIONFOLDER]torto.exe,0'/>
+                        <RegistryValue Root='HKCR' Key='Torto.Book\shell\open\command' Type='string' Value='&quot;[APPLICATIONFOLDER]torto.exe&quot; &quot;%1&quot;'/>
                         <RegistryValue Root='HKCR' Key='.epub\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
                         <RegistryValue Root='HKCR' Key='.mobi\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
                         <RegistryValue Root='HKCR' Key='.azw\OpenWithProgids' Name='Torto.Book' Type='string' Value=''/>
@@ -190,7 +191,25 @@
                 </Directory>
             </Directory>
             <Directory Id='ProgramMenuFolder'/>
-            <Directory Id='DesktopFolder'/>
+            <Directory Id='CommonDesktopFolder'>
+                <Component Id='DesktopShortcutComponent' Guid='*' Win64='yes'>
+                    <Shortcut
+                        Id='DesktopShortcut'
+                        Name='Torto'
+                        Description='Torto e-book reader'
+                        Target='[APPLICATIONFOLDER]torto.exe'
+                        WorkingDirectory='APPLICATIONFOLDER'
+                        Icon='ProductIcon.exe'
+                        IconIndex='0'/>
+                    <RegistryValue
+                        Root='HKLM'
+                        Key='Software\TortoTech\Torto'
+                        Name='DesktopShortcut'
+                        Type='integer'
+                        Value='1'
+                        KeyPath='yes'/>
+                </Component>
+            </Directory>
         </Directory>
 
         <Feature
@@ -210,9 +229,27 @@
 
             <ComponentRef Id='binary0'/>
             <ComponentRef Id='InstallLocationRegistry'/>
-            <ComponentRef Id='FileAssociations'/>
+            <Feature
+                Id='DesktopShortcutFeature'
+                Title='Desktop shortcut'
+                Description='Creates a Torto shortcut on the desktop.'
+                Level='1'
+                Absent='allow'
+                AllowAdvertise='no'>
+                <ComponentRef Id='DesktopShortcutComponent'/>
+            </Feature>
+            <Feature
+                Id='FileAssociationsFeature'
+                Title='E-book file associations'
+                Description='Makes Torto available in Open with for supported e-book files.'
+                Level='1'
+                Absent='allow'
+                AllowAdvertise='no'>
+                <ComponentRef Id='FileAssociations'/>
+            </Feature>
         </Feature>
 
+        <SetProperty Id='APPLICATIONFOLDER' Value='[LEGACYAPPLICATIONFOLDER]' After='AppSearch'>NOT APPLICATIONFOLDER AND LEGACYAPPLICATIONFOLDER</SetProperty>
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
 
 
@@ -225,7 +262,7 @@
         <Icon Id='ProductIcon.exe' SourceFile='assets\windows\torto.ico'/>
         <Property Id='ARPPRODUCTICON' Value='ProductIcon.exe'/>
 
-        <Property Id='ARPHELPLINK' Value='https://github.com/L-Chris/torto'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/TortoTech/torto'/>
 
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>
@@ -256,7 +293,7 @@
 
           The banner BMP dimensions are 493 x 58 pixels.
         -->
-        <!--<WixVariable Id='WixUIBannerBmp' Value='wix\Banner.bmp'/>-->
+        <WixVariable Id='WixUIBannerBmp' Value='assets\windows\installer\installer-banner.bmp'/>
 
 
         <!--
@@ -267,7 +304,7 @@
 
           The dialog BMP dimensions are 493 x 312 pixels.
         -->
-        <!--<WixVariable Id='WixUIDialogBmp' Value='wix\Dialog.bmp'/>-->
+        <WixVariable Id='WixUIDialogBmp' Value='assets\windows\installer\installer-dialog.bmp'/>
 
     </Product>
 

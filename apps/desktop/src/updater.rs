@@ -14,8 +14,8 @@ use crate::platform::UserEvent;
 use crate::preferences::AppLanguage;
 use crate::ui::{dialog_action_button, palette};
 
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/L-Chris/torto/releases/latest";
-const RELEASE_DOWNLOAD_PREFIX: &str = "/L-Chris/torto/releases/download/";
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/TortoTech/torto/releases/latest";
+const RELEASE_DOWNLOAD_PREFIX: &str = "/TortoTech/torto/releases/download/";
 const CHINESE_RELEASE_NOTES_SUMMARY: &str = "中文更新说明";
 const MAX_INSTALLER_BYTES: u64 = 256 * 1024 * 1024;
 const WINDOWS_INSTALL_SCRIPT: &str = r#"
@@ -669,7 +669,7 @@ mod tests {
             assets: vec![GitHubAsset {
                 name: format!("Torto-{}-x86_64.msi", tag.trim_start_matches('v')),
                 browser_download_url: format!(
-                    "https://github.com/L-Chris/torto/releases/download/{tag}/Torto-{}-x86_64.msi",
+                    "https://github.com/TortoTech/torto/releases/download/{tag}/Torto-{}-x86_64.msi",
                     tag.trim_start_matches('v')
                 ),
                 digest: digest.map(str::to_owned),
@@ -716,12 +716,24 @@ mod tests {
     }
 
     #[test]
+    fn updater_uses_the_current_github_organization() {
+        assert_eq!(
+            LATEST_RELEASE_URL,
+            "https://api.github.com/repos/TortoTech/torto/releases/latest"
+        );
+        assert_eq!(
+            RELEASE_DOWNLOAD_PREFIX,
+            "/TortoTech/torto/releases/download/"
+        );
+    }
+
+    #[test]
     fn installer_bytes_must_match_size_and_digest() {
         let bytes = b"verified installer";
         let asset = UpdateAsset {
             name: "Torto-0.2.12-x86_64.msi".into(),
             url:
-                "https://github.com/L-Chris/torto/releases/download/v0.2.12/Torto-0.2.12-x86_64.msi"
+                "https://github.com/TortoTech/torto/releases/download/v0.2.12/Torto-0.2.12-x86_64.msi"
                     .into(),
             sha256: format!("{:x}", Sha256::digest(bytes)),
             size: u64::try_from(bytes.len()).unwrap(),

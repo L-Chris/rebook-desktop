@@ -357,6 +357,8 @@ mod tests {
         assert_eq!(wix.matches("Icon='ProductIcon.exe'").count(), 2);
         assert!(wix.contains("<Property Id='APPLICATIONFOLDER' Secure='yes'>"));
         assert!(wix.contains("Id='PreviousApplicationFolder'"));
+        assert!(wix.contains("Id='LegacyApplicationFolder'"));
+        assert!(wix.contains("Value='[LEGACYAPPLICATIONFOLDER]'"));
         assert!(wix.contains("Value='[APPLICATIONFOLDER]'"));
         assert!(wix.contains("<ComponentRef Id='InstallLocationRegistry'/>"));
     }
@@ -366,9 +368,11 @@ mod tests {
         let wix = include_str!("../../wix/main.wxs");
 
         assert!(wix.contains("Key='Software\\RegisteredApplications'"));
-        assert!(wix.contains("Value='Software\\L-Chris\\Torto\\Capabilities'"));
+        assert!(wix.contains("Value='Software\\TortoTech\\Torto\\Capabilities'"));
         assert!(wix.contains("<ComponentRef Id='FileAssociations'/>"));
-        assert!(wix.contains("Value='&quot;[#exe0]&quot; &quot;%1&quot;'"));
+        assert!(wix.contains("Id='FileAssociationsFeature'"));
+        assert!(wix.contains("Title='E-book file associations'"));
+        assert!(wix.contains("Value='&quot;[APPLICATIONFOLDER]torto.exe&quot; &quot;%1&quot;'"));
         for extension in ["epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "pdf"] {
             assert!(
                 wix.contains(&format!(
@@ -381,6 +385,23 @@ mod tests {
                 "missing Open With registration for .{extension}"
             );
         }
+    }
+
+    #[test]
+    fn installer_brand_and_desktop_shortcut_are_configurable() {
+        let wix = include_str!("../../wix/main.wxs");
+        let license = include_str!("../../../../LICENSE");
+        let installer_license = include_str!("../../wix/License.rtf");
+
+        assert!(wix.contains("Manufacturer='TortoTech'"));
+        assert!(!wix.contains("Manufacturer='L-Chris'"));
+        assert!(wix.contains("Id='DesktopShortcutFeature'"));
+        assert!(wix.contains("Title='Desktop shortcut'"));
+        assert!(wix.contains("<ComponentRef Id='DesktopShortcutComponent'/>"));
+        assert_eq!(wix.matches("Absent='allow'").count(), 2);
+        assert!(wix.contains("MigrateFeatures='yes'"));
+        assert!(license.contains("Copyright (c) 2026 TortoTech"));
+        assert!(installer_license.contains("Copyright (c) 2026 TortoTech"));
     }
 
     #[test]
